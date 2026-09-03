@@ -2,7 +2,7 @@
 
 用法：
     python api/main.py
-    # 浏览器打开 http://127.0.0.1:8000/docs 查看接口文档
+    # 浏览器打开 http://127.0.0.1:8001/docs 查看接口文档
     # 前端看板: frontend/index.html
 
 接口：

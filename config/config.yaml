@@ -194,4 +194,4 @@ risk:
   take_max_pct: 0.30      # 止盈百分比上限
 api:
   host: 127.0.0.1
-  port: 8000
+  port: 8001

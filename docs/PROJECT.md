@@ -35,7 +35,7 @@
 | 数据 | akshare（东财接口**被墙不可用**；日常用 新浪/腾讯，免费源） |
 | 数值/模型 | pandas≥2、numpy、torch(CPU 即可)、scikit-learn |
 | 树模型 | **LightGBM**（`cross_model` 缺失时自动回退 sklearn HistGradientBoosting） |
-| 服务 | FastAPI + uvicorn（默认 `127.0.0.1:8000`，`启动量化系统.bat` 里写 8001） |
+| 服务 | FastAPI + uvicorn（**统一端口 8001**：`启动量化系统.bat` 与前端 `API_BASE` 均写死 8001，起服务请带 `--port 8001`） |
 | 前端 | **单文件** `frontend/index.html`：Vue3(CDN) + ECharts，无构建步骤 |
 | 存储 | SQLite：`data/market.db`(日线) + `data/minute.db`(5分钟线) |
 
@@ -95,7 +95,7 @@ python scripts/01_fetch_data.py
 python scripts/18_train_ensemble.py       # 约 10~30 分钟 CPU
 
 # 4) 起 API（另开终端）
-python -m uvicorn api.main:app --port 8000
+python -m uvicorn api.main:app --port 8001
 #    或 Windows 双击「启动量化系统.bat」（记得先改里面的 python 路径）
 
 # 5) 浏览器打开 frontend/index.html  →  看板
