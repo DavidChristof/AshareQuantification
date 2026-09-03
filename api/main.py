@@ -993,7 +993,8 @@ def _portfolio_with_reasons(n: int | None = None):
             minute_adj = cfg.get("trading", {}).get("minute_adj", 0.05)
             score += {"buy": minute_adj, "sell": -minute_adj, "hold": 0.0}.get(
                 minute["minute_signal"], 0.0)
-        rows.append({"symbol": symbol, "prob": prob, "close": close,
+        rows.append({"symbol": symbol, "name": _display_name(symbol),
+                     "prob": prob, "close": close,
                      "timing": timing, "advisor": adv, "minute": minute,
                      "score": score})
     rows.sort(key=lambda r: r["score"], reverse=True)
@@ -1144,7 +1145,7 @@ def portfolio():
         "top_n": len(targets),
         "candidate_source": cfg.get("trading", {}).get("candidate_source", "selection"),
         "targets": [{
-            "symbol": t["symbol"], "name": t["name"],
+            "symbol": t["symbol"], "name": t.get("name") or _display_name(t["symbol"]),
             "prob": round(t["prob"], 4) if t["prob"] is not None else None,
             "close": t["close"],
             "score": round(t["score"] if t.get("score_scale") == 100
