@@ -45,6 +45,7 @@
 │   ├── 03_train.py           # 训练模型
 │   ├── 04_backtest.py        # 回测验证
 │   └── 05_update.py          # 每日更新：拉数据→预测→纸面调仓
+├── docs/PROJECT.md           # 📘 协作者项目说明（快速上手/架构/约定）
 ├── api/main.py               # FastAPI 接口（含 CORS / 手动下单）
 ├── frontend/index.html       # Web 看板（Vue3 + ECharts，三个 Tab）
 ├── data/                     # 运行时生成（SQLite + CSV 备份）
