@@ -6,17 +6,18 @@ __pycache__/
 venv/
 env/
 
-# 数据与结果（体积大，不入库）
-data/
-results/
+# 数据与结果（体积大，不入库）——注意 / 锚定到仓库根！
+# 否则 data/ 会误匹配任意层级的 data（曾把 quant/data 源码整个忽略）
+/data/
+/results/
 *.db
 *.db-shm
 *.db-wal
 *.csv
 
-# 运行产物（日志 / 纸面账户数据库）
-logs/
-paper/
+# 运行产物（日志 / 纸面账户数据库）——同样 / 锚定到根
+/logs/
+/paper/
 
 # 模型权重
 *.pt
