@@ -4,7 +4,12 @@ cd /d "%~dp0"
 title A-share Quant Launcher
 
 REM ========== config (edit if needed) ==========
-set "PYTHON=D:\Python\Python3_12\python.exe"
+REM prefer a project-local .venv if present, else fall back to configured system python
+if exist ".venv\Scripts\python.exe" (
+    set "PYTHON=.venv\Scripts\python.exe"
+) else (
+    set "PYTHON=D:\Python\Python3_12\python.exe"
+)
 set "PORT=8001"
 set "LOG_FILE=logs\api.log"
 REM =============================================
@@ -77,5 +82,3 @@ echo          Common causes: port occupied, network blocked, missing deps.
 echo.
 pause
 exit /b 1
-
-
