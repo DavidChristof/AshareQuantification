@@ -519,7 +519,8 @@ v2 之后继续做「为什么模型无信号」的归因实验，四轮离线�
   - **综合分** = 基本面(PE/ROE)×0.6 + 技术面×0.4；无技术面时回退基本面分
   - 返回明细 `{code,name,pe,roe,fund_score,tech_score,mom20,vol20,rev60,total_score,in_universe,regime,tech_weights}`（regime = 本次选股用到的市场状态，tech_weights = 实际权重表，供前端展示）
 - `scripts/16_daily_selection.py`：跑选股，保存 `results/daily_selection.json` + `.csv`；`scripts/23_preview_selection.py`：命令行预览大池选股
-- API：`GET /api/selection`（读最近结果）、`POST /api/selection/run`（后台手动触发，约1-2分钟）；**收盘后随自动刷新自动更新**（`config selection.auto: true`）
+- API：`GET /api/selection`（读最近结果）、`POST /api/selection/run`（后台触发，约1-2分钟）；**收盘后随自动刷新自动更新**（`config selection.auto: true`）
+  - **子进程隔离选股**（9/3）：大池选股抓基本面会触发 akshare 百度估值接口的 `py_mini_racer` native 崩溃（进程级、无法 try 捕获）——若在服务内直接跑会**连带杀死 uvicorn**。故 `_run_daily_selection` 改为 `subprocess` 调 `scripts/30_run_selection_standalone.py`：崩溃只杀子进程，服务永不被拖垮；成功后再从 `results/daily_selection.json` 重载结果
 - 前端 Tab1「📋 今日选股」面板：topN 列表（综合分/基本面/技术面/PE/ROE/动量20/**反转60**/是否在池）+ 立即选股按钮（轮询等结果）
 - **设计**：每日选股**不修改训练股票池**（避免频繁换池重训模型），只做推荐；基本面用缓存提速，技术面权重来自 600 只横截面实证
 - 测试：`tests/test_selection.py`（8 项：强/弱打分、分数边界、None 回退、上涨趋势技术面、日线失败跳过、regime 权重方向/求和、regime 权重改变排序）

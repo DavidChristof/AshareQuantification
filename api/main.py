@@ -21,6 +21,7 @@ from __future__ import annotations
 import sys
 import json
 import logging
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -1255,31 +1256,30 @@ def portfolio_apply():
 
 # ---------- 每日选股（优质股推荐） ----------
 def _run_daily_selection(force: bool = False):
-    """执行每日选股：沪深300 → 流动性 → 基本面 + 技术面 → topN。更新全局并写盘。"""
+    """每日选股：在**独立子进程**执行（scripts/30），隔离 py_mini_racer native 崩溃。
+
+    服务内直接跑大池选股会因 akshare 百度估值接口（py_mini_racer 跑 JS）偶发
+    进程级崩溃连带杀死 uvicorn，故改为 subprocess：崩溃只杀子进程，服务不受影响。
+    成功后从 results/daily_selection.json 重载结果（含 regime 门控状态）。
+    """
     global SELECTION_RESULT
     try:
-        from quant.data.selector import select_daily  # noqa: PLC0415
-        sel_cfg = cfg.get("selection", {})
-        rows = select_daily(n=sel_cfg.get("n", 12))
-        now = datetime.now()
-        regime = None
-        try:
-            from quant.data.selector import fetch_market_regime  # noqa: PLC0415
-            regime = fetch_market_regime()
-        except Exception:  # noqa: BLE001
-            pass
-        SELECTION_RESULT = {
-            "date": now.strftime("%Y-%m-%d"),
-            "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "candidates": rows,
-            "regime": regime,
-        }
-        path = cfg.resolve("results") / "daily_selection.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(SELECTION_RESULT, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-        logger.info("[selection] 每日选股完成 %d 只（%s）", len(rows), now.strftime("%m-%d %H:%M"))
-    except Exception as exc:  # noqa: BLE001
+        script = (Path(__file__).resolve().parents[1]
+                  / "scripts" / "30_run_selection_standalone.py")
+        r = subprocess.run([sys.executable, "-u", str(script)],
+                           cwd=str(script.parent.parent),
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode == 0 and _selection_path.exists():
+            SELECTION_RESULT = json.loads(
+                _selection_path.read_text(encoding="utf-8"))
+            logger.info("[selection] 子进程选股完成 %d 只",
+                        len(SELECTION_RESULT.get("candidates", [])))
+        else:
+            tail = ((r.stderr or "").strip().splitlines()
+                    or (r.stdout or "").strip().splitlines())
+            logger.error("[selection] 子进程选股失败 rc=%s: %s",
+                         r.returncode, tail[-1] if tail else "?")
+    except Exception as exc:  # noqa: BLE001 - 含 subprocess.TimeoutExpired
         logger.error("[selection] 每日选股失败: %s", exc)
 
 
