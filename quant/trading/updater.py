@@ -79,12 +79,15 @@ def rebalance_auto(cfg: Config, broker, signals: dict, date: str, data: dict | N
         for s in stops:
             logger.info("自动盘止盈止损触发 %s: %s", s["symbol"], s["reason"])
 
-    # 2. 调仓
+    # 2. 调仓（双阈值多日持有：无 clear_threshold 配置时回退旧「掉榜即清」）
+    tr = cfg.get("trading", {})
     engine = TradingEngine(
         broker,
         threshold=bt["threshold"],
         position_pct=bt["position_pct"],
         max_positions=max_positions,
+        clear_threshold=tr.get("clear_threshold"),
+        hold_trim_pct=tr.get("hold_trim_pct", 0.5),
     )
     probs = {s: float(t["prob_up"].iloc[-1]) for s, t in signals.items() if not t.empty}
     return engine.rebalance(date, probs, prices)

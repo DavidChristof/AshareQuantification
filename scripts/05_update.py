@@ -64,11 +64,14 @@ def main():
         commission=bt_cfg["commission"],
         slippage=bt_cfg["slippage"],
     )
+    tr_cfg = cfg.get("trading", {})
     engine = TradingEngine(
         broker,
         threshold=bt_cfg["threshold"],
         position_pct=bt_cfg["position_pct"],
         max_positions=3,     # 小额账户最多同时持 3 只
+        clear_threshold=tr_cfg.get("clear_threshold"),   # 双阈值多日持有（null=旧掉榜即清）
+        hold_trim_pct=tr_cfg.get("hold_trim_pct", 0.5),
     )
     summary = engine.rebalance(latest_date, signals, prices)
 

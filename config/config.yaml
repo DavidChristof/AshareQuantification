@@ -166,6 +166,12 @@ minute:
   concurrency: 4
 trading:
   max_positions: 5
+  # 自动纸面盘「多日持有」双阈值（quant/trading/engine.py）：
+  #   掉出核心榜但概率仍 ≥ clear_threshold → 保留 hold_trim 成观察仓（部分减持，不清仓）
+  #   跌破 clear_threshold（或无当日信号）→ 全仓卖出
+  #   设 null 回到旧「掉榜即清」模式（每期整仓轮动）
+  clear_threshold: 0.45
+  hold_trim_pct: 0.5
   minute_adj: 0.05   # 盘中分钟模型对综合分的修正强度（方向化，buy +0.05 / sell -0.05）
   # 组合/一键调仓的「交易候选」来源：
   #   selection = 今日选股 topN（600 只大池，基本面+低波动+60日反转实证因子）——主推
