@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 数据与结果（体积大，不入库）
+data/
+results/
+*.db
+*.db-shm
+*.db-wal
+*.csv
+
+# 运行产物（日志 / 纸面账户数据库）
+logs/
+paper/
+
+# 模型权重
+*.pt
+*.pth
+*.onnx
+
+# 备份与临时
+*.bak
+*~
+*.tmp
+
+# 工具
+.idea/
+.vscode/
+.DS_Store
+
+# 图表
+*.png
+*.jpg
+
+# 注意：frontend/index.html 是前端模板，需要入库，不禁用 html

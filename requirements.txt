@@ -1,0 +1,17 @@
+# ============ A-share Quant Project Dependencies ============
+# Data layer
+akshare>=1.12.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Model layer
+torch>=2.0.0
+scikit-learn>=1.3.0
+
+# Config / Visualization
+pyyaml>=6.0
+matplotlib>=3.7.0
+
+# Presentation layer (optional)
+fastapi>=0.104.0
+uvicorn>=0.24.0

@@ -1,0 +1,1065 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A股量化监控台</title>
+<!-- Vue3 + ECharts CDN，无需构建工具 -->
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #e6edf3; font-family: "Microsoft YaHei", -apple-system, sans-serif; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px 16px 60px; }
+
+  header { display: flex; justify-content: space-between; align-items: baseline;
+           border-bottom: 1px solid #30363d; padding-bottom: 16px; margin-bottom: 24px; }
+  header h1 { font-size: 22px; color: #58a6ff; }
+  header .sub { color: #8b949e; font-size: 13px; margin-left: 12px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; }
+  .card .label { color: #8b949e; font-size: 12px; margin-bottom: 6px; }
+  .card .value { font-size: 22px; font-weight: 600; }
+  .up { color: #f85149; }        /* A股习惯：红涨 */
+  .down { color: #3fb950; }      /* 绿跌 */
+  .muted { color: #8b949e; }
+
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+           padding: 16px; margin-bottom: 20px; }
+  .panel h2 { font-size: 15px; color: #c9d1d9; margin-bottom: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; }
+  tr:hover td { background: #1c2128; }
+
+  .tag { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; }
+  .tag-buy { background: rgba(248,81,73,.15); color: #f85149; }
+  .tag-wait { background: rgba(139,148,158,.15); color: #8b949e; }
+
+  .prob-bar { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+  .sortable th { cursor: pointer; user-select: none; white-space: nowrap; }
+  .prob-bar > div { height: 100%; border-radius: 3px; }
+
+  #equityChart { width: 100%; height: 300px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .grid4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; }
+  .m { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  .refresh-btn { background: #238636; color: #fff; border: none; border-radius: 6px;
+                 padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  .refresh-btn:hover { background: #2ea043; }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .update-info { color: #8b949e; font-size: 12px; }
+  .rt-price { font-weight: 600; font-size: 14px; }
+  .status-tag { font-size: 12px; padding: 2px 10px; border-radius: 4px; margin-right: 8px; }
+  .status-tag.open { background: rgba(63,185,80,.15); color: #3fb950; }
+  .status-tag.market_closed { background: rgba(210,153,34,.15); color: #d29922; }
+  .status-tag.closed_today { background: rgba(139,148,158,.15); color: #8b949e; }
+
+  .tabs { display: flex; gap: 8px; margin-bottom: 22px; }
+  .tab { padding: 8px 18px; border-radius: 8px; background: #161b22;
+         border: 1px solid #30363d; cursor: pointer; color: #8b949e; font-size: 14px; }
+  .tab.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+
+  .tag-buy { background: rgba(248,81,73,.15); color: #f85149; }
+  .tag-sell { background: rgba(63,185,80,.15); color: #3fb950; }
+  .tag-add { background: rgba(88,166,255,.15); color: #58a6ff; }
+  .tag-hold { background: rgba(139,148,158,.15); color: #8b949e; }
+  .tag-wait { background: rgba(139,148,158,.15); color: #8b949e; }
+  .holding { font-size: 11px; color: #d29922; margin-left: 6px; }
+  .reason { font-size: 12px; color: #8b949e; line-height: 1.6; }
+
+  .order-form .form-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .order-form .form-row label { width: 52px; color: #8b949e; font-size: 13px; }
+  .order-form select, .order-form input {
+    background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 6px; padding: 7px 10px; font-size: 13px; }
+  .side-group { display: flex; gap: 8px; }
+  .side-btn { padding: 6px 16px; border-radius: 6px; cursor: pointer;
+              border: 1px solid #30363d; font-size: 13px; }
+  .side-btn input { display: none; }
+  .side-btn.buy.on { background: rgba(248,81,73,.15); border-color: #f85149; color: #f85149; }
+  .side-btn.sell.on { background: rgba(63,185,80,.15); border-color: #3fb950; color: #3fb950; }
+  .order-btn { padding: 8px 22px; border: none; border-radius: 6px; color: #fff;
+               cursor: pointer; font-size: 14px; margin-top: 4px; }
+  .order-btn.buy { background: #da3633; }
+  .order-btn.sell { background: #238636; }
+  .order-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .order-msg { margin-top: 10px; font-size: 13px; }
+  .order-msg.ok { color: #3fb950; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="container">
+    <header>
+      <h1>📈 A股量化监控台 <span class="sub">决策辅助 · 纸面跟踪 · 模拟炒股</span></h1>
+      <div class="header-right">
+        <span class="update-info">
+          <span v-if="lastUpdated">🕐 上次更新 {{ lastUpdated }} · </span>
+          <span v-if="autoRefreshOn">🔄 自动刷新中</span>
+          <span v-if="refreshMsg"> · {{ refreshMsg }}</span>
+        </span>
+        <button class="refresh-btn" @click="refreshNow" :disabled="refreshing">
+          {{ refreshing ? '刷新中...' : '🔄 立即刷新' }}
+        </button>
+      </div>
+    </header>
+
+    <!-- Tab 导航 -->
+    <div class="tabs">
+      <div class="tab" :class="{active: tab==='advisor'}" @click="tab='advisor'">🎯 买卖决策</div>
+      <div class="tab" :class="{active: tab==='timing'}" @click="tab='timing'">⏱️ 择时</div>
+      <div class="tab" :class="{active: tab==='manual'}" @click="tab='manual'">💰 模拟炒股</div>
+    </div>
+
+    <!-- ============ Tab 1 买卖决策 ============ -->
+    <div v-show="tab==='advisor'">
+      <div class="panel">
+        <h2>📊 大盘参考
+          <span class="muted" style="font-size:12px">指数涨跌 · 市场温度（{{ indices.last_update }}）</span>
+        </h2>
+        <div class="grid2">
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:4px">主要指数（腾讯实时）</div>
+            <table>
+              <thead><tr><th>指数</th><th>点位</th><th>涨跌</th><th>涨跌幅</th></tr></thead>
+              <tbody>
+                <tr v-if="!indices.indices.length"><td colspan="4" class="muted">大盘指数加载中...</td></tr>
+                <tr v-for="ix in indices.indices" :key="ix.code">
+                  <td>{{ ix.name }}</td>
+                  <td>{{ ix.point.toFixed(2) }}</td>
+                  <td :class="ix.change_pct>=0?'up':'down'">{{ ix.change>0?'+':'' }}{{ ix.change.toFixed(2) }}</td>
+                  <td :class="ix.change_pct>=0?'up':'down'">{{ ix.change_pct>=0?'+':'' }}{{ ix.change_pct.toFixed(2) }}%</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:4px">股票池市场温度（{{ indices.breadth.total }} 只）</div>
+            <div style="display:flex;gap:16px;font-size:16px;margin-top:8px">
+              <span class="up">▲ 上涨 {{ indices.breadth.up }}</span>
+              <span class="down">▼ 下跌 {{ indices.breadth.down }}</span>
+              <span class="muted" style="font-size:13px">平 {{ indices.breadth.flat }}</span>
+            </div>
+            <div style="margin-top:10px" class="muted" style="font-size:12px">
+              参考：大盘普跌时谨慎加仓；上涨家数多说明市场宽度好，模型信号更可信
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:14px">
+          <h3 style="font-size:13px;margin:0 0 6px">指数K线（日线 · 新浪源）
+            <select v-model="indexSymbol" @change="loadIndexKline"
+              style="float:right; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:3px 8px; font-size:12px;">
+              <option value="sh000001">上证指数</option>
+              <option value="sz399001">深证成指</option>
+              <option value="sz399006">创业板指</option>
+              <option value="sh000300">沪深300</option>
+            </select>
+          </h3>
+          <div id="indexChart" style="width:100%; height:300px;"></div>
+          <div v-if="!indexBars.length" class="muted" style="font-size:12px;margin-top:6px">指数K线加载中...</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>盘中实时
+          <span class="status-tag" :class="marketCode">{{ marketText }}</span>
+          <span class="muted" style="font-size:12px">现价 · 涨跌 · 五档（每 {{ rtInterval }} 秒刷新{{ rtLastUpdate ? ' · ' + rtLastUpdate : '' }}）</span>
+        </h2>
+        <table>
+          <thead class="sortable"><tr>
+            <th @click="sortBy('symbol')">代码 {{ sortMark('symbol') }}</th>
+            <th @click="sortBy('name')">名称 {{ sortMark('name') }}</th>
+            <th @click="sortBy('price')">现价 {{ sortMark('price') }}</th>
+            <th @click="sortBy('change_pct')">涨跌幅 {{ sortMark('change_pct') }}</th>
+            <th @click="sortBy('open')">今开 {{ sortMark('open') }}</th>
+            <th @click="sortBy('high')">最高 {{ sortMark('high') }}</th>
+            <th @click="sortBy('low')">最低 {{ sortMark('low') }}</th>
+            <th @click="sortBy('amount')">成交额 {{ sortMark('amount') }}</th>
+            <th @click="sortBy('bid1')">买一 {{ sortMark('bid1') }}</th>
+            <th @click="sortBy('ask1')">卖一 {{ sortMark('ask1') }}</th>
+          </tr></thead>
+          <tbody>
+            <tr v-if="realtimeQuotes.length===0"><td colspan="10" class="muted">实时行情加载中（交易日盘中显示）...</td></tr>
+            <tr v-for="q in sortedQuotes" :key="q.symbol">
+              <td>{{ q.symbol }}</td><td>{{ q.name }}</td>
+              <td class="rt-price" :class="q.change_pct>=0?'up':'down'">{{ q.price.toFixed(2) }}</td>
+              <td :class="q.change_pct>=0?'up':'down'">{{ (q.change_pct*100).toFixed(2) }}%</td>
+              <td>{{ q.open.toFixed(2) }}</td>
+              <td>{{ q.high.toFixed(2) }}</td>
+              <td>{{ q.low.toFixed(2) }}</td>
+              <td>{{ fmtWan(q.amount) }}</td>
+              <td class="muted">{{ q.bid[0][0].toFixed(2) }}×{{ fmtVol(q.bid[0][1]) }}</td>
+              <td class="muted">{{ q.ask[0][0].toFixed(2) }}×{{ fmtVol(q.ask[0][1]) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <h2>分钟K线
+          <span class="muted" style="font-size:12px">5分钟 · 当日</span>
+          <select v-model="minuteSymbol" @change="loadMinute"
+            style="float:right; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:4px 8px; font-size:13px;">
+            <option v-for="s in stocks" :key="s.symbol" :value="s.symbol">{{ s.symbol }} {{ s.name }}</option>
+          </select>
+        </h2>
+        <div id="minuteChart" style="width:100%; height:320px;"></div>
+        <div v-if="minuteProb!==null" style="margin-top:10px;font-size:13px">
+          分钟模型（未来25分钟）：上涨概率 <b :class="minuteProb>=0.5?'up':'down'">{{ (minuteProb*100).toFixed(1) }}%</b>
+          <span class="tag" :class="tagCls(minuteSignal)" style="margin-left:6px">{{ actionLabel(minuteSignal) }}</span>
+        </div>
+        <div v-else-if="minuteNote" class="muted" style="margin-top:10px;font-size:12px">{{ minuteNote }}</div>
+        <div v-if="minuteBars.length===0" class="muted" style="font-size:12px; margin-top:6px;">分钟K线加载中（交易日盘中实时更新）...</div>
+      </div>
+
+      <div class="panel">
+        <h2>动态选股权重 <span class="muted" style="font-size:12px">市场因子有效性 + 你的盈利偏好</span></h2>
+        <div class="grid2" v-if="weights.weights">
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:6px">
+              PE 低估值权重：<b :style="{color: weights.weights.pe >= 0.5 ? '#58a6ff' : '#8b949e'}">{{ (weights.weights.pe*100).toFixed(0) }}%</b>
+            </div>
+            <div class="prob-bar"><div :style="{width:(weights.weights.pe*100)+'%', background:'#58a6ff'}"></div></div>
+            <div class="muted" style="font-size:12px;margin:10px 0 6px">
+              ROE 高盈利权重：<b :style="{color: weights.weights.roe >= 0.5 ? '#58a6ff' : '#8b949e'}">{{ (weights.weights.roe*100).toFixed(0) }}%</b>
+            </div>
+            <div class="prob-bar"><div :style="{width:(weights.weights.roe*100)+'%', background:'#58a6ff'}"></div></div>
+          </div>
+          <div>
+            <div v-for="(r,i) in weights.reason" :key="i" class="reason">· {{ r }}</div>
+            <div class="muted" style="font-size:12px;margin-top:8px">
+              样本 {{ weights.meta.sample }} 只 · 盈利持仓 {{ weights.meta.profit_symbols.length }} 只
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>今日买卖建议（模型概率 + 技术指标）</h2>
+        <table>
+          <thead><tr><th>代码</th><th>名称</th><th>收盘</th><th>建议</th><th>跑赢概率</th><th>技术面</th><th>理由</th></tr></thead>
+          <tbody>
+            <tr v-if="advice.length===0"><td colspan="7" class="muted">暂无建议</td></tr>
+            <tr v-for="a in advice" :key="a.symbol">
+              <td>{{ a.symbol }}</td>
+              <td>{{ a.name }}<span v-if="a.holding" class="holding">持有中</span></td>
+              <td>{{ a.close.toFixed(2) }}</td>
+              <td><span class="tag" :class="tagCls(a.action)">{{ a.label }}</span></td>
+              <td>{{ (a.prob_up*100).toFixed(1) }}%</td>
+              <td :class="a.score>=0?'up':'down'">{{ a.score>0?'+':'' }}{{ a.score }}</td>
+              <td><div v-for="(r,i) in a.reasons" :key="i" class="reason">· {{ r }}</div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <h2>股票池 · 模型预测信号</h2>
+        <table>
+          <thead><tr><th>代码</th><th>名称</th><th>收盘</th><th>跑赢概率</th><th>信号</th></tr></thead>
+          <tbody>
+            <tr v-for="s in stocks" :key="s.symbol">
+              <td>{{ s.symbol }}</td>
+              <td>{{ s.name }}</td>
+              <td>{{ s.close.toFixed(2) }}</td>
+              <td style="min-width:120px">
+                <div class="prob-bar"><div :style="{width:(s.prob_up*100)+'%', background: s.signal ? '#f85149' : '#58a6ff'}"></div></div>
+                <span style="font-size:11px;color:#8b949e">{{ (s.prob_up*100).toFixed(1) }}%</span>
+              </td>
+              <td><span class="tag" :class="s.signal ? 'tag-buy' : 'tag-wait'">{{ s.signal ? '看多' : '观望' }}</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <h2>📋 今日选股
+          <span class="muted" style="font-size:12px">沪深300优质股 · 基本面+技术面综合打分（每日收盘后自动更新）</span>
+          <button class="refresh-btn" style="float:right" @click="runSelection" :disabled="selBusy">
+            {{ selBusy ? '选股中...' : '立即选股' }}
+          </button>
+        </h2>
+        <div v-if="selection.candidates && selection.candidates.length">
+          <div class="muted" style="font-size:12px;margin-bottom:6px">
+            选股日期：{{ selection.date }}{{ selection.generated_at ? ' ' + selection.generated_at : '' }}
+            · 综合分 = 基本面(PE/ROE)×0.6 + 技术面×0.4 · ✓=已在股票池
+          </div>
+          <table>
+            <thead><tr><th>#</th><th>代码</th><th>名称</th><th>综合分</th><th>基本面</th><th>技术面</th><th>PE</th><th>ROE</th><th>动量20</th><th>反转60</th><th>池</th></tr></thead>
+            <tbody>
+              <tr v-for="(c,i) in selection.candidates" :key="c.code">
+                <td>{{ i+1 }}</td>
+                <td>{{ c.code }}</td>
+                <td>{{ c.name }}</td>
+                <td><b :class="c.total_score>=70?'up':(c.total_score>=55?'':'down')">{{ c.total_score }}</b></td>
+                <td>{{ c.fund_score }}</td>
+                <td>{{ c.tech_score ?? '-' }}</td>
+                <td>{{ c.pe }}</td>
+                <td>{{ c.roe }}</td>
+                <td :class="(c.mom20||0)>=0?'up':'down'">{{ c.mom20!=null ? (c.mom20*100).toFixed(1)+'%' : '-' }}</td>
+                <td>{{ c.rev60!=null ? (c.rev60*100).toFixed(1)+'%' : '-' }}</td>
+                <td>{{ c.in_universe ? '✓' : '·' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else class="muted" style="font-size:12px">{{ selection.message || '今日选股加载中...' }}</div>
+      </div>
+    </div>
+
+    <!-- ============ Tab 3 模拟炒股 ============ -->
+    <div v-show="tab==='manual'">
+      <div class="cards">
+        <div class="card"><div class="label">总资产</div>
+          <div class="value" :class="mAcct.total_return >= 0 ? 'up' : 'down'">¥{{ fmt(mAcct.equity) }}</div></div>
+        <div class="card"><div class="label">可用现金</div>
+          <div class="value">¥{{ fmt(mAcct.cash) }}</div></div>
+        <div class="card"><div class="label">累计收益</div>
+          <div class="value" :class="mAcct.total_return >= 0 ? 'up' : 'down'">{{ (mAcct.total_return*100).toFixed(2) }}%</div></div>
+        <div class="card"><div class="label">当日收益</div>
+          <div class="value" :class="todayPnl >= 0 ? 'up' : 'down'">{{ todayPnl>=0?'+':'' }}¥{{ fmt(Math.abs(todayPnl)) }}</div>
+          <div class="muted" style="font-size:11px" :class="todayPnl>=0?'up':'down'">{{ todayPnlPct>=0?'+':'' }}{{ todayPnlPct }}% 较本金</div></div>
+        <div class="card"><div class="label">持仓数</div>
+          <div class="value">{{ mPositions.length }}</div></div>
+        <div class="card"><div class="label">大盘涨跌 <span class="muted" style="font-size:10px">上证参考</span></div>
+          <div class="value" :class="indexRef && indexRef.change_pct>=0 ? 'up' : 'down'">{{ indexRef ? (indexRef.change_pct>=0?'+':'')+indexRef.change_pct.toFixed(2)+'%' : '--' }}</div>
+          <div class="muted" style="font-size:11px">{{ indexRef ? indexRef.name+' '+indexRef.point.toFixed(2) : '加载中' }}</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>账户净值曲线 <span class="muted" style="font-size:12px">总资产走势（每次交易 / 每个交易日更新）</span></h2>
+        <div id="mEquityChart" style="height:260px"></div>
+      </div>
+
+      <div class="panel">
+        <h2>⭐ 组合调仓 <span class="muted" style="font-size:12px">交易池={{ portfolio.candidate_source==='selection' ? '今日选股·600只大池' : '40只模型池' }} · 综合分=基本面0.6+技术0.4(含低波动/60日反转) · 风控（大盘弱势降仓/单票≤20%）</span>
+          <span v-if="portfolio.regime && portfolio.regime.regime" class="status-tag" style="margin-left:6px">
+            市场:{{ portfolio.regime.regime }}
+          </span>
+        </h2>
+        <div v-if="portfolio.market_weak && portfolio.market_weak.weak"
+             style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4);color:#d29922;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
+          ⚠️ 大盘弱势（沪深300/上证 {{ portfolio.market_weak.index_pct }}%，阈值 {{ portfolio.market_weak.threshold }}%）→ 已降仓保护：买入仓位≤{{ (portfolio.market_weak.weak_position_pct||0.5)*100 }}% · 单票≤20% · 盘中分钟看空暂停买入
+        </div>
+        <div v-if="portfolio.targets && portfolio.targets.length" class="grid2" style="margin-bottom:8px">
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:4px">组合目标 top{{ portfolio.top_n }}{{ portfolio.candidate_source==='selection' ? '（今日选股综合分，池内标附模型参考）' : '（模型综合分）' }}</div>
+            <table>
+              <thead><tr><th>#</th><th>代码</th><th>名称</th><th>综合分</th><th>模型(池内)</th><th>择时</th><th>技术面</th><th>盘中分钟</th></tr></thead>
+              <tbody>
+                <tr v-for="(t,i) in portfolio.targets" :key="t.symbol">
+                  <td>{{ i+1 }}</td><td>{{ t.symbol }}</td>
+                  <td>{{ t.name }}<span v-if="!t.in_universe" class="tag tag-hold" style="font-size:10px;margin-left:4px">池外</span></td>
+                  <td><b :class="t.score>=70?'up':(t.score>=55?'':'down')">{{ t.score.toFixed(1) }}</b></td>
+                  <td :class="t.prob!=null ? (t.prob>=0.5?'up':'down') : ''">{{ t.prob!=null ? (t.prob*100).toFixed(1)+'%' : '--' }}</td>
+                  <td>{{ timingLabel(t.timing_action) }}</td>
+                  <td class="muted" style="font-size:11px">{{ t.advisor_label || '-' }}</td>
+                  <td>
+                    <template v-if="t.minute_prob != null">
+                      <span :class="t.minute_prob>=0.5?'up':'down'">{{ (t.minute_prob*100).toFixed(1) }}%</span>
+                      <span class="tag" style="font-size:10px"
+                        :class="t.minute_signal==='buy'?'tag-buy':(t.minute_signal==='sell'?'tag-sell':'tag-hold')">
+                        {{ t.minute_signal==='buy'?'买':(t.minute_signal==='sell'?'卖':'持') }}
+                      </span>
+                    </template>
+                    <span v-else class="muted" style="font-size:11px">收盘/无</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:4px">建议调仓（现金 ¥{{ fmtWan(portfolio.cash) }}）</div>
+            <div v-if="!portfolio.actions.length" class="muted" style="font-size:12px">已是最优组合，无需调整</div>
+            <div v-for="(a,i) in portfolio.actions" :key="i" style="font-size:13px;margin:4px 0">
+              <span class="tag" :class="a.side==='buy'?'tag-buy':'tag-sell'">{{ a.side==='buy'?'买入':'卖出' }}</span>
+              {{ a.symbol }} {{ a.name }} <span class="muted" style="font-size:11px">{{ a.reason }}{{ a.side==='buy' && a.prob!=null ? ' · 模型' + (a.prob*100).toFixed(1) + '%' : '' }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 资金决策（基于现有资金） -->
+        <div v-if="portfolio.allocation && portfolio.allocation.length">
+          <div class="muted" style="font-size:12px;margin-bottom:4px">
+            资金决策 · 总资产 ¥{{ fmtWan(portfolio.total_assets) }} · 等权（每只≈预算/{{ portfolio.top_n }}）· 整手 100 股
+          </div>
+          <table>
+            <thead><tr><th>代码</th><th>名称</th><th>操作</th><th>当前市值</th><th>目标市值</th><th>建议买入</th><th>预估金额</th><th>理由</th></tr></thead>
+            <tbody>
+              <tr v-for="a in portfolio.allocation" :key="a.symbol">
+                <td>{{ a.symbol }}</td><td>{{ a.name }}</td>
+                <td><span class="tag" :class="a.action==='buy'?'tag-buy':(a.action==='add'?'tag-add':(a.action==='skip'?'tag-sell':'tag-hold'))">{{ allocLabel(a.action) }}</span></td>
+                <td>{{ a.current_value>0 ? fmtWan(a.current_value) : '-' }}</td>
+                <td>{{ fmtWan(a.target_value) }}</td>
+                <td>{{ a.est_shares>0 ? a.est_shares+'股' : '-' }}</td>
+                <td>{{ a.est_amount>0 ? fmtWan(a.est_amount) : '-' }}</td>
+                <td class="muted" style="font-size:11px">{{ a.reason }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:10px">
+          <button class="order-btn buy" style="width:auto;padding:8px 18px" @click="submitPortfolio" :disabled="pfBusy || !portfolio.trading_hours">
+            {{ pfBusy ? '调仓中...' : '一键执行组合调仓' }}
+          </button>
+          <span v-if="!portfolio.trading_hours" class="muted" style="font-size:12px">⏸ 交易时段内可执行</span>
+          <span v-if="pfMsg" :class="pfOk?'up':'down'" style="font-size:12px">{{ pfMsg }}</span>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="panel">
+          <h2>资产构成（现金 vs 持仓）</h2>
+          <div id="mAssetsChart" style="height:260px"></div>
+        </div>
+        <div class="panel">
+          <h2>持仓盈亏分布</h2>
+          <div id="mPnlChart" style="height:260px"></div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="panel">
+          <h2>下单（真实行情 · 模拟撮合）</h2>
+          <div class="order-form">
+            <div class="form-row">
+              <label>股票</label>
+              <select v-model="order.symbol">
+                <option v-for="s in stocks" :key="s.symbol" :value="s.symbol">{{ s.symbol }} {{ s.name }}</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>方向</label>
+              <div class="side-group">
+                <label class="side-btn buy" :class="{on: order.side==='buy'}">
+                  <input type="radio" value="buy" v-model="order.side"> 买入</label>
+                <label class="side-btn sell" :class="{on: order.side==='sell'}">
+                  <input type="radio" value="sell" v-model="order.side"> 卖出</label>
+              </div>
+            </div>
+            <div class="form-row">
+              <label>数量(股)</label>
+              <input type="number" v-model.number="order.shares" min="100" step="100">
+              <span class="muted">预估 ¥{{ estAmount }}</span>
+            </div>
+            <div class="muted" style="font-size:11px;margin-bottom:6px">
+              规则：买入须 100 股整数倍 · 当日买入不可卖（T+1）· 卖出含印花税 0.05% · 涨停买不进/跌停卖不出
+            </div>
+            <button class="order-btn" :class="order.side" @click="submitOrder" :disabled="submitting || !isTradingHours">
+              {{ submitting ? '提交中...' : (order.side==='buy' ? '买入' : '卖出') }}
+            </button>
+            <div v-if="!isTradingHours" class="muted" style="font-size:12px;margin-top:6px">
+              ⏸ 当前非交易时段，无法下单（交易日 9:30-11:30 / 13:00-15:00）
+            </div>
+            <div v-if="orderMsg" class="order-msg" :class="{ok: orderOk}">{{ orderMsg }}</div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>我的持仓</h2>
+          <table>
+            <thead><tr><th>代码</th><th>名称</th><th>股数</th><th>成本</th><th>现价</th><th>波动率</th><th>盈亏</th><th>止损线</th><th>止盈线</th></tr></thead>
+            <tbody>
+              <tr v-if="mPositions.length === 0"><td colspan="9" class="muted">当前空仓，去买入吧</td></tr>
+              <tr v-for="p in mPositions" :key="p.symbol">
+                <td>{{ p.symbol }}</td><td>{{ p.name }}</td>
+                <td>{{ p.shares }}</td><td>{{ p.avg_cost }}</td><td>{{ p.price }}</td>
+                <td class="muted">{{ p.atr_pct ? (p.atr_pct*100).toFixed(1)+'%' : '-' }}</td>
+                <td :class="p.unrealized_pnl >= 0 ? 'up' : 'down'">{{ p.unrealized_pnl.toFixed(2) }} ({{ (p.pnl_pct*100).toFixed(1) }}%)</td>
+                <td class="muted">{{ p.stop_price }}<span v-if="p.mode==='dynamic'" class="tag" style="margin-left:4px;font-size:10px">{{ (p.sl_pct*100).toFixed(1) }}%</span><span v-if="p.stop_dist<=3" class="tag tag-sell" style="margin-left:4px;font-size:10px">警戒</span></td>
+                <td class="muted">{{ p.take_price }}<span v-if="p.mode==='dynamic'" class="tag" style="margin-left:4px;font-size:10px">{{ (p.tp_pct*100).toFixed(1) }}%</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>模拟成交记录</h2>
+        <table>
+          <thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>成交价</th><th>手续费</th><th>金额</th><th>备注</th></tr></thead>
+          <tbody>
+            <tr v-if="mTrades.length === 0"><td colspan="8" class="muted">暂无成交</td></tr>
+            <tr v-for="(t, i) in mTrades" :key="i">
+              <td>{{ t.date }}</td><td>{{ t.symbol }}</td>
+              <td :class="t.side === 'buy' ? 'up' : 'down'">{{ t.side === 'buy' ? '买入' : '卖出' }}</td>
+              <td>{{ t.shares.toFixed(0) }}</td><td>{{ t.price.toFixed(2) }}</td>
+              <td>{{ t.fee.toFixed(2) }}</td><td>{{ t.amount.toFixed(2) }}</td>
+              <td v-if="t.remark" class="tag tag-sell" style="font-size:11px">{{ t.remark }}</td>
+              <td v-else class="muted">-</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ============ Tab 4 择时 ============ -->
+    <div v-show="tab==='timing'">
+      <div class="cards">
+        <div class="card"><div class="label">市场状态</div>
+          <div class="value" :class="regimeColor(timing.regime.regime)">{{ timing.regime.description }}</div></div>
+        <div class="card"><div class="label">代理指数</div>
+          <div class="value">{{ timing.regime.price }}</div></div>
+        <div class="card"><div class="label">年化波动率</div>
+          <div class="value">{{ (timing.regime.volatility*100).toFixed(1) }}%</div></div>
+        <div class="card"><div class="label">买入信号</div>
+          <div class="value up">{{ timingBuyCount }} / {{ timing.signals.length }}</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>自主择时方法 <span class="muted" style="font-size:12px">{{ timing.explain }}</span></h2>
+        <div class="grid4" v-if="timing.weights">
+          <div v-for="(w, name) in timing.weights" :key="name" class="m">
+            <div class="muted" style="font-size:12px;margin-bottom:6px">{{ methodName(name) }} <b>{{ (w*100).toFixed(0) }}%</b></div>
+            <div class="prob-bar"><div :style="{width:(w*100)+'%', background:'#58a6ff'}"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>每只股票买卖点信号（多方法加权）</h2>
+        <table>
+          <thead><tr><th>代码</th><th>名称</th><th>现价</th><th>信号</th><th>综合分</th><th>触发依据</th></tr></thead>
+          <tbody>
+            <tr v-if="timing.signals.length===0"><td colspan="6" class="muted">暂无信号</td></tr>
+            <tr v-for="t in timing.signals" :key="t.symbol">
+              <td>{{ t.symbol }}</td><td>{{ t.name }}</td>
+              <td>{{ t.close.toFixed(2) }}</td>
+              <td><span class="tag" :class="tagCls(t.action)">{{ actionLabel(t.action) }}</span></td>
+              <td :class="t.score>=0?'up':'down'">{{ t.score>0?'+':'' }}{{ t.score }}</td>
+              <td><div v-for="(r,i) in t.reasons" :key="i" class="reason">· {{ r }}</div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = 'http://127.0.0.1:8001';   // ← 改为你实际启动 API 的地址
+
+const { createApp } = Vue;
+
+createApp({
+  data() {
+    return {
+      tab: 'advisor',
+      advice: [],
+      acct: { equity: 0, cash: 0, total_return: 0 },
+      stocks: [], positions: [], trades: [],
+      buyCount: 0,
+      mAcct: { equity: 0, cash: 0, total_return: 0 },
+      mPositions: [], mTrades: [], mEquity: [],
+      portfolio: { top_n: 5, targets: [], actions: [], allocation: [], trading_hours: false, candidate_source: 'selection', regime: null, cash: 0, total_assets: 0 },
+      indices: { indices: [], breadth: { up: 0, down: 0, flat: 0, total: 0 }, last_update: '' },
+      indexSymbol: 'sh000001', indexBars: [],
+      selection: { date: null, candidates: [], message: '' },
+      selBusy: false, selMsg: '',
+      pfMsg: '', pfOk: false, pfBusy: false,
+      order: { symbol: '', side: 'buy', shares: 100 },
+      orderMsg: '', orderOk: false, submitting: false,
+      lastUpdated: '',
+      autoRefreshOn: true,
+      refreshing: false, refreshMsg: '',
+      realtimeQuotes: [], rtLastUpdate: '', rtInterval: 10,
+      sortKey: '', sortDir: 'desc',
+      marketCode: 'unknown', marketText: '加载中',
+      minuteSymbol: '', minuteBars: [],
+      minuteProb: null, minuteSignal: 'hold', minuteNote: '',
+      weights: { weights: null, reason: [], meta: { sample: 0, profit_symbols: [] } },
+      timing: { regime: { regime: 'range', description: '加载中', price: 0, volatility: 0 }, weights: null, explain: '', signals: [] },
+      timingBuyCount: 0,
+    };
+  },
+  computed: {
+    estAmount() {
+      const s = this.stocks.find(x => x.symbol === this.order.symbol);
+      return s ? (s.close * (this.order.shares || 0)).toFixed(2) : '0.00';
+    },
+    isTradingHours() {
+      return this.marketCode === 'open';
+    },
+    // 当日收益（金额差值）：当前总资产 - 初始本金（账户重置后从本金起算）
+    todayPnl() {
+      const eq = +(this.mAcct.equity || 0);
+      const base = this.baseCapital;
+      return +(eq - base).toFixed(2);
+    },
+    todayPnlPct() {
+      const base = this.baseCapital;
+      return base ? +(this.todayPnl / base * 100).toFixed(2) : 0;
+    },
+    baseCapital() {
+      return +(this.mAcct.initial_capital || 100000);
+    },
+    indexRef() {
+      const arr = (this.indices && this.indices.indices) || [];
+      return arr.find(i => i.code === 'sh000001') || null;
+    },
+    sortedQuotes() {
+      if (!this.sortKey) return this.realtimeQuotes;
+      const dir = this.sortDir === 'desc' ? -1 : 1;
+      const key = this.sortKey;
+      return [...this.realtimeQuotes].sort((a, b) => {
+        let x = this.sortVal(a, key), y = this.sortVal(b, key);
+        if (x == null) x = -Infinity;
+        if (y == null) y = -Infinity;
+        if (typeof x === 'string') { x = x.toLowerCase(); y = String(y).toLowerCase(); }
+        return (x > y ? 1 : x < y ? -1 : 0) * dir;
+      });
+    },
+  },
+  watch: {
+    tab(v) {
+      // 切到模拟炒股时容器变为可见，重新绘制图表（修正 display:none 时的 0 尺寸）
+      if (v === 'manual') this.$nextTick(() => this.drawManualCharts());
+      // 切回买卖决策时重绘大盘K线 + 分钟K线（display:none 期间图表尺寸为 0）
+      if (v === 'advisor') {
+        this.$nextTick(() => {
+          this.drawIndexChart();
+          if (this.minuteBars.length) this.drawMinute();
+          else this.loadMinute();
+        });
+      }
+    },
+  },
+  mounted() {
+    this.loadAll();
+    // 数据自动轮询：每 60 秒静默刷新一次（不弹错误弹窗）
+    setInterval(() => this.loadAll(false), 60 * 1000);
+    // 模拟炒股实时估值：每 15 秒同步持仓市值/总资产（跟随盘中实时价）
+    setInterval(() => this.refreshManual(), 15000);
+    // 实时行情：每 5 秒轮询（与数据刷新分离）
+    this.loadRealtime();
+    setInterval(() => this.loadRealtime(), 5000);
+    // 分钟K线：每 60 秒刷新
+    this.loadMinute();
+    setInterval(() => this.loadMinute(), 60 * 1000);
+    // 大盘指数K线：首次加载（30分钟缓存，后续手动切换）
+    this.loadIndexKline();
+  },
+  methods: {
+    fmt(v) { return Number(v || 0).toFixed(2); },
+    methodName(n) { return { probability: '概率', momentum: '动量', mean_reversion: '均值回归', trend: '趋势' }[n] || n; },
+    actionLabel(a) { return { buy: '买入', sell: '卖出', hold: '观望' }[a] || a; },
+    regimeColor(r) { return { uptrend: 'up', downtrend: 'down', range: 'muted' }[r] || 'muted'; },
+    async refreshNow() {
+      // 立即全量刷新（含反馈）：实时 + 数据 + 分钟K线
+      this.refreshing = true;
+      this.refreshMsg = '';
+      await this.loadAll(true);   // 失败会弹出提示
+      await this.loadRealtime();
+      await this.loadMinute();
+      await this.loadIndexKline();
+      this.refreshMsg = '已刷新 ' + new Date().toLocaleTimeString();
+      this.refreshing = false;
+    },
+    fmtWan(v) {
+      v = Number(v || 0);
+      return v >= 1e8 ? (v / 1e8).toFixed(2) + '亿' : (v / 1e4).toFixed(0) + '万';
+    },
+    fmtVol(v) {
+      // 单位是「股」，转「手」显示（100股 = 1手）
+      v = Number(v || 0);
+      const hands = v / 100;
+      return hands >= 10000 ? (hands / 10000).toFixed(1) + '万手' : hands.toFixed(0) + '手';
+    },
+    async loadRealtime() {
+      try {
+        const r = await this.api('/api/realtime');
+        this.realtimeQuotes = r.quotes;
+        this.rtLastUpdate = r.last_update || '';
+        this.rtInterval = r.interval || 10;
+        this.marketCode = (r.market && r.market.code) || 'unknown';
+        this.marketText = (r.market && r.market.text) || '状态未知';
+      } catch (e) { /* 实时行情失败静默，等待下个周期 */ }
+    },
+    async loadMinute() {
+      if (!this.minuteSymbol) return;
+      try {
+        const r = await this.api('/api/minute/' + this.minuteSymbol);
+        this.minuteBars = r.bars || [];
+        this.minuteProb = (r.minute_prob !== undefined) ? r.minute_prob : null;
+        this.minuteSignal = r.minute_signal || 'hold';
+        this.minuteNote = r.minute_note || '';
+        this.drawMinute();
+      } catch (e) { /* 分钟K线失败静默 */ }
+    },
+    drawMinute() {
+      if (!this.minuteBars.length) return;
+      if (this._mChart) this._mChart.dispose();
+      const chart = echarts.init(document.getElementById('minuteChart'));
+      this._mChart = chart;
+      // 完整时间戳做轴值，标签显示 MM-DD HH:MM（跨天也能看出日期）
+      const times = this.minuteBars.map(b => b.datetime);
+      const ohlc = this.minuteBars.map(b => [b.open, b.close, b.low, b.high]);
+      chart.setOption({
+        grid: { left: 60, right: 20, top: 20, bottom: 50 },
+        tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+        xAxis: {
+          type: 'category', data: times, axisLine: { lineStyle: { color: '#30363d' } },
+          axisLabel: { interval: 'auto', hideOverlap: true, color: '#8b949e',
+                       formatter: v => String(v).slice(5, 16) },
+        },
+        yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#21262d' } } },
+        dataZoom: [
+          { type: 'inside', start: 0, end: 100 },
+          { type: 'slider', height: 18, bottom: 4, start: 0, end: 100,
+            labelFormatter: v => String(v).slice(5, 16) },
+        ],
+        series: [{
+          type: 'candlestick', data: ohlc,
+          itemStyle: { color: '#f85149', color0: '#3fb950',
+                       borderColor: '#f85149', borderColor0: '#3fb950' },
+        }],
+      });
+    },
+    tagCls(action) {
+      return { buy: 'tag-buy', sell: 'tag-sell', wait: 'tag-wait' }[action] || 'tag-wait';
+    },
+    async loadIndexKline() {
+      try {
+        const r = await this.api('/api/market/indices/kline?code=' + this.indexSymbol + '&days=150');
+        this.indexBars = r.bars || [];
+        this.drawIndexChart();
+      } catch (e) { /* 指数K线失败静默 */ }
+    },
+    drawIndexChart() {
+      if (!this.indexBars.length) return;
+      const el = document.getElementById('indexChart');
+      if (!el) return;
+      if (this._ixChart) this._ixChart.dispose();
+      const chart = echarts.init(el);
+      this._ixChart = chart;
+      const dates = this.indexBars.map(b => b.date);
+      const ohlc = this.indexBars.map(b => [b.open, b.close, b.low, b.high]);
+      // MA5 / MA20 均线（技术面参考）
+      const closes = this.indexBars.map(b => b.close);
+      const ma = n => closes.map((_, i) => {
+        if (i < n - 1) return null;
+        let s = 0; for (let j = i - n + 1; j <= i; j++) s += closes[j];
+        return +(s / n).toFixed(2);
+      });
+      chart.setOption({
+        grid: { left: 60, right: 20, top: 26, bottom: 50 },
+        tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+        legend: { top: 0, textStyle: { color: '#8b949e', fontSize: 11 },
+                  data: ['MA5', 'MA20'] },
+        xAxis: { type: 'category', data: dates, axisLine: { lineStyle: { color: '#30363d' } } },
+        yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#21262d' } } },
+        dataZoom: [
+          { type: 'inside', start: 60, end: 100 },
+          { type: 'slider', height: 18, bottom: 4, start: 60, end: 100 },
+        ],
+        series: [{
+          type: 'candlestick', data: ohlc,
+          itemStyle: { color: '#f85149', color0: '#3fb950',
+                       borderColor: '#f85149', borderColor0: '#3fb950' },
+        }, {
+          name: 'MA5', type: 'line', data: ma(5), smooth: true, showSymbol: false,
+          lineStyle: { width: 1, color: '#d29922' },
+        }, {
+          name: 'MA20', type: 'line', data: ma(20), smooth: true, showSymbol: false,
+          lineStyle: { width: 1, color: '#58a6ff' },
+        }],
+      });
+    },
+    async api(path, opts) {
+      const resp = await fetch(API_BASE + path, opts);
+      if (!resp.ok) {
+        const t = await resp.json().catch(() => ({}));
+        throw new Error(t.detail || path + ' -> ' + resp.status);
+      }
+      return resp.json();
+    },
+    async loadAll(showError = true) {
+      try {
+        const [adv, dash, mAcct, mPos, mTrades, mEq, w, tmg, pfo, idx, sel] = await Promise.all([
+          this.api('/api/advisor'), this.api('/api/dashboard'),
+          this.api('/api/manual/account'), this.api('/api/manual/positions'),
+          this.api('/api/manual/trades'), this.api('/api/manual/equity'),
+          this.api('/api/weights'), this.api('/api/timing'), this.api('/api/portfolio'),
+          this.api('/api/market/indices'), this.api('/api/selection'),
+        ]);
+        this.weights = w;
+        this.timing = tmg;
+        this.timingBuyCount = (tmg.signals || []).filter(s => s.action === 'buy').length;
+        this.advice = adv.advice;
+        this.acct = dash.account;
+        this.buyCount = dash.stocks.filter(s => s.signal === 1).length;
+        this.stocks = dash.stocks;
+        this.lastUpdated = dash.last_updated || '';
+        this.mAcct = mAcct;
+        this.mPositions = mPos.positions;
+        this.mTrades = mTrades.trades;
+        this.mEquity = (mEq && mEq.equity_curve) || [];
+        this.portfolio = pfo || { top_n: 5, targets: [], actions: [], allocation: [], trading_hours: false, regime: null, cash: 0, total_assets: 0 };
+        this.indices = idx || { indices: [], breadth: { up: 0, down: 0, flat: 0, total: 0 }, last_update: '' };
+        this.selection = sel || { date: null, candidates: [], message: '' };
+        // 自动纸面盘已隐藏，不再加载 /api/positions、/api/trades、/api/equity
+        if (!this.order.symbol && this.stocks.length) {
+          this.order.symbol = this.stocks[0].symbol;
+        }
+        if (!this.minuteSymbol && this.stocks.length) {
+          this.minuteSymbol = this.stocks[0].symbol;
+          this.loadMinute();
+        }
+        this.drawManualCharts();
+      } catch (err) {
+        console.error('加载失败:', err);
+        if (showError) {
+          alert('加载失败：' + err.message + '\n请确认 API 服务已启动（python api/main.py）');
+        }
+      }
+    },
+    async submitOrder() {
+      this.submitting = true; this.orderMsg = ''; this.orderOk = false;
+      try {
+        const r = await this.api('/api/manual/order', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(this.order),
+        });
+        this.orderOk = true;
+        this.orderMsg = `✅ 成交：${r.trade.side === 'buy' ? '买入' : '卖出'} ${r.trade.symbol} ` +
+          `${r.trade.shares.toFixed(0)}股 @ ${r.trade.price.toFixed(2)}（手续费 ${r.trade.fee.toFixed(2)}）`;
+        await this.loadAll();
+      } catch (e) {
+        this.orderOk = false;
+        this.orderMsg = '❌ ' + e.message;
+      } finally {
+        this.submitting = false;
+      }
+    },
+    async submitPortfolio() {
+      this.pfBusy = true; this.pfMsg = ''; this.pfOk = false;
+      try {
+        const r = await this.api('/api/portfolio/apply', { method: 'POST' });
+        const ex = r.executed || [];
+        const errs = ex.filter(e => e.error);
+        const oks = ex.filter(e => !e.error);
+        const fmt = e => (e.side === 'buy' ? '买' : '卖') + ' ' + e.symbol + ' ' + e.name +
+          (e.error ? ' ' + e.error : ` ${e.shares}股@${e.price}`);
+        let msg = oks.length ? '✅ 已成交：' + oks.map(fmt).join('；') : '（本次无成交）';
+        if (errs.length) msg += ' ⚠ 未成交：' + errs.map(fmt).join('；');
+        if (r.notes && r.notes.length) msg += '。风控提示：' + r.notes.join('；');
+        this.pfOk = errs.length === 0;
+        this.pfMsg = msg;
+        await this.loadAll();
+      } catch (e) {
+        this.pfOk = false;
+        this.pfMsg = '❌ ' + e.message;
+      } finally {
+        this.pfBusy = false;
+      }
+    },
+    async runSelection() {
+      this.selBusy = true; this.selMsg = '';
+      try {
+        const r = await this.api('/api/selection/run', { method: 'POST' });
+        this.selMsg = r.message || '选股已启动';
+        // 轮询等待结果（约 1-2 分钟），每 10 秒查一次
+        const wait = async () => {
+          const s = await this.api('/api/selection');
+          if (s && s.candidates && s.candidates.length) {
+            this.selection = s;
+            this.selBusy = false;
+            this.selMsg = '✅ 选股完成：' + s.candidates.length + ' 只（' + s.date + '）';
+          } else if (this.selBusy) {
+            setTimeout(wait, 10000);
+          }
+        };
+        setTimeout(wait, 10000);
+      } catch (e) {
+        this.selBusy = false;
+        this.selMsg = '❌ ' + e.message;
+      }
+    },
+    timingLabel(a) {
+      return { buy: '🟢买', sell: '🔴卖', hold: '⏸持' }[a] || '-'
+    },
+    allocLabel(a) {
+      return { buy: '买入', add: '加仓', hold: '持有', skip: '暂停' }[a] || a
+    },
+    sortBy(key) {
+      if (this.sortKey === key) {
+        this.sortDir = this.sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        this.sortKey = key; this.sortDir = 'desc';
+      }
+    },
+    sortMark(key) {
+      if (this.sortKey !== key) return '';
+      return this.sortDir === 'desc' ? '↓' : '↑';
+    },
+    sortVal(q, key) {
+      if (key === 'bid1') return q.bid && q.bid[0] ? q.bid[0][0] : null;
+      if (key === 'ask1') return q.ask && q.ask[0] ? q.ask[0][0] : null;
+      return q[key];
+    },
+    drawEquity(curve) {
+      const el = document.getElementById('equityChart');
+      if (!el) return;   // 自动纸面盘面板已隐藏，元素不存在时直接返回
+      if (this._chart) this._chart.dispose();
+      const chart = echarts.init(el);
+      this._chart = chart;
+      chart.setOption({
+        grid: { left: 70, right: 20, top: 20, bottom: 40 },
+        tooltip: { trigger: 'axis', valueFormatter: v => '¥' + Number(v).toFixed(2) },
+        xAxis: { type: 'category', data: curve.map(d => d.date), axisLine: { lineStyle: { color: '#30363d' } } },
+        yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#21262d' } } },
+        series: [{
+          name: '总资产', type: 'line', data: curve.map(d => d.equity),
+          smooth: true, showSymbol: false,
+          lineStyle: { width: 2, color: '#58a6ff' },
+          areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [{ offset: 0, color: 'rgba(88,166,255,.35)' }, { offset: 1, color: 'rgba(88,166,255,0)' }] } },
+        }],
+      });
+    },
+    // ---------- 模拟炒股可视化 ----------
+    async refreshManual() {
+      // 实时估值：刷新账户/持仓（总资产跟随盘中实时价），并更新两个图表
+      try {
+        const [acct, pos] = await Promise.all([
+          this.api('/api/manual/account'), this.api('/api/manual/positions'),
+        ]);
+        this.mAcct = acct;
+        this.mPositions = pos.positions;
+        this.drawMAssets();
+        this.drawMPnl();
+      } catch (e) { /* 轮询失败静默，下次重试 */ }
+    },
+    drawManualCharts() {
+      this.drawMEquity();
+      this.drawMAssets();
+      this.drawMPnl();
+    },
+    drawMEquity() {
+      const el = document.getElementById('mEquityChart');
+      if (!el) return;
+      if (this._mEq) this._mEq.dispose();
+      const curve = this.mEquity || [];
+      const initCap = +(this.mAcct.initial_capital || 100000);
+      const chart = echarts.init(el);
+      this._mEq = chart;
+      const fmtAxis = d => {
+        const s = d.date || '';
+        if (s.includes(' ')) { const [date, hm] = s.split(' '); return date.slice(5) + ' ' + hm.slice(0, 5); }
+        return s.slice(5);   // 纯日期只显示 MM-DD
+      };
+      const labels = curve.map(fmtAxis);
+      // 红涨绿跌（A股）：按相邻点涨跌把曲线拆成红/绿分段
+      const segments = [];
+      if (curve.length >= 2) {
+        let start = 0;
+        let up = curve[1].equity >= curve[0].equity;
+        for (let i = 2; i < curve.length; i++) {
+          const cur = curve[i].equity >= curve[i - 1].equity;
+          if (cur !== up) {
+            segments.push(this._mkSeg(curve, start, i, up));
+            start = i - 1;   // 共享端点保持连续
+            up = cur;
+          }
+        }
+        segments.push(this._mkSeg(curve, start, curve.length, up));
+      } else if (curve.length === 1) {
+        segments.push({
+          type: 'line', data: [curve[0].equity], symbol: 'circle', symbolSize: 6,
+          lineStyle: { color: '#f85149' }, itemStyle: { color: '#f85149' },
+        });
+      }
+      chart.setOption({
+        grid: { left: 70, right: 20, top: 20, bottom: 40 },
+        tooltip: {
+          trigger: 'axis',
+          // 分段曲线有很多 null 段，逐个跳过，只显示有效净值点（修复 ¥NaN）
+          formatter: (params) => {
+            const ps = Array.isArray(params) ? params : [params];
+            let val = null;
+            for (const p of ps) {
+              if (p.seriesName === '初始资金') continue;
+              if (p.value != null && isFinite(p.value)) { val = p.value; break; }
+            }
+            const head = (ps[0] && ps[0].axisValue) ? ps[0].axisValue : '';
+            return (head ? head + '<br/>' : '') +
+              (val == null ? '总资产：--' : '总资产：<b>¥' + Number(val).toFixed(2) + '</b>');
+          }
+        },
+        legend: { show: false },
+        xAxis: { type: 'category', data: labels, axisLine: { lineStyle: { color: '#30363d' } } },
+        yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#21262d' } } },
+        series: [...segments, {
+          // 初始资金基准线（虚线）：直观看到盈亏分界
+          name: '初始资金', type: 'line',
+          data: labels.map(() => initCap),
+          smooth: false, showSymbol: false,
+          lineStyle: { type: 'dashed', width: 1, color: '#8b949e' },
+          tooltip: { show: false },
+        }],
+      });
+    },
+    _mkSeg(curve, start, end, up) {
+      // 生成一段曲线：区间内为净值，区间外为 null（红涨绿跌）
+      return {
+        name: up ? '上涨' : '下跌', type: 'line',
+        data: curve.map((d, i) => (i >= start && i < end) ? d.equity : null),
+        smooth: 0.35, showSymbol: false, connectNulls: false,
+        lineStyle: { width: 2, color: up ? '#f85149' : '#3fb950' },
+      };
+    },
+    drawMAssets() {
+      const el = document.getElementById('mAssetsChart');
+      if (!el) return;
+      if (this._mAs) this._mAs.dispose();
+      const cash = +(this.mAcct.cash || 0);
+      const items = [
+        { name: '现金', value: cash },
+        ...this.mPositions.map(p => ({ name: p.name, value: +(p.market_value || 0) })),
+      ];
+      if (items.every(i => i.value <= 0)) items[0].value = 1;  // 全空时占位
+      const chart = echarts.init(el);
+      this._mAs = chart;
+      chart.setOption({
+        tooltip: { trigger: 'item', valueFormatter: v => '¥' + Number(v).toFixed(2) },
+        legend: { bottom: 0, type: 'scroll', textStyle: { color: '#8b949e' } },
+        series: [{
+          type: 'pie', radius: ['45%', '70%'], center: ['50%', '44%'],
+          label: { color: '#c9d1d9', formatter: '{b}: {d}%' },
+          data: items,
+          color: ['#58a6ff', '#3fb950', '#f85149', '#d29922', '#bc8cff', '#39c5cf', '#ff7b72'],
+        }],
+      });
+    },
+    drawMPnl() {
+      const el = document.getElementById('mPnlChart');
+      if (!el) return;
+      if (this._mPnl) this._mPnl.dispose();
+      const data = this.mPositions.map(p => ({
+        name: p.name + ' ' + p.symbol,
+        value: +(p.pnl_pct * 100).toFixed(1),
+      }));
+      const chart = echarts.init(el);
+      this._mPnl = chart;
+      chart.setOption({
+        grid: { left: 110, right: 40, top: 10, bottom: 25 },
+        tooltip: { trigger: 'axis', valueFormatter: v => v + '%' },
+        xAxis: { type: 'value', axisLabel: { formatter: '{value}%', color: '#8b949e' } },
+        yAxis: { type: 'category', data: data.map(d => d.name).reverse(), axisLabel: { color: '#c9d1d9' } },
+        series: [{
+          type: 'bar', data: data.map(d => d.value).reverse(), barWidth: 18,
+          // A股习惯：红涨绿跌（盈利红、亏损绿）
+          itemStyle: { color: p => p.value >= 0 ? '#f85149' : '#3fb950' },
+          label: { show: true, position: 'right', formatter: '{c}%', color: '#8b949e' },
+        }],
+      });
+    },
+  },
+}).mount('#app');
+</script>
+</body>
+</html>

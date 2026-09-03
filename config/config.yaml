@@ -1,0 +1,197 @@
+data:
+  source: akshare
+  db_path: data/market.db
+  csv_dir: data/csv
+  start_date: '2020-01-01'
+  end_date: '2026-08-31'
+  universe:
+  - '000301'
+  - '000333'
+  - 000408
+  - 000792
+  - 000807
+  - 000975
+  - 000977
+  - '002001'
+  - '002027'
+  - '002532'
+  - 002558
+  - '002602'
+  - 002648
+  - 002709
+  - '300628'
+  - '300750'
+  - '300760'
+  - '300866'
+  - '301308'
+  - '600066'
+  - '600160'
+  - '600489'
+  - '600519'
+  - '600549'
+  - '600600'
+  - '600809'
+  - '600989'
+  - '601138'
+  - '601336'
+  - '601600'
+  - '601628'
+  - '601872'
+  - '601899'
+  - '603259'
+  - '603369'
+  - '603986'
+  - '603993'
+  - '605117'
+  - '605499'
+  - '688111'
+  universe_names:
+    '000301': 东方盛虹
+    '000333': 美的集团
+    000408: 藏格矿业
+    000792: 盐湖股份
+    000807: 云铝股份
+    000975: 山金国际
+    000977: 浪潮信息
+    '002001': 新和成
+    '002027': 分众传媒
+    '002532': 天山铝业
+    002558: 巨人网络
+    '002602': 世纪华通
+    002648: 卫星化学
+    002709: 天赐材料
+    '300628': 亿联网络
+    '300750': 宁德时代
+    '300760': 迈瑞医疗
+    '300866': 安克创新
+    '301308': 江波龙
+    '600066': 宇通客车
+    '600160': 巨化股份
+    '600489': 中金黄金
+    '600519': 贵州茅台
+    '600549': 厦门钨业
+    '600600': 青岛啤酒
+    '600809': 山西汾酒
+    '600989': 宝丰能源
+    '601138': 工业富联
+    '601336': 新华保险
+    '601600': 中国铝业
+    '601628': 中国人寿
+    '601872': 招商轮船
+    '601899': 紫金矿业
+    '603259': 药明康德
+    '603369': 今世缘
+    '603986': 兆易创新
+    '603993': 洛阳钼业
+    '605117': 德业股份
+    '605499': 东鹏饮料
+    '688111': 金山办公
+features:
+  window: 30
+  horizon: 5
+  technical:
+  - ma
+  - rsi
+  - macd
+  - volatility
+  - volume_ratio
+model:
+  type: lstm
+  hidden_size: 64
+  num_layers: 2
+  dropout: 0.2
+  lr: 0.001
+  epochs: 50
+  batch_size: 64
+  patience: 8
+  seed: 42
+  device: auto
+# 横截面增强模型（v2，2026-09-02 升级：相对标签 + 截面/Alpha101 特征 + 多模型集成）
+# 根因：旧 LSTM 学"单股绝对涨跌"≈抛硬币(acc~0.5)，与"选股=横截面排序"任务错配。
+# 有该段时 API/重训优先使用 v2；想回退旧模型，删除/改名 results/model_v2 即可。
+model_v2:
+  enabled: true
+  dir: results/model_v2
+  label_mode: relative        # relative = 未来 horizon 跑赢全池当日中位数(截面) | absolute = 未来绝对涨跌
+  cross_features: true        # 加当日截面分位特征 rank_close/rank_volume/rank_ret1/rank_ret5
+  alpha_features: true        # 加 Alpha101 + 自动挖掘精选因子（与 17_factor_mine 共享算子库）
+  members: [lstm, transformer, gbm]   # 集成成员：lstm / transformer / gbm（至少 1 个）
+  gbm:
+    n_estimators: 800         # LightGBM（缺失时回退 sklearn HistGradientBoosting）
+    learning_rate: 0.05
+    num_leaves: 63
+    max_depth: 8
+    min_child_samples: 40
+    subsample: 0.9
+    colsample_bytree: 0.8
+backtest:
+  initial_capital: 100000.0
+  commission: 0.0003
+  slippage: 0.0002
+  stamp_tax: 0.0005    # 印花税（卖出单边，2023.8 起 0.05%）
+  threshold: 0.55
+  position_pct: 0.95
+  risk_free: 0.02      # 无风险利率（年化），用于夏普/Alpha/Treynor/Sortino
+manual:
+  initial_capital: 100000.0
+  db_path: paper/manual_account.db
+  max_order_shares: 10000
+  enforce_trading_hours: true   # 闭市/休市禁止下单（仅交易日 9:30-11:30 / 13:00-15:00）
+  lot_size: 100                # A股买入整手（100 股整数倍）
+auto_refresh:
+  enabled: true
+  check_interval_minutes: 30
+  update_time: '15:30'
+  auto_rebalance: true
+selection:
+  auto: true        # 每日选股：收盘后随自动刷新运行（寻找大盘优质股）
+  n: 12             # 展示优质股数量
+  universe: large   # 候选宇宙：large=现池40∪中小盘缓存~560（600只实证低波动/反转所在）| hs300=仅沪深300
+  # 技术面权重已按 600 只实证固定：动量25 / 趋势15 / 低波动30 / 60日反转30（见 selector._score_tech）
+realtime:
+  enabled: true
+  interval_seconds: 10
+  sources:
+  - sina
+  - tencent
+minute:
+  enabled: true
+  scale: 5
+  refresh_interval: 60
+  datalen: 1023
+  db_path: data/minute.db
+  concurrency: 4
+trading:
+  max_positions: 5
+  minute_adj: 0.05   # 盘中分钟模型对综合分的修正强度（方向化，buy +0.05 / sell -0.05）
+  # 组合/一键调仓的「交易候选」来源：
+  #   selection = 今日选股 topN（600 只大池，基本面+低波动+60日反转实证因子）——主推
+  #   model40   = 旧逻辑：40 只训练池按模型综合分 topN（可随时回退）
+  candidate_source: selection
+portfolio_risk:
+  market_weak_threshold: -1.0   # 大盘(沪深300)当日跌幅低于此值(%) → 弱势，降仓
+  weak_position_pct: 0.5        # 弱势时总仓位上限（占资产比例）
+  max_stock_pct: 0.20           # 单票仓位上限（避免重仓单票）
+  # 分钟否决买入：默认关闭！分钟模型概率极端未校准（常 0.002~0.006 恒判 sell），
+  # 若开启会把盘中所有买入目标都 skip（一键调仓"卖出能成交、买入全被拦"）。
+  # 待分钟模型校准/重训后再置 true；期间靠 大盘弱势降仓 + 单票上限 兜底。
+  minute_veto: false            # true=盘中分钟 sell 暂停买入该目标 | false=只做方向化微调(±minute_adj)
+risk:
+  enabled: true
+  stop_loss_pct: 0.08
+  take_profit_pct: 0.15
+  trailing_stop: true
+  trailing_pct: 0.08
+  # 按波动率动态止盈止损（ATR 自适应）：不同波动股票用不同宽窄的止损/止盈
+  dynamic_volatility: true
+  vol_window: 20          # ATR 计算窗口（日）
+  atr_stop_mult: 2.5      # 止损 = 成本 - 2.5 × ATR
+  atr_take_mult: 3.5      # 止盈 = 成本 + 3.5 × ATR
+  atr_trailing_mult: 2.5  # 移动止损 = 高点 - 2.5 × ATR
+  vol_min_pct: 0.03       # 止损百分比下限（低波动股不设过窄）
+  vol_max_pct: 0.15       # 止损百分比上限（高波动股不设过宽）
+  take_min_pct: 0.05      # 止盈百分比下限
+  take_max_pct: 0.30      # 止盈百分比上限
+api:
+  host: 127.0.0.1
+  port: 8000
