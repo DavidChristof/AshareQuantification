@@ -49,6 +49,26 @@ TECH_TOPK = 40                  # 算技术面的候选数（基本面分高者�
 TECH_WORKERS = 4                # 日线拉取并发数
 CACHE_MAX_AGE_HOURS = 24        # 基本面缓存有效期（小时）
 
+# 技术面因子权重（mom/trd/vol/rev），regime 门控可切换（见 fetch_market_regime）
+# 实证（29_regime_split_validation，600池 h20）：价量 alpha 是「条件性」的——
+#   下跌市 低波动+60日反转 最强（RankIC 0.118 / 超额 +1.4%）→ 防守/超跌反弹
+#   上涨市 低波/反转 负暴露（RankIC -0.072 / 超额 -1.8%）→ 动量/趋势主导
+DEFAULT_TECH_WEIGHTS = {"mom": 25, "trd": 15, "vol": 30, "rev": 30}
+TECH_REGIME_WEIGHTS: dict[str, dict[str, float]] = {
+    "uptrend":   {"mom": 45, "trd": 25, "vol": 15, "rev": 15},  # 上涨趋势：追涨
+    "range":     {"mom": 20, "trd": 10, "vol": 35, "rev": 35},  # 震荡：均值回归
+    "downtrend": {"mom": 10, "trd": 10, "vol": 35, "rev": 45},  # 下跌：防守/超跌反弹
+}
+_REGIME_CN = {"uptrend": "上涨趋势", "range": "震荡整理", "downtrend": "下跌趋势"}
+
+
+def pick_tech_weights(regime: str | None) -> dict[str, float]:
+    """regime → 技术面权重（未知/数据不足回退默认），各分量和为 100。"""
+    w = dict(TECH_REGIME_WEIGHTS.get(regime or "", DEFAULT_TECH_WEIGHTS))
+    total = float(sum(w.values())) or 1.0
+    return {k: round(v / total * 100, 1) for k, v in w.items()}
+
+
 
 # ---------- 数据获取 ----------
 def fetch_liquidity(codes: Iterable[str], batch: int = 80) -> dict[str, float]:
@@ -271,25 +291,49 @@ def _daily_tech(code: str, days: int = 120) -> dict | None:
         return None
 
 
-def _score_tech(t: dict | None) -> float | None:
-    """技术面分（0~100）：动量25 + 趋势15 + 低波动30 + 中期反转30。
+def _score_tech(t: dict | None,
+                weights: dict | None = None) -> float | None:
+    """技术面分（0~100）：(动量+趋势+低波动+中期反转) × 权重。
 
-    权重来自 600 只横截面实证（20 日预测期 IC）：低波动 vol20≈-0.050、
-    60 日反转 rev60≈+0.045 是最强的两个价量异象，故占比最高。
+    默认权重 动量25/趋势15/低波动30/反转30（600 只实证：低波 vol20≈-0.05、
+    60日反转 rev60≈+0.045 最强）；regime 门控时传入 pick_tech_weights(regime)
+    的权重，实现「弱市重防守/强市重追涨」。
     """
     if not t:
         return None
+    w = weights or DEFAULT_TECH_WEIGHTS
     mom = max(0.0, min(1.0, (t["mom20"] + 0.05) / 0.25))       # -5%~20% 动量
     trd = max(0.0, min(1.0, (t["trend"] + 0.05) / 0.10))        # -5%~5% 偏离MA
     vol = max(0.0, min(1.0, 1.0 - t["vol20"] / 0.03))           # 日波动<3% 满分
     rev = max(0.0, min(1.0, (t.get("rev60", 0.0) + 0.20) / 0.30))  # 过去60天跌→反转加分
-    return round(mom * 25 + trd * 15 + vol * 30 + rev * 30, 1)
+    return round(mom * w["mom"] + trd * w["trd"] + vol * w["vol"] + rev * w["rev"], 1)
+
+
+def fetch_market_regime() -> dict | None:
+    """市场状态判定（regime 门控代理）：用沪深300 日 K 线趋势 → 上涨/震荡/下跌。
+
+    实证（29_regime_split_validation）：价量因子 alpha 是「条件性」的——弱市低波/反转
+    是真 alpha、强市动量/趋势才有效。故每日选股用**可观察代理**（沪深300 近 20 日趋势，
+    非未来收益）切换技术面权重。失败/数据不足返回 None → 调用方回退默认权重。
+    """
+    try:
+        from ..realtime.indices import fetch_index_daily  # noqa: PLC0415
+        from ..timing.regime import MarketRegime          # noqa: PLC0415
+        df = fetch_index_daily("sh000300")
+        close = df.set_index("date")["close"].sort_index()
+        r = MarketRegime().detect(close)
+        r["source"] = "sh000300 沪深300(日线趋势)"
+        return r
+    except Exception as exc:  # noqa: BLE001 - 判定失败不阻断选股
+        logger.debug("市场状态判定失败(回退默认权重): %s", exc)
+        return None
 
 
 def select_daily(n: int = 12, basic_topk: int = BASIC_TOPK,
                  tech_topk: int = TECH_TOPK, min_amount: float = MIN_AMOUNT,
                  workers: int = TECH_WORKERS,
-                 universe: str | None = None) -> list[dict]:
+                 universe: str | None = None,
+                 regime_gating: bool | None = None) -> list[dict]:
     """每日选股：流动性 + 基本面(缓存优先) + 技术面 → 综合分排名。
 
     流程：
@@ -299,13 +343,26 @@ def select_daily(n: int = 12, basic_topk: int = BASIC_TOPK,
            实时流动性过滤（排除 ST）
         2. 流动性 top basic_topk → 基本面 PE/ROE（缓存缺失增量抓取）
         3. 基本面 top tech_topk → 并发拉日线算技术面
-           （动量/趋势/低波动/60日中期反转，权重来自 600 只实证）
+           （动量/趋势/低波动/60日中期反转；regime_gating=true 时按市场状态
+           沪深300 趋势切换权重：上涨→动量主导 / 震荡→低波+反转 / 下跌→反转+低波防守）
         4. 综合分 = 基本面×0.6 + 技术面×0.4 → top n
+
+    regime_gating: None = 读 config selection.regime_gating（默认 true）；
+                   false 恒用默认权重（向后兼容旧行为）。
 
     Returns:
         [{code, name, pe, roe, fund_score, mom20, trend, vol20, rev60,
-          tech_score, total_score, in_universe}]
+          tech_score, total_score, in_universe, regime, tech_weights}]
     """
+    # ---- regime 门控开关（None → 读 config，默认开启） ----
+    if regime_gating is None:
+        try:
+            from ..config import load_config
+            regime_gating = bool((load_config().get("selection") or {}).get(
+                "regime_gating", True))
+        except Exception:  # noqa: BLE001
+            regime_gating = True
+
     # ---- 候选宇宙 ----
     if universe is None:
         try:
@@ -364,14 +421,22 @@ def select_daily(n: int = 12, basic_topk: int = BASIC_TOPK,
                 tech_map[code] = t
     logger.info("技术面计算完成: %d 只", len(tech_map))
 
-    # 4. 综合打分
+    # 4. 综合打分（regime 门控：先判市场状态 → 选技术面因子权重）
+    regime_code, weights = None, DEFAULT_TECH_WEIGHTS
+    if regime_gating:
+        rinfo = fetch_market_regime()
+        if rinfo:
+            regime_code = rinfo.get("regime")
+            weights = pick_tech_weights(regime_code)
+        logger.info("市场状态: %s 技术面权重=%s",
+                    _REGIME_CN.get(regime_code, "未知(默认)"), weights)
     in_universe = set(load_universe_codes())
     rows = []
     for c in funded:
         fund = fund_map[c]
         ts = tech_map.get(c)
         fund_score = fund["score"] or 0.0
-        tech_score = _score_tech(ts)
+        tech_score = _score_tech(ts, weights)
         if tech_score is None:                 # 无技术面则只靠基本面
             total = fund_score
         else:
@@ -388,6 +453,8 @@ def select_daily(n: int = 12, basic_topk: int = BASIC_TOPK,
             "tech_score": tech_score,
             "total_score": round(total, 1),
             "in_universe": c in in_universe,
+            "regime": regime_code,
+            "tech_weights": dict(weights),
         })
     rows.sort(key=lambda r: -r["total_score"])
     return rows[:n]

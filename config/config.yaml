@@ -147,7 +147,10 @@ selection:
   auto: true        # 每日选股：收盘后随自动刷新运行（寻找大盘优质股）
   n: 12             # 展示优质股数量
   universe: large   # 候选宇宙：large=现池40∪中小盘缓存~560（600只实证低波动/反转所在）| hs300=仅沪深300
-  # 技术面权重已按 600 只实证固定：动量25 / 趋势15 / 低波动30 / 60日反转30（见 selector._score_tech）
+  # regime 门控：按市场状态(沪深300近20日趋势)切换技术面因子权重——实证(29号)价量 alpha 是
+  # 条件性的：下跌市 低波+60日反转 最强(RankIC0.12/超额+1.4%)，上涨市 低波/反转 负暴露 → 动量主导。
+  # 权重表见 quant/data/selector.py: TECH_REGIME_WEIGHTS；false = 恒用默认(动量25/趋势15/低波30/反转30)
+  regime_gating: true
 realtime:
   enabled: true
   interval_seconds: 10

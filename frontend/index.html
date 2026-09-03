@@ -278,7 +278,9 @@
 
       <div class="panel">
         <h2>📋 今日选股
-          <span class="muted" style="font-size:12px">沪深300优质股 · 基本面+技术面综合打分（每日收盘后自动更新）</span>
+          <span v-if="selection.regime && selection.regime.regime" class="status-tag" :class="regimeColor(selection.regime.regime)" style="margin-left:6px;font-size:12px">
+            市场:{{ selection.regime.description || selection.regime.regime }}</span>
+          <span class="muted" style="font-size:12px">600只大池候选 · 基本面+技术面(按市场状态切权重)</span>
           <button class="refresh-btn" style="float:right" @click="runSelection" :disabled="selBusy">
             {{ selBusy ? '选股中...' : '立即选股' }}
           </button>
@@ -287,6 +289,8 @@
           <div class="muted" style="font-size:12px;margin-bottom:6px">
             选股日期：{{ selection.date }}{{ selection.generated_at ? ' ' + selection.generated_at : '' }}
             · 综合分 = 基本面(PE/ROE)×0.6 + 技术面×0.4 · ✓=已在股票池
+            <span v-if="selection.candidates.length && selection.candidates[0].tech_weights">
+              · 技术权重(动量/趋势/低波/反转)={{ selection.candidates[0].tech_weights.mom }}/{{ selection.candidates[0].tech_weights.trd }}/{{ selection.candidates[0].tech_weights.vol }}/{{ selection.candidates[0].tech_weights.rev }}</span>
           </div>
           <table>
             <thead><tr><th>#</th><th>代码</th><th>名称</th><th>综合分</th><th>基本面</th><th>技术面</th><th>PE</th><th>ROE</th><th>动量20</th><th>反转60</th><th>池</th></tr></thead>
@@ -557,7 +561,7 @@ createApp({
       portfolio: { top_n: 5, targets: [], actions: [], allocation: [], trading_hours: false, candidate_source: 'selection', regime: null, cash: 0, total_assets: 0 },
       indices: { indices: [], breadth: { up: 0, down: 0, flat: 0, total: 0 }, last_update: '' },
       indexSymbol: 'sh000001', indexBars: [],
-      selection: { date: null, candidates: [], message: '' },
+      selection: { date: null, candidates: [], message: '', regime: null },
       selBusy: false, selMsg: '',
       pfMsg: '', pfOk: false, pfBusy: false,
       order: { symbol: '', side: 'buy', shares: 100 },

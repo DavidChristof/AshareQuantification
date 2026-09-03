@@ -132,8 +132,10 @@ python tests/test_cross_model.py          # 任一测试文件；全量见第 8 
 ```
 600 只大池候选
   → 基本面：PE/ROE 质量分（实时快照 + 缓存 factor_cache.json）
-  → 技术面：动量25 + 趋势15 + 低波动30 + 60日反转30（权重来自 600 只实证）
-  → select_daily(n=12) → results/daily_selection.json
+  → 技术面（regime 门控，config selection.regime_gating 默认开）：按沪深300 近20日趋势
+    判市场状态 → 切权重：上涨市动量主导 / 震荡低波+反转 / 下跌市反转+低波防守
+     （源自 29 号实证「价量 alpha 是条件性的」：弱市才有真 alpha）
+  → select_daily(n=12) → results/daily_selection.json（含 regime/tech_weights）
   → 一键调仓 portfolio/apply：候选=今日选股 topN，实时价撮合整手，风控(大盘弱势降仓/单票上限)
 ```
 

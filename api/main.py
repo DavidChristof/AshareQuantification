@@ -1262,10 +1262,17 @@ def _run_daily_selection(force: bool = False):
         sel_cfg = cfg.get("selection", {})
         rows = select_daily(n=sel_cfg.get("n", 12))
         now = datetime.now()
+        regime = None
+        try:
+            from quant.data.selector import fetch_market_regime  # noqa: PLC0415
+            regime = fetch_market_regime()
+        except Exception:  # noqa: BLE001
+            pass
         SELECTION_RESULT = {
             "date": now.strftime("%Y-%m-%d"),
             "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             "candidates": rows,
+            "regime": regime,
         }
         path = cfg.resolve("results") / "daily_selection.json"
         path.parent.mkdir(parents=True, exist_ok=True)
