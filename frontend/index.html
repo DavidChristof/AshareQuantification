@@ -957,31 +957,18 @@ createApp({
         return s.slice(5);   // 纯日期只显示 MM-DD
       };
       const labels = curve.map(fmtAxis);
-      // 红涨绿跌（A股）：按相邻点涨跌把曲线拆成红/绿分段
-      const segments = [];
-      if (curve.length >= 2) {
-        let start = 0;
-        let up = curve[1].equity >= curve[0].equity;
-        for (let i = 2; i < curve.length; i++) {
-          const cur = curve[i].equity >= curve[i - 1].equity;
-          if (cur !== up) {
-            segments.push(this._mkSeg(curve, start, i, up));
-            start = i - 1;   // 共享端点保持连续
-            up = cur;
-          }
-        }
-        segments.push(this._mkSeg(curve, start, curve.length, up));
-      } else if (curve.length === 1) {
-        segments.push({
-          type: 'line', data: [curve[0].equity], symbol: 'circle', symbolSize: 6,
-          lineStyle: { color: '#f85149' }, itemStyle: { color: '#f85149' },
-        });
-      }
+      // 账户净值曲线：单条连续平滑线（主题蓝）。
+      // 旧实现按"红涨绿跌"把曲线拆成多段不同颜色并用 null 断开，导致段与段之间
+      // 出现断点、红绿无法平滑衔接（表现为"一段折线一段曲线"）→ 9/3 改为整线。
+      const nPts = curve.length;
+      const data = labels.map((_, i) => {
+        const e = curve[i] && curve[i].equity;
+        return (e != null && isFinite(e)) ? e : null;   // null 仅兜底缺失点
+      });
       chart.setOption({
         grid: { left: 70, right: 20, top: 20, bottom: 40 },
         tooltip: {
           trigger: 'axis',
-          // 分段曲线有很多 null 段，逐个跳过，只显示有效净值点（修复 ¥NaN）
           formatter: (params) => {
             const ps = Array.isArray(params) ? params : [params];
             let val = null;
@@ -997,7 +984,17 @@ createApp({
         legend: { show: false },
         xAxis: { type: 'category', data: labels, axisLine: { lineStyle: { color: '#30363d' } } },
         yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#21262d' } } },
-        series: [...segments, {
+        series: [{
+          // 净值整线：smooth 平滑 + connectNulls 连接缺失点 → 视觉连续
+          name: '总资产', type: 'line',
+          data,
+          smooth: 0.35, showSymbol: nPts <= 40, connectNulls: true,
+          lineStyle: { width: 2, color: '#58a6ff' },
+          itemStyle: { color: '#58a6ff' },
+          areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [{ offset: 0, color: 'rgba(88,166,255,.22)' },
+                         { offset: 1, color: 'rgba(88,166,255,0)' }] } },
+        }, {
           // 初始资金基准线（虚线）：直观看到盈亏分界
           name: '初始资金', type: 'line',
           data: labels.map(() => initCap),
@@ -1006,15 +1003,6 @@ createApp({
           tooltip: { show: false },
         }],
       });
-    },
-    _mkSeg(curve, start, end, up) {
-      // 生成一段曲线：区间内为净值，区间外为 null（红涨绿跌）
-      return {
-        name: up ? '上涨' : '下跌', type: 'line',
-        data: curve.map((d, i) => (i >= start && i < end) ? d.equity : null),
-        smooth: 0.35, showSymbol: false, connectNulls: false,
-        lineStyle: { width: 2, color: up ? '#f85149' : '#3fb950' },
-      };
     },
     drawMAssets() {
       const el = document.getElementById('mAssetsChart');
