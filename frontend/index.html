@@ -326,7 +326,7 @@
           <div class="value" :class="mAcct.total_return >= 0 ? 'up' : 'down'">{{ (mAcct.total_return*100).toFixed(2) }}%</div></div>
         <div class="card"><div class="label">当日收益</div>
           <div class="value" :class="todayPnl >= 0 ? 'up' : 'down'">{{ todayPnl>=0?'+':'' }}¥{{ fmt(Math.abs(todayPnl)) }}</div>
-          <div class="muted" style="font-size:11px" :class="todayPnl>=0?'up':'down'">{{ todayPnlPct>=0?'+':'' }}{{ todayPnlPct }}% 较本金</div></div>
+          <div class="muted" style="font-size:11px" :class="todayPnl>=0?'up':'down'">{{ todayPnlPct>=0?'+':'' }}{{ todayPnlPct }}% 较昨收</div></div>
         <div class="card"><div class="label">持仓数</div>
           <div class="value">{{ mPositions.length }}</div></div>
         <div class="card"><div class="label">大盘涨跌 <span class="muted" style="font-size:10px">上证参考</span></div>
@@ -587,15 +587,19 @@ createApp({
     isTradingHours() {
       return this.marketCode === 'open';
     },
-    // 当日收益（金额差值）：当前总资产 - 初始本金（账户重置后从本金起算）
+    // 当日收益（金额差值）：当前总资产 - 上一交易日收盘权益（较昨收；无历史退回本金）
     todayPnl() {
       const eq = +(this.mAcct.equity || 0);
-      const base = this.baseCapital;
+      const base = this.dayBase;
       return +(eq - base).toFixed(2);
     },
     todayPnlPct() {
-      const base = this.baseCapital;
+      const base = this.dayBase;
       return base ? +(this.todayPnl / base * 100).toFixed(2) : 0;
+    },
+    dayBase() {
+      const prev = this.mAcct.prev_close_equity;
+      return prev != null ? +prev : this.baseCapital;
     },
     baseCapital() {
       return +(this.mAcct.initial_capital || 100000);

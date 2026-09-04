@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 from .base import Broker, Position, TradeResult
@@ -350,10 +351,21 @@ class PaperBroker(Broker):
             init = conn.execute(
                 "SELECT value FROM paper_account WHERE key='initial_capital'").fetchone()
         initial = float(init[0]) if init else cash
+        # 当日收益口径：相对「上一交易日收盘」而非本金（净值历史里 date < 今天的最后一个点）
+        today = date.today().isoformat()
+        prev_close = None
+        for _r in self.equity_history():
+            if str(_r["date"])[:10] < today:
+                prev_close = _r["equity"]
+        base = float(prev_close) if prev_close is not None else float(initial)
+        day_pnl = equity - base
         return {
             "cash": round(cash, 2),
             "market_value": round(mv, 2),
             "equity": round(equity, 2),
             "initial_capital": initial,
             "total_return": equity / initial - 1 if initial else 0.0,
+            "prev_close_equity": round(base, 2),
+            "day_pnl": round(day_pnl, 2),
+            "day_return": round(day_pnl / base, 4) if base else 0.0,
         }

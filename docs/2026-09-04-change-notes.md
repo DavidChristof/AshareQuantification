@@ -83,3 +83,11 @@ pre_holiday:
 - **长假降仓要生效**：每年初把当年法定休市日（非周末部分）填进 `risk.pre_holiday.holiday_dates`
 - **回退旧调仓**：`trading.clear_threshold: null` → 自动盘回到「掉榜即清」
 - 手动盘「顺位补买」候选 = 今日选股（需先有当日选股结果）；候选池范围与目标数可调 `selection` / `trading.max_positions`
+
+## 补充 · 当日收益改为「较昨收」口径
+
+**问题**：Tab3 模拟炒股卡片「当日收益」原来 = 现总资产 − 初始本金（累计口径，标签还写"较本金"）。
+**修复**：`quant/trading/paper.py: live_summary` 新增 `prev_close_equity / day_pnl / day_return`——
+基准 = 净值历史里「日期早于今天」的最后一个点（即上一交易日收盘权益）；
+`frontend/index.html` 当日收益用该基准（`dayBase`，无历史回退本金），标签改「较昨收」。
+首日/账户刚重置（无历史净值）时自动回退本金口径，不报错。
