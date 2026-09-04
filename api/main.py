@@ -51,6 +51,7 @@ from quant.timing.regime import MarketRegime                           # noqa: E
 from quant.timing.selector import explain as timing_explain            # noqa: E402
 from quant.timing.selector import select_weights                       # noqa: E402
 from quant.trading.paper import PaperBroker                            # noqa: E402
+from quant.risk.calendar import parse_dates, upcoming_closure_run     # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -927,6 +928,9 @@ def _portfolio_from_selection(rows: list[dict], n: int):
         weak = False
     pos_pct = (pr.get("weak_position_pct", 0.5) if weak
                else cfg["backtest"].get("position_pct", 0.95))
+    pre_h = _pre_holiday_info()
+    if pre_h.get("active"):
+        pos_pct = min(pos_pct, pre_h["reduce_to_pct"])   # 长假前降仓（取更严）
     cap = total_assets * pr.get("max_stock_pct", 0.20)
 
     ranked = sorted(rows, key=lambda x: -float(x.get("total_score", 0)))
@@ -1089,6 +1093,27 @@ def _portfolio_targets(n: int | None = None):
     return targets, target_set, held
 
 
+def _pre_holiday_info() -> dict:
+    """长假前降仓信息：明天起将连续休市 ≥ min_days_off 天 → active=True。
+
+    用于把目标仓位上限收紧到 reduce_to_pct（规避跨长假跳空）。
+    依赖 config risk.pre_holiday.holiday_dates 维护当年法定休市日；未配置日期则不生效。
+    """
+    ph = (cfg.get("risk", {}) or {}).get("pre_holiday") or {}
+    dates = ph.get("holiday_dates") or []
+    if not dates:
+        return {}
+    holidays = parse_dates(dates)
+    run = upcoming_closure_run(datetime.now().date(), holidays,
+                               min_days=int(ph.get("min_days_off", 3)))
+    if not run:
+        return {}
+    return {"active": True,
+            "days_off": run["days_off"],
+            "break_starts": run["break_starts"],
+            "reduce_to_pct": float(ph.get("reduce_to_pct", 0.5))}
+
+
 def _market_weakness() -> dict:
     """大盘弱势检测：沪深300/上证当日跌幅 < 阈值 或 市场状态为 downtrend。
 
@@ -1112,7 +1137,8 @@ def _market_weakness() -> dict:
     weak = bool((idx_pct is not None and idx_pct < thr) or regime == "downtrend")
     return {"weak": weak,
             "index_pct": round(idx_pct, 2) if idx_pct is not None else None,
-            "regime": regime, "threshold": thr}
+            "regime": regime, "threshold": thr,
+            "pre_holiday": _pre_holiday_info()}
 
 
 def _portfolio_allocation(targets: list, target_set: set, held: set,
@@ -1151,6 +1177,9 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
     weak = bool(market_weak and market_weak.get("weak"))
     pos_pct = (pr.get("weak_position_pct", 0.5) if weak
                else cfg["backtest"].get("position_pct", 0.95))
+    pre_h = _pre_holiday_info()
+    if pre_h.get("active"):
+        pos_pct = min(pos_pct, pre_h["reduce_to_pct"])   # 长假前降仓（取更严）
     budget = total_assets * pos_pct
     n = max(len(targets), 1)
     per = budget / n
@@ -1326,6 +1355,12 @@ def portfolio_apply():
             f"⚠ 大盘弱势（沪深300/上证 {idx_pct}%，阈值 {market_weak.get('threshold')}%），"
             f"买入仓位降至 "
             f"{cfg.get('portfolio_risk', {}).get('weak_position_pct', 0.5)*100:.0f}%")
+    # 0b. 长假前降仓提示（目标仓位上限被收紧，规避跨长假跳空）
+    pre_h = market_weak.get("pre_holiday") or {}
+    if pre_h.get("active"):
+        risk_notes.append(
+            f"⚠ 长假前：{pre_h.get('break_starts')} 起连续休市 {pre_h.get('days_off')} 天，"
+            f"买入仓位降至 {pre_h.get('reduce_to_pct', 0.5) * 100:.0f}%")
 
     # 1. 卖掉落出 topN 的持仓
     for p in MANUAL_BROKER.query_positions():
