@@ -170,15 +170,35 @@ if MINUTE_PREDICTOR:
                 MINUTE_PREDICTOR.window, MINUTE_PREDICTOR.horizon)
 
 
+def _sanitize_signal_table(sig: pd.DataFrame) -> pd.DataFrame:
+    """信号表数值兜底：防止个别股票 NaN 让 dashboard/advisor/timing 序列化 500。
+
+    场景（9/4）：某股信号概率为 NaN（如横截面预测该日特征缺失/停牌）会使
+    JSON 序列化抛 ValueError；close 缺失同理。此处统一：
+        prob_up NaN → 0.5（中性，不误触买卖阈值）；close 缺 → 前收(ffill)。
+    """
+    t = sig.copy()
+    if "close" in t.columns:
+        t["close"] = pd.to_numeric(t["close"], errors="coerce").ffill()
+    if "prob_up" in t.columns:
+        t["prob_up"] = (pd.to_numeric(t["prob_up"], errors="coerce")
+                        .fillna(0.5).clip(0.0, 1.0))
+    if "signal" in t.columns:
+        t["signal"] = pd.to_numeric(t["signal"], errors="coerce").fillna(0).astype(int)
+    return t
+
+
 def _signal_tables() -> dict[str, pd.DataFrame]:
-    """对每只股票生成最新信号表（含日期/收盘/概率/信号）。"""
+    """对每只股票生成最新信号表（含日期/收盘/概率/信号），数值已兜底清洗。"""
     if PREDICTOR is None:
         return {}
     if hasattr(PREDICTOR, "make_signals_all"):
         # v2 横截面模型：截面/Alpha 特征需要全池，一次批量预测
-        return PREDICTOR.make_signals_all(DATA)
+        allsig = PREDICTOR.make_signals_all(DATA)
+        return {s: _sanitize_signal_table(t) for s, t in allsig.items()}
     return {
-        symbol: PREDICTOR.make_signal(DATA[symbol], threshold=cfg["backtest"]["threshold"])
+        symbol: _sanitize_signal_table(
+            PREDICTOR.make_signal(DATA[symbol], threshold=cfg["backtest"]["threshold"]))
         for symbol in DATA
     }
 
