@@ -24,7 +24,7 @@ import logging
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,7 +52,9 @@ from quant.timing.regime import MarketRegime                           # noqa: E
 from quant.timing.selector import explain as timing_explain            # noqa: E402
 from quant.timing.selector import select_weights                       # noqa: E402
 from quant.trading.paper import PaperBroker                            # noqa: E402
-from quant.risk.calendar import parse_dates, upcoming_closure_run     # noqa: E402
+from quant.risk.calendar import (                                      # noqa: E402
+    is_ashare_trading_day, parse_dates, upcoming_closure_run,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +274,57 @@ def _scheduler():
 
 # 启动后台调度线程（daemon，随主进程退出）
 threading.Thread(target=_scheduler, daemon=True).start()
+
+
+def _auto_open_execute_worker():
+    """开盘自动组合调仓：服务在开盘时刻(9:30+delay)正运行时，自动执行一次买入/卖出。
+
+    用日志标记防同一天重复（中途重启也不重跑）；服务当时没开 → 本进程错过则当日不再跑
+    （符合“本地项目无法 24h 挂服务”约束）。执行走 portfolio_apply 同一套决策（含追高拦截/风控）。
+    """
+    try:
+        aoe = (cfg.get("portfolio_risk", {}) or {}).get("auto_open_execute") or {}
+        if not aoe.get("enabled", False):
+            return
+        today = datetime.now().date()
+        holidays = parse_dates(
+            (cfg.get("risk", {}) or {}).get("pre_holiday", {}).get("holiday_dates") or [])
+        if not is_ashare_trading_day(today, holidays):
+            return
+        delay = int(aoe.get("delay_sec", 60))
+        grace = int(aoe.get("grace_min", 25)) * 60
+        trigger = datetime(today.year, today.month, today.day, 9, 30, 0) \
+            + timedelta(seconds=delay)
+        marker = cfg.resolve("logs") / "auto_open_execute_date"
+        while True:
+            now = datetime.now()
+            if now < trigger:
+                time.sleep(max(1.0, min(20.0, (trigger - now).total_seconds())))
+                continue
+            if (now - trigger).total_seconds() > grace:
+                logger.info("[auto-open] 错过开盘触发点（已过 %s 分钟），本日不自动调仓",
+                            grace // 60)
+                return
+            if marker.exists() \
+                    and marker.read_text(encoding="utf-8").strip() == today.isoformat():
+                return                                    # 本日已自动执行过
+            try:
+                logger.info("[auto-open] 触发自动组合调仓 ...")
+                summary = portfolio_apply()
+                logger.info("[auto-open] 完成: %s", summary)
+            except HTTPException as exc:
+                logger.info("[auto-open] 跳过（%s）", exc.detail)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[auto-open] 执行异常: %s", exc, exc_info=True)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(today.isoformat(), encoding="utf-8")
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[auto-open] worker 异常退出: %s", exc)
+
+
+# 启动「开盘自动组合调仓」线程（daemon；配置关闭时立即空转退出）
+threading.Thread(target=_auto_open_execute_worker, daemon=True).start()
 
 
 @app.get("/")

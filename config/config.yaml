@@ -194,6 +194,13 @@ portfolio_risk:
   exec_mode: live
   open_window_minutes: 15      # open 模式下，开盘后前 N 分钟为可执行窗口（9:30 起）
   open_premium_pct: 0.5        # open 模式委托价相对昨收的溢价（%，近似开盘成交/回测口径）
+  # 自动开盘执行：服务在开盘时刻(9:30+delay_sec)正运行时，自动执行一次组合调仓（每日一次）
+  # 人工窗口易吃盘中波动（如东鹏开盘15分钟内大涨）——由机器在开盘瞬间自动触发更贴近开盘价。
+  # 服务当时没开 → 当日不自动跑（符合“无法 24h 挂服务”约束）；手动“一键调仓”不受影响。
+  auto_open_execute:
+    enabled: false
+    delay_sec: 60              # 9:30 后延迟秒数再触发（留出集合竞价→连续竞价过渡）
+    grace_min: 25              # 触发点过后仍允许补跑的分钟数（防线程启动略晚）
 risk:
   enabled: true
   stop_loss_pct: 0.08
