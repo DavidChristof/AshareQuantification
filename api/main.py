@@ -200,10 +200,18 @@ def _run_auto_update():
             from quant.trading.updater import (  # noqa: PLC0415
                 latest_trade_date, rebalance_auto, rebuild_signals, refresh_market_data,
             )
+            from quant.data.storage import MarketDB  # noqa: PLC0415
             logger.info("[auto] 开始自动更新 ...")
+            # 休市/节假日感知：库内最新交易日未推进到新一天 → 拉不到新行情，
+            # 说明今日未开市（周末/法定假日）或早已更新过 → 跳过调仓与选股，避免空跑交易
+            db = MarketDB(cfg.resolve(cfg["data"]["db_path"]))
+            before = db.latest_date()
             refresh_market_data(cfg)
             data, signals = rebuild_signals(cfg, PREDICTOR)
             date = latest_trade_date(data)
+            if str(date) == (before or ""):
+                logger.info("[auto] 行情未推进到新交易日（最新 %s）→ 休市或已更新，跳过调仓/选股", date)
+                return
             ar = cfg.get("auto_refresh", {})
             if ar.get("auto_rebalance", True):
                 rebalance_auto(cfg, BROKER, signals, date, data)
@@ -745,15 +753,34 @@ def manual_equity():
     return {"equity_curve": MANUAL_BROKER.equity_history()}
 
 
+def _market_status_now() -> dict:
+    """当前市场状态（open/closed_today/market_closed/unknown）；快照空或异常返回 unknown。
+
+    复用 _market_status：行情时间戳日期 ≠ 今天 → market_closed（休市：周末/法定节假日）。
+    """
+    try:
+        return _market_status(QUOTE_MANAGER.snapshot())
+    except Exception:  # noqa: BLE001
+        return {"code": "unknown", "text": "状态未知"}
+
+
 def _in_trading_hours() -> bool:
-    """当前是否处于 A股交易时段（工作日 9:30-11:30 / 13:00-15:00）。"""
+    """是否处于 A股交易时段（工作日 9:30-11:30 / 13:00-15:00 且今日确为交易日）。
+
+    节假日感知：即便在工作日时段，若实时快照显示最近成交日 ≠ 今天（market_closed，
+    即法定节假日休市），也不放行；快照缺失/状态未知时回退到「周几+时段」判定。
+    """
     if not cfg.get("manual", {}).get("enforce_trading_hours", True):
         return True
     now = datetime.now()
     if now.weekday() >= 5:
         return False
     hm = now.hour * 100 + now.minute
-    return 930 <= hm <= 1130 or 1300 <= hm <= 1500
+    if not (930 <= hm <= 1130 or 1300 <= hm <= 1500):
+        return False
+    if _market_status_now().get("code") == "market_closed":
+        return False            # 法定节假日休市（实时最近成交日非今天）
+    return True                 # open / closed_today / unknown 均按周几+时段放行
 
 
 class OrderRequest(BaseModel):
@@ -767,7 +794,8 @@ def manual_order(order: OrderRequest):
     """手动下单：用最新收盘价在模拟盘成交（仅限交易时段）。"""
     # 交易时间限制：闭市/休市禁止下单（可配置关闭）
     if not _in_trading_hours():
-        if datetime.now().weekday() >= 5:
+        if (datetime.now().weekday() >= 5
+                or _market_status_now().get("code") == "market_closed"):
             raise HTTPException(400, "今日休市（周末/节假日），无法下单")
         raise HTTPException(
             400, "非交易时段无法下单（A股交易时间 9:30-11:30 / 13:00-15:00，周一至周五）")

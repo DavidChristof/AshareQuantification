@@ -89,6 +89,15 @@ class MarketDB:
             rows = conn.execute(query).fetchall()
         return [r[0] for r in rows]
 
+    def latest_date(self) -> str | None:
+        """库内全部股票的最新日期（YYYY-MM-DD 文本）；空库返回 None。
+
+        用于判断「行情是否推进到新交易日」（区分休市/节假日空跑）。
+        """
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+        return row[0] if row and row[0] else None
+
     def stats(self) -> dict:
         with self._connect() as conn:
             total = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
