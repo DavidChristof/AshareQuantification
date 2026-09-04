@@ -1039,22 +1039,35 @@ def _market_weakness() -> dict:
 def _portfolio_allocation(targets: list, target_set: set, held: set,
                           prices: dict,
                           market_weak: dict | None = None) -> list[dict]:
-    """基于现有资金 + 风控决策：等权目标、个股上限、大盘弱势降仓、分钟否决。
+    """基于现有资金 + 风控决策：等权目标、个股上限、大盘弱势降仓、分钟否决、A股整手。
 
-    规则（对应复盘改进）：
+    规则（对应复盘改进 + 2026-09-04 修复）：
         - 总仓位预算 = 总资产 × position_pct（默认 95%）；**大盘弱势降到 weak_position_pct**
         - 每只目标等权 = 预算/目标数，但**不超过单票上限 max_stock_pct×总资产**
-        - 已持有达标 → 持有；不足 → 加仓；未持有 → 买入（整手 100）
+        - 按「目标整手股数」决策，避免把"已有持仓/差额不足一手"误报成资金不足：
+            已持有且已达/超过目标整手 → hold（持有）
+            已持有、低于目标但差额不足以凑 1 手 → hold（距目标不足一手，不硬凑）
+            已持有、不足且可整手补仓 → add（加仓至目标整手）
+            未持有、单票预算/可用现金够 1 手 → buy（新进）
+            未持有但现价×100 超预算 → skip（明示"现价高，单票预算买不起 1 手"）
         - **盘中分钟 sell（未来25分钟看空）且 minute_veto → 暂停买入该目标**（action=skip）
     """
     pr = cfg.get("portfolio_risk", {})
+    slip = MANUAL_BROKER.slippage
+    commission = getattr(MANUAL_BROKER, "commission", 0.0003)
+    lot = max(int(getattr(MANUAL_BROKER, "lot_size", 100) or 100), 1)
+
     cash = MANUAL_BROKER.query_cash()
+    held_sh: dict[str, float] = {}
+    held_vals: dict[str, float] = {}
     held_value = 0.0
-    held_vals = {}
     for p in MANUAL_BROKER.query_positions():
-        v = prices.get(p.symbol, p.avg_cost) * p.shares
-        held_value += v
+        price = prices.get(p.symbol)
+        px = price if price and price > 0 else p.avg_cost
+        v = px * p.shares
+        held_sh[p.symbol] = p.shares
         held_vals[p.symbol] = v
+        held_value += v
     total_assets = cash + held_value
     weak = bool(market_weak and market_weak.get("weak"))
     pos_pct = (pr.get("weak_position_pct", 0.5) if weak
@@ -1063,53 +1076,77 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
     n = max(len(targets), 1)
     per = budget / n
     cap = total_assets * pr.get("max_stock_pct", 0.20)      # 单票上限
-    target_val = min(per, cap)
-    slip = MANUAL_BROKER.slippage
+    slot_val = min(per, cap)
+
+    cash_left = cash                     # 模拟多只买入的现金递减，与真实撮合一致
     out = []
     for t in targets:
         symbol = t["symbol"]
+        name = _display_name(symbol)
         price = prices.get(symbol)
         if price is None or price <= 0:
             continue
         cur = held_vals.get(symbol, 0.0)
+        row = {"symbol": symbol, "name": name,
+               "current_value": round(cur, 2),
+               "target_value": round(slot_val, 2),
+               "price": round(price, 3)}
         # 盘中分钟否决：未来25分钟强烈看空 → 暂停买入/加仓
         minute = t.get("minute")
         if pr.get("minute_veto", True) and minute \
                 and minute.get("minute_signal") == "sell":
-            out.append({"symbol": symbol, "name": _display_name(symbol),
-                        "action": "skip", "reason": "盘中分钟看空，暂停买入",
-                        "current_value": round(cur, 2),
-                        "target_value": round(target_val, 2),
-                        "est_shares": 0, "est_amount": 0.0,
-                        "price": round(price, 3)})
-            continue
-        if symbol in held and cur >= target_val - 1:
-            out.append({"symbol": symbol, "name": _display_name(symbol),
-                        "action": "hold", "reason": "已达目标仓位，持有",
-                        "current_value": round(cur, 2),
-                        "target_value": round(target_val, 2),
+            out.append({**row, "action": "skip", "reason": "盘中分钟看空，暂停买入",
                         "est_shares": 0, "est_amount": 0.0})
             continue
-        need = target_val - cur if symbol in held else target_val
-        shares = int(need / (price * (1 + slip)) // 100) * 100
-        amount = shares * price
-        if shares < 100:
-            # 目标价位太高/现金不足一手：明确暂停并给出原因，避免"buy 0股"误导
-            out.append({"symbol": symbol, "name": _display_name(symbol),
-                        "action": "skip", "reason": "资金不足以买入一手(100股)",
-                        "current_value": round(cur, 2),
-                        "target_value": round(target_val, 2),
-                        "est_shares": 0, "est_amount": 0.0,
-                        "price": round(price, 3)})
+
+        # 该股在单票预算内的「目标整手股数」
+        target_sh = int(slot_val / (price * (1 + slip)) // lot) * lot
+        cur_sh = held_sh.get(symbol, 0.0)
+
+        if cur_sh > 0:
+            # ---- 已持有：先认成“持有”，只有明显低于目标且能整手补仓才 add ----
+            if cur_sh >= target_sh:
+                out.append({**row, "action": "hold",
+                            "reason": f"已持有 {cur_sh:.0f} 股，已达目标整手 {target_sh} 股，持有",
+                            "est_shares": 0, "est_amount": 0.0})
+                continue
+            need_sh = target_sh - cur_sh
+            affordable = int((max(cash_left, 0.0) /
+                              (price * (1 + slip) * (1 + commission))) // lot) * lot
+            shares = min(need_sh, affordable)
+            if shares >= lot:
+                cash_left -= shares * price * (1 + slip) * (1 + commission)
+                out.append({**row, "action": "add",
+                            "reason": f"加仓至目标整手 {target_sh} 股",
+                            "est_shares": shares,
+                            "est_amount": round(shares * price, 2)})
+            else:
+                out.append({**row, "action": "hold",
+                            "reason": f"已持有 {cur_sh:.0f} 股，距目标 {target_sh} 股不足 1 手，持有",
+                            "est_shares": 0, "est_amount": 0.0})
             continue
-        out.append({
-            "symbol": symbol, "name": _display_name(symbol),
-            "action": "add" if symbol in held else "buy",
-            "reason": "加仓至目标仓位" if symbol in held else "新进组合",
-            "current_value": round(cur, 2), "target_value": round(target_val, 2),
-            "est_shares": shares, "est_amount": round(amount, 2),
-            "price": round(price, 3),
-        })
+
+        # ---- 未持有：优先按等权目标整手；目标小于 1 手成本且未超单票上限 → 1 手起配 ----
+        one_lot_cost = price * (1 + slip) * lot
+        desired_val = slot_val
+        if slot_val < one_lot_cost and one_lot_cost <= cap:
+            # 等权预算买不起 1 手，但 1 手成本未超单票上限 → 按最少 1 手起配（否则永不开仓）
+            desired_val = one_lot_cost
+        want_sh = int(desired_val / (price * (1 + slip)) // lot) * lot
+        affordable = int((max(cash_left, 0.0) /
+                          (price * (1 + slip) * (1 + commission))) // lot) * lot
+        shares = min(want_sh, affordable)
+        if shares >= lot:
+            cash_left -= shares * price * (1 + slip) * (1 + commission)
+            row["target_value"] = round(max(slot_val, shares * price), 2)
+            reason = "新进组合（现价较高，按 1 手起配）" if slot_val < one_lot_cost else "新进组合"
+            out.append({**row, "action": "buy", "reason": reason,
+                        "est_shares": shares, "est_amount": round(shares * price, 2)})
+        else:
+            out.append({**row, "action": "skip",
+                        "reason": (f"现价 {price:.2f}，1 手约 {one_lot_cost:.0f} 元，"
+                                   f"超过单票上限({cap:.0f})或现金不足，无法起配"),
+                        "est_shares": 0, "est_amount": 0.0})
     return out
 
 
@@ -1118,23 +1155,25 @@ def portfolio():
     """组合模式（核心）：topN 目标（融合模型+择时+技术面+分钟）+ 持仓 + 调仓清单 + 资金决策预览。"""
     targets, target_set, held, regime = _portfolio_with_reasons()
     market_weak = _market_weakness()
-    actions = []
-    for t in targets:
-        if t["symbol"] not in held:
-            actions.append({"symbol": t["symbol"], "name": _display_name(t["symbol"]),
-                            "prob": round(t["prob"], 4) if t["prob"] is not None else None,
-                            "side": "buy",
-                            "reason": "新进组合 topN"})
-    for p in MANUAL_BROKER.query_positions():
-        if p.symbol not in target_set:
-            actions.append({"symbol": p.symbol, "name": _display_name(p.symbol),
-                            "prob": None, "side": "sell", "reason": "掉出组合 topN"})
-
     # 资金决策预览（基于现有现金与持仓 + 大盘弱势风控）；价格覆盖池外候选
     syms = {t["symbol"] for t in targets} | \
         {p.symbol for p in MANUAL_BROKER.query_positions()}
     prices = _build_prices(syms)
     allocation = _portfolio_allocation(targets, target_set, held, prices, market_weak)
+
+    # 买卖动作与资金决策对齐：只列 allocation 里真正能整手成交的买卖（避免"建议买茅台却买不起"）
+    tgt_prob = {t["symbol"]: t["prob"] for t in targets}
+    actions = []
+    for a in allocation:
+        if a["action"] in ("buy", "add"):
+            p = tgt_prob.get(a["symbol"])
+            actions.append({"symbol": a["symbol"], "name": _display_name(a["symbol"]),
+                            "prob": round(p, 4) if p is not None else None,
+                            "side": "buy", "reason": a["reason"]})
+    for p in MANUAL_BROKER.query_positions():
+        if p.symbol not in target_set:
+            actions.append({"symbol": p.symbol, "name": _display_name(p.symbol),
+                            "prob": None, "side": "sell", "reason": "掉出组合 topN"})
     cash = MANUAL_BROKER.query_cash()
     # 总资产 = 现金 + 全部持仓市值（含不在目标内的持仓，它们会触发卖出）
     held_value = sum(
