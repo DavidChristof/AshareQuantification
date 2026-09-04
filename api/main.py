@@ -1048,6 +1048,58 @@ def _build_prices(symbols) -> dict[str, float]:
     return prices
 
 
+def _prev_closes(symbols) -> dict[str, float]:
+    """昨收参考价：SIGNALS 最新收盘（盘中尚未拉今日数据时即昨收）；池外候选回退选股行 price。"""
+    out: dict[str, float] = {}
+    for s in symbols:
+        sig = SIGNALS.get(s)
+        if sig is not None and not sig.empty:
+            out[s] = float(sig["close"].iloc[-1])
+    for r in _selection_rows():
+        c = str(r.get("code"))
+        if c in symbols and r.get("price"):
+            out.setdefault(c, float(r["price"]))
+    return {k: v for k, v in out.items() if v and v > 0}
+
+
+def _guard_check(symbol: str, price: float, prev_close: dict) -> tuple[bool, str]:
+    """追高/接飞刀保护：现价 vs 昨收 的当日涨跌幅超出阈值 → 拦截新买/加仓。"""
+    g = (cfg.get("portfolio_risk", {}) or {}).get("chase_guard") or {}
+    if not g.get("enabled", True):
+        return True, ""
+    prev = prev_close.get(symbol)
+    if not prev or not price or prev <= 0:
+        return True, ""
+    pct = (price / prev - 1) * 100
+    hi = float(g.get("high_limit_pct", 2.0))
+    lo = float(g.get("drop_limit_pct", -3.0))
+    if pct > hi:
+        return False, f"当日已涨 {pct:+.1f}%（>追高上限 {hi:+.1f}%），暂停买入"
+    if pct < lo:
+        return False, f"当日已跌 {pct:+.1f}%（<{lo:+.1f}% 急跌），暂缓买入"
+    return True, ""
+
+
+def _open_exec_enabled() -> bool:
+    return (cfg.get("portfolio_risk", {}) or {}).get("exec_mode") == "open"
+
+
+def _in_open_window() -> bool:
+    """回测式开盘窗口：交易时段内且距开盘 ≤ open_window_minutes 分钟。"""
+    if not _in_trading_hours():
+        return False
+    now = datetime.now()
+    mins = (now.hour - 9) * 60 + now.minute - 30
+    win = int((cfg.get("portfolio_risk", {}) or {}).get("open_window_minutes", 15))
+    return 0 <= mins <= win
+
+
+def _open_ref_prices(symbols, prev_close: dict) -> dict[str, float]:
+    """回测式开盘委托价 = 昨收 × (1 + open_premium_pct)。无昨收的票不进参考表。"""
+    prem = float((cfg.get("portfolio_risk", {}) or {}).get("open_premium_pct", 0.5)) / 100
+    return {s: prev_close[s] * (1 + prem) for s in symbols if prev_close.get(s)}
+
+
 def _portfolio_with_reasons(n: int | None = None):
     """topN 组合目标（供组合面板与一键调仓）。
 
@@ -1170,11 +1222,11 @@ def _market_weakness() -> dict:
 
 
 def _portfolio_allocation(targets: list, target_set: set, held: set,
-                          prices: dict,
-                          market_weak: dict | None = None) -> list[dict]:
+                          prices: dict, market_weak: dict | None = None,
+                          prev_close: dict | None = None) -> list[dict]:
     """基于现有资金 + 风控决策：等权目标、个股上限、大盘弱势降仓、分钟否决、A股整手。
 
-    规则（对应复盘改进 + 2026-09-04 修复）：
+    规则（对应复盘改进 + 2026-09-04 修复 + 追高/接飞刀保护）：
         - 总仓位预算 = 总资产 × position_pct（默认 95%）；**大盘弱势降到 weak_position_pct**
         - 每只目标等权 = 预算/目标数，但**不超过单票上限 max_stock_pct×总资产**
         - 按「目标整手股数」决策，避免把"已有持仓/差额不足一手"误报成资金不足：
@@ -1184,6 +1236,7 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
             未持有、单票预算/可用现金够 1 手 → buy（新进）
             未持有但现价×100 超预算 → skip（明示"现价高，单票预算买不起 1 手"）
         - **盘中分钟 sell（未来25分钟看空）且 minute_veto → 暂停买入该目标**（action=skip）
+        - **追高/接飞刀保护**：新买/加仓前按现价vs昨收(prev_close)当日涨跌幅拦截（chase_guard）
     """
     pr = cfg.get("portfolio_risk", {})
     slip = MANUAL_BROKER.slippage
@@ -1255,6 +1308,11 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
             affordable = int((max(cash_left, 0.0) /
                               (price * (1 + slip) * (1 + commission))) // lot) * lot
             shares = min(need_sh, affordable)
+            ok, why = _guard_check(symbol, price, prev_close or {})
+            if not ok:
+                out.append({**row, "action": "skip", "reason": f"加仓被拦：{why}",
+                            "est_shares": 0, "est_amount": 0.0})
+                continue
             if shares >= lot:
                 cash_left -= shares * price * (1 + slip) * (1 + commission)
                 out.append({**row, "action": "add",
@@ -1277,6 +1335,11 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
         affordable = int((max(cash_left, 0.0) /
                           (price * (1 + slip) * (1 + commission))) // lot) * lot
         shares = min(target_sh, affordable)
+        ok, why = _guard_check(symbol, price, prev_close or {})
+        if not ok:
+            out.append({**row, "action": "skip", "reason": why,
+                        "est_shares": 0, "est_amount": 0.0})
+            continue
         if shares >= lot:
             cash_left -= shares * price * (1 + slip) * (1 + commission)
             reason = "新进组合（现价较高，按 1 手起配）" if slot_eff > slot_val else "新进组合"
@@ -1294,11 +1357,13 @@ def portfolio():
     """组合模式（核心）：topN 目标（融合模型+择时+技术面+分钟）+ 持仓 + 调仓清单 + 资金决策预览。"""
     targets, target_set, held, regime = _portfolio_with_reasons()
     market_weak = _market_weakness()
-    # 资金决策预览（基于现有现金与持仓 + 大盘弱势风控）；价格覆盖池外候选
+    # 资金决策预览（基于现有现金与持仓 + 大盘弱势风控 + 追高拦截）；价格覆盖池外候选
     syms = {t["symbol"] for t in targets} | \
         {p.symbol for p in MANUAL_BROKER.query_positions()}
+    prev_close = _prev_closes(syms)
     prices = _build_prices(syms)
-    allocation = _portfolio_allocation(targets, target_set, held, prices, market_weak)
+    allocation = _portfolio_allocation(targets, target_set, held, prices, market_weak,
+                                       prev_close=prev_close)
 
     # 买卖动作与资金决策对齐：只列 allocation 里真正能整手成交的买卖（避免"建议买茅台却买不起"）
     tgt_prob = {t["symbol"]: t["prob"] for t in targets}
@@ -1363,7 +1428,17 @@ def portfolio_apply():
     # 最新交易日与价格：实时快照优先 → 信号收盘 → 选股候选收盘（覆盖池外）
     all_syms = {t["symbol"] for t in targets} | \
         {p.symbol for p in MANUAL_BROKER.query_positions()}
+    prev_close = _prev_closes(all_syms)
     prices = _build_prices(all_syms)
+    if _open_exec_enabled():
+        # 回测式：仅开盘窗口可调，成交用参考价=昨收×(1+溢价)（近似开盘成交/回测口径）
+        if not _in_open_window():
+            raise HTTPException(
+                400, "回测式开盘调仓仅在开盘后窗口内执行（9:30 起 "
+                     f"{cfg.get('portfolio_risk', {}).get('open_window_minutes', 15)} 分钟内）")
+        refs = _open_ref_prices(all_syms, prev_close)
+        if refs:
+            prices = {**prices, **refs}
     today = None
     for s in all_syms:
         sig = SIGNALS.get(s)
@@ -1403,8 +1478,9 @@ def portfolio_apply():
                 executed.append({"symbol": p.symbol, "name": _display_name(p.symbol),
                                  "side": "sell", "error": r.message})
 
-    # 2. 基于现有资金 + 风控决策买入/加仓（大盘弱势降仓 + 分钟否决 + 个股上限）
-    allocation = _portfolio_allocation(targets, target_set, held, prices, market_weak)
+    # 2. 基于现有资金 + 风控决策买入/加仓（大盘弱势降仓 + 分钟否决 + 个股上限 + 追高拦截）
+    allocation = _portfolio_allocation(targets, target_set, held, prices, market_weak,
+                                       prev_close=prev_close)
     for a in allocation:
         if a["action"] == "skip":
             # 被风控暂停的买入也要透出到结果（前端可见"未买入+原因"，避免静默跳过）

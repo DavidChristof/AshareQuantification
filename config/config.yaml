@@ -185,6 +185,15 @@ portfolio_risk:
   # 若开启会把盘中所有买入目标都 skip（一键调仓"卖出能成交、买入全被拦"）。
   # 待分钟模型校准/重训后再置 true；期间靠 大盘弱势降仓 + 单票上限 兜底。
   minute_veto: false            # true=盘中分钟 sell 暂停买入该目标 | false=只做方向化微调(±minute_adj)
+  # 追高/接飞刀保护：组合调仓「新买/加仓」前，按 现价vs昨收 的当日涨跌幅拦截
+  chase_guard:
+    enabled: true
+    high_limit_pct: 2.0        # 涨幅 > 该值 → 追高，跳过买入（专治盘中买在最高点）
+    drop_limit_pct: -3.0       # 跌幅 < 该值 → 急跌接飞刀，跳过买入
+  # 回测式执行模式：'live'=现状(盘中实时价随时可调) | 'open'=仅开盘窗口可调、用参考价=昨收×(1+open_premium_pct)
+  exec_mode: live
+  open_window_minutes: 15      # open 模式下，开盘后前 N 分钟为可执行窗口（9:30 起）
+  open_premium_pct: 0.5        # open 模式委托价相对昨收的溢价（%，近似开盘成交/回测口径）
 risk:
   enabled: true
   stop_loss_pct: 0.08
