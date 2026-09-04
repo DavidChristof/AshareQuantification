@@ -864,20 +864,71 @@ def _selection_rows() -> list[dict]:
 
 
 def _portfolio_from_selection(rows: list[dict], n: int):
-    """组合目标 = 今日选股 topN（综合分=基本面0.6+技术0.4，0~100）。
+    """组合目标 = 按「实时可用资金」从今日选股里挑买得起的实际组合（≤ n）。
+
+    需求背景（2026-09-04）：原固定 topN，若前几名单票买不起 1 手（如茅台 1 手≈13 万）
+    该名额直接空置；现改为：已持有的（在今日候选内）优先保留，空位按综合分降序
+    顺位补买「能整手起配」（1 手成本 ≤ 单票上限且现金够）的候选，凑出可执行组合。
 
     池内（40 训练池）候选叠加模型概率/择时/技术面/分钟作为参考列；池外只有
     大池选股综合分（仍可交易——价格来自选股收盘价 + 实时快照）。
     Returns: (targets, target_set, held, regime)，targets 内部字段与旧逻辑一致。
     """
-    held = {p.symbol for p in MANUAL_BROKER.query_positions()}
+    positions = MANUAL_BROKER.query_positions()
+    held = {p.symbol for p in positions}
+    held_sh = {p.symbol: p.shares for p in positions}
     regime = None
     try:
         regime = REGIME_DETECTOR.detect(_market_proxy())
     except Exception:  # noqa: BLE001
         pass
+
+    # ---- 实时资金可行性上下文（与 _portfolio_allocation 同口径）----
+    slip = MANUAL_BROKER.slippage
+    commission = getattr(MANUAL_BROKER, "commission", 0.0003)
+    lot = max(int(getattr(MANUAL_BROKER, "lot_size", 100) or 100), 1)
+    cash = MANUAL_BROKER.query_cash()
+    pr = cfg.get("portfolio_risk", {})
+    row_price = {str(r.get("code")): r.get("price") for r in rows}
+    held_value = sum(
+        (row_price.get(p.symbol) or p.avg_cost) * p.shares for p in positions)
+    total_assets = cash + held_value
+    try:
+        weak = bool(_market_weakness().get("weak"))
+    except Exception:  # noqa: BLE001
+        weak = False
+    pos_pct = (pr.get("weak_position_pct", 0.5) if weak
+               else cfg["backtest"].get("position_pct", 0.95))
+    cap = total_assets * pr.get("max_stock_pct", 0.20)
+
+    ranked = sorted(rows, key=lambda x: -float(x.get("total_score", 0)))
+
+    # ---- 1) 保留：已持有且在今日候选内 ----
+    chosen = [r for r in ranked if str(r.get("code")) in held]
+
+    # ---- 2) 顺位补买：空位按分数补「能整手起配」的候选（1手 ≤ 单票上限 且现金够）----
+    chosen_syms = {str(r.get("code")) for r in chosen}
+    cash_left = cash
+    for r in ranked:
+        if len(chosen) >= n:
+            break
+        symbol = str(r.get("code"))
+        if symbol in chosen_syms or symbol in held_sh:
+            continue
+        price = r.get("price")
+        if not price or price <= 0:
+            continue
+        one_lot_cost = price * (1 + slip) * lot
+        total_cost = one_lot_cost * (1 + commission)
+        if one_lot_cost <= cap and cash_left >= total_cost:
+            chosen.append(r)
+            chosen_syms.add(symbol)
+            cash_left -= total_cost
+    chosen = chosen[:n]
+
+    # ---- 3) 对 chosen 逐行构建 target 参考列 ----
     targets = []
-    for r in rows[:n]:
+    for r in chosen:
         symbol = str(r["code"])
         close = r.get("price")
         prob = None
@@ -1099,12 +1150,17 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
                         "est_shares": 0, "est_amount": 0.0})
             continue
 
-        # 该股在单票预算内的「目标整手股数」
-        target_sh = int(slot_val / (price * (1 + slip)) // lot) * lot
+        # 目标整手：等权单票 slot；若 slot < 1 手成本且 1 手 ≤ 单票上限 → 以 1 手为目标（1 手起配）
+        one_lot_cost = price * (1 + slip) * lot
+        slot_eff = (one_lot_cost
+                    if (slot_val < one_lot_cost and one_lot_cost <= cap) else slot_val)
+        target_sh = int(slot_eff / (price * (1 + slip)) // lot) * lot
         cur_sh = held_sh.get(symbol, 0.0)
+        if slot_eff > slot_val:
+            row["target_value"] = round(slot_eff, 2)
 
         if cur_sh > 0:
-            # ---- 已持有：先认成“持有”，只有明显低于目标且能整手补仓才 add ----
+            # ---- 已持有：达目标整手→持有；低于目标且能整手补→add；否则持有 ----
             if cur_sh >= target_sh:
                 out.append({**row, "action": "hold",
                             "reason": f"已持有 {cur_sh:.0f} 股，已达目标整手 {target_sh} 股，持有",
@@ -1126,26 +1182,24 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
                             "est_shares": 0, "est_amount": 0.0})
             continue
 
-        # ---- 未持有：优先按等权目标整手；目标小于 1 手成本且未超单票上限 → 1 手起配 ----
-        one_lot_cost = price * (1 + slip) * lot
-        desired_val = slot_val
-        if slot_val < one_lot_cost and one_lot_cost <= cap:
-            # 等权预算买不起 1 手，但 1 手成本未超单票上限 → 按最少 1 手起配（否则永不开仓）
-            desired_val = one_lot_cost
-        want_sh = int(desired_val / (price * (1 + slip)) // lot) * lot
+        # ---- 未持有：能整手起配就买（slot<1手时按 1 手起配）；否则明确原因 ----
+        if target_sh < lot:
+            out.append({**row, "action": "skip",
+                        "reason": (f"现价 {price:.2f}，1 手约 {one_lot_cost:.0f} 元，"
+                                   f"超过单票上限({cap:.0f})，无法起配"),
+                        "est_shares": 0, "est_amount": 0.0})
+            continue
         affordable = int((max(cash_left, 0.0) /
                           (price * (1 + slip) * (1 + commission))) // lot) * lot
-        shares = min(want_sh, affordable)
+        shares = min(target_sh, affordable)
         if shares >= lot:
             cash_left -= shares * price * (1 + slip) * (1 + commission)
-            row["target_value"] = round(max(slot_val, shares * price), 2)
-            reason = "新进组合（现价较高，按 1 手起配）" if slot_val < one_lot_cost else "新进组合"
+            reason = "新进组合（现价较高，按 1 手起配）" if slot_eff > slot_val else "新进组合"
             out.append({**row, "action": "buy", "reason": reason,
                         "est_shares": shares, "est_amount": round(shares * price, 2)})
         else:
             out.append({**row, "action": "skip",
-                        "reason": (f"现价 {price:.2f}，1 手约 {one_lot_cost:.0f} 元，"
-                                   f"超过单票上限({cap:.0f})或现金不足，无法起配"),
+                        "reason": "可用现金不足以买入 1 手，暂缓",
                         "est_shares": 0, "est_amount": 0.0})
     return out
 
