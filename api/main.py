@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd                                                    # noqa: E402
 from fastapi import FastAPI, HTTPException                             # noqa: E402
+from fastapi.responses import FileResponse                              # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware                     # noqa: E402
 from pydantic import BaseModel                                         # noqa: E402
 
@@ -285,6 +286,13 @@ def root():
         "paper_equity": BROKER.account_summary()["equity"],
         "last_updated": _last_updated.strftime("%Y-%m-%d %H:%M:%S") if _last_updated else None,
     }
+
+
+@app.get("/dashboard")
+def dashboard_page():
+    """返回看板页面（前端单文件 index.html），便于在 VSCode 内置浏览器/浏览器里访问。"""
+    page = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
+    return FileResponse(page) if page.exists() else {"error": "frontend/index.html 不存在"}
 
 
 @app.get("/api/stocks")
