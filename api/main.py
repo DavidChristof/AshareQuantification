@@ -789,7 +789,7 @@ def manual_account():
     prices = _live_prices()          # 实时价优先（盘中总资产随行情同步）
     _apply_manual_stops(prices)      # 止盈止损按最新价检查
     _sync_manual_equity()            # 净值曲线对齐最新交易日（历史快照仍按日线）
-    return MANUAL_BROKER.live_summary(prices)
+    return MANUAL_BROKER.live_summary(prices, trading_today=_today_is_trading())
 
 
 @app.get("/api/manual/positions")
@@ -844,6 +844,22 @@ def _market_status_now() -> dict:
         return _market_status(QUOTE_MANAGER.snapshot())
     except Exception:  # noqa: BLE001
         return {"code": "unknown", "text": "状态未知"}
+
+
+def _today_is_trading() -> bool:
+    """今天是否为 A股交易日（用于当日收益是否有效 / 非交易日归零）。
+
+    优先看实时行情：日期=今天(open/closed_today) → 交易日；日期≠今天(market_closed) → 休市。
+    快照缺失/未知时回退：周末必 False，工作日再看法定休市清单。
+    """
+    code = _market_status_now().get("code")
+    if code == "market_closed":
+        return False
+    if code in ("open", "closed_today"):
+        return True
+    holidays = parse_dates(
+        (cfg.get("risk", {}) or {}).get("pre_holiday", {}).get("holiday_dates") or [])
+    return is_ashare_trading_day(datetime.now().date(), holidays)
 
 
 def _in_trading_hours() -> bool:

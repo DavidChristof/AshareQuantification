@@ -334,11 +334,15 @@ class PaperBroker(Broker):
             "total_return": equity / initial - 1 if initial else 0.0,
         }
 
-    def live_summary(self, latest_prices: dict[str, float]) -> dict:
+    def live_summary(self, latest_prices: dict[str, float],
+                     trading_today: bool = True) -> dict:
         """按最新价格（盘中实时价）估算总资产，不回写历史净值快照。
 
         Args:
             latest_prices: {symbol: 现价}，缺失的持仓回退到成本价。
+            trading_today: 今天是否 A股交易日。周末/法定休市日传入 False，
+                           当日收益归零（休市无“当日”盈亏），避免拿上一交易日的
+                           盘中历史点当基准产生假的“当日收益”。
         """
         cash = self.query_cash()
         mv = 0.0
@@ -358,6 +362,9 @@ class PaperBroker(Broker):
             if str(_r["date"])[:10] < today:
                 prev_close = _r["equity"]
         base = float(prev_close) if prev_close is not None else float(initial)
+        if not trading_today:
+            # 今日休市（周末/节假日）：无当日收益，基准对齐当前，避免假盈亏
+            base = equity
         day_pnl = equity - base
         return {
             "cash": round(cash, 2),
@@ -368,4 +375,5 @@ class PaperBroker(Broker):
             "prev_close_equity": round(base, 2),
             "day_pnl": round(day_pnl, 2),
             "day_return": round(day_pnl / base, 4) if base else 0.0,
+            "trading_today": bool(trading_today),
         }
