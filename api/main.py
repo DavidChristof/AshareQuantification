@@ -1345,7 +1345,11 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
         one_lot_cost = price * (1 + slip) * lot
         slot_eff = (one_lot_cost
                     if (slot_val < one_lot_cost and one_lot_cost <= cap) else slot_val)
-        target_sh = int(slot_eff / (price * (1 + slip)) // lot) * lot
+        if slot_eff > slot_val:
+            # 1 手起配：直接取整手（避免 slot_eff÷含滑点单价 因浮点得到 99.99…→0 手）
+            target_sh = lot
+        else:
+            target_sh = int(slot_eff / (price * (1 + slip)) // lot) * lot
         cur_sh = held_sh.get(symbol, 0.0)
         if slot_eff > slot_val:
             row["target_value"] = round(slot_eff, 2)
