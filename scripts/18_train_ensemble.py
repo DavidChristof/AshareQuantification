@@ -39,6 +39,39 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
+def _trim_recent(data: dict, recent: int) -> dict:
+    """每只只保留最近 N 个交易日（recent<=0 表示全部）——控 make_samples 内存。"""
+    if recent <= 0:
+        return data
+    return {c: df.tail(recent) for c, df in data.items()}
+
+
+def _load_training_data(cfg, universe: str, recent: int) -> dict:
+    """按 universe 载入训练截面：
+        base  现池 40（market.db，原行为）
+        large 现池40 ∪ data/large_pool.db 全量（约 600 池，阶段实验产物）
+    """
+    import sqlite3
+    data = load_all(cfg)
+    if universe == "large":
+        db_path = Path(cfg.resolve("data")) / "large_pool.db"
+        if not db_path.exists():
+            raise SystemExit(
+                "缺少 data/large_pool.db —— 请先运行 scripts/23_large_pool_data.py 构建 600 池日线")
+        con = sqlite3.connect(str(db_path))
+        for code, in con.execute("SELECT DISTINCT symbol FROM large_daily").fetchall():
+            rows = con.execute(
+                "SELECT date, open, high, low, close, volume, amount FROM large_daily "
+                "WHERE symbol=? ORDER BY date", (code,)).fetchall()
+            df = pd.DataFrame(rows, columns=["date", "open", "high", "low",
+                                             "close", "volume", "amount"])
+            df["date"] = pd.to_datetime(df["date"])
+            data[code] = df
+        con.close()
+        logger.info("universe=large：现池 %d + 大池 → %d 只", 40, len(data))
+    return _trim_recent(data, recent)
+
+
 def _panel_rankic(prob_panel: pd.DataFrame, ret_panel: pd.DataFrame,
                   val_dates) -> dict:
     """面板版截面评估：prob(date×symbol) vs 未来收益，在验证日期上逐日。"""
@@ -74,6 +107,12 @@ def main():
     parser.add_argument("--fetch", action="store_true", help="先拉最新日线再训练")
     parser.add_argument("--quick", action="store_true", help="冒烟：缩短训练快速验证流水线")
     parser.add_argument("--members", default=None, help="覆盖集成成员，逗号分隔 lstm,transformer,gbm")
+    parser.add_argument("--universe", default="base", choices=["base", "large"],
+                        help="训练截面：base=现池40 | large=现池40∪600大池(需 large_pool.db)")
+    parser.add_argument("--tag", default=None,
+                        help="保存到 results/model_v2_<tag>（不覆盖/不备份线上 model_v2）")
+    parser.add_argument("--recent", type=int, default=0,
+                        help="每只只取最近 N 个交易日(0=全部)。large 全历史内存≈5.7GB，建议 900~1100")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -100,18 +139,25 @@ def main():
     logger.info("模型 v2 集成训练：%s", members)
     logger.info("=" * 64)
 
-    data = load_all(cfg)
-    # 备份旧 v2（若存在）
-    out_dir = cfg.resolve(mv2.get("dir", "results/model_v2"))
-    if out_dir.exists():
-        bak = out_dir.with_name(out_dir.name + ".bak")
-        if bak.exists():
+    data = _load_training_data(cfg, args.universe, args.recent)
+    # 输出目录：--tag 或 universe=large 时另存（不碰线上 model_v2）；否则替换并备份旧版
+    live_dir = cfg.resolve(mv2.get("dir", "results/model_v2"))
+    tag = args.tag or ("large" if args.universe == "large" else None)
+    out_dir = live_dir if tag is None else live_dir.with_name(live_dir.name + "_" + tag)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    if tag is None:
+        if out_dir.exists():                      # 备份旧 v2
+            bak = out_dir.with_name(out_dir.name + ".bak")
+            if bak.exists():
+                import shutil
+                shutil.rmtree(bak)
             import shutil
-            shutil.rmtree(bak)
-        import shutil
-        shutil.move(str(out_dir), str(bak))
-        logger.info("旧 v2 已备份到 %s", bak)
+            shutil.move(str(out_dir), str(bak))
+            logger.info("旧 v2 已备份到 %s", bak)
+    else:
+        logger.info("另存模式：%s（不动线上 model_v2）", out_dir)
 
+    logger.info("训练截面 %d 只 · 输出 %s", len(data), out_dir)
     result = train_ensemble(data, cfg)
     result["_model_cfg"] = cfg["model"]
     save_ensemble(result, out_dir)
@@ -180,16 +226,20 @@ def main():
                                **result["member_meta"][m]}
                            for m in members},
     }
-    rep_path = cfg.resolve("results") / "model_v2_report.json"
+    rep_name = "model_v2_report.json" if tag is None else f"model_v2_{tag}_report.json"
+    rep_path = cfg.resolve("results") / rep_name
     rep_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
                         encoding="utf-8")
     print(f"\n报告已保存: {rep_path}")
     print("\n==================== v2 训练完成 ====================")
-    print(f"  集成保存: {out_dir}")
+    print(f"  集成保存: {out_dir}  (截面 {len(data)} 只)")
     print(f"  验证 F1={result['ens_f1']:.3f} 阈值={result['ens_threshold']:.2f}")
-    print("\n  >>> 重启 API 服务即自动加载 v2：")
-    print("      D:/Python/Python3_12/python.exe -m uvicorn api.main:app --port 8001")
-    print("  >>> 回退旧模型：删除/改名 results/model_v2 后重启即可。")
+    if tag is None:
+        print("\n  >>> 重启 API 服务即自动加载 v2：")
+        print("      .venv/Scripts/python.exe -m uvicorn api.main:app --port 8001")
+        print("  >>> 回退旧模型：删除/改名 results/model_v2 后重启即可。")
+    else:
+        print("\n  >>> 另存版本未接入线上。验证通过后切换方式：把 results/model_v2 换掉（先备份 .bak）再重启。")
 
 
 if __name__ == "__main__":
