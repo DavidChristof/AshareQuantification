@@ -41,9 +41,11 @@ LARGE_DB = Path("data/large_pool.db")
 REPORT = Path("results/large_pool_gbm_exp.json")
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--pool", default="base", choices=["base", "large", "mix"])
+parser.add_argument("--pool", default="base", choices=["base", "large", "mix", "full"])
 parser.add_argument("--k", type=int, default=50, help="大池随机抽取数量（large/mix 用）")
 parser.add_argument("--full", action="store_true", help="large 用全量 559（忽略 --k）")
+parser.add_argument("--recent", type=int, default=0,
+                    help="每只只用最近 N 个交易日（0=全部）。控内存：全 599 时建议 350 左右")
 parser.add_argument("--trees", type=int, default=300, help="GBM 树数（quick 校准）")
 parser.add_argument("--seed", type=int, default=42)
 args = parser.parse_args()
@@ -54,8 +56,15 @@ feat = cfg["features"]
 window, horizon = int(feat["window"]), int(feat["horizon"])
 
 
+def _trim_recent(d: dict, r: int) -> dict:
+    """每只只保留最近 r 个交易日（r<=0 表示全部），控 make_samples 内存。"""
+    if r <= 0:
+        return d
+    return {c: df.tail(r) for c, df in d.items()}
+
+
 def load_large_pool(sample_k: int | None, rng: random.Random,
-                    add_base: bool = False) -> dict:
+                    add_base: bool = False, recent: int = 0) -> dict:
     """读 data/large_pool.db（559 只全历史），可选抽 sample_k；add_base 并入现池40。"""
     codes = [r[0] for r in sqlite3.connect(str(LARGE_DB)).execute(
         "SELECT DISTINCT symbol FROM large_daily").fetchall()]
@@ -73,8 +82,8 @@ def load_large_pool(sample_k: int | None, rng: random.Random,
         out[c] = df
     con.close()
     if add_base:
-        out.update(load_all(cfg))     # 现池40（market.db）
-    return out
+        out.update(_trim_recent(load_all(cfg), recent))   # 现池40（market.db）
+    return _trim_recent(out, recent)
 
 
 def run_pool(data: dict, tag: str) -> dict:
@@ -117,12 +126,15 @@ def main():
     results: dict = {"generated_at": datetime.now().isoformat(timespec="seconds"),
                      "seed": args.seed, "trees": args.trees}
     if args.pool == "base":
-        data = load_all(cfg)
-        results["runs"] = [run_pool(data, "base40")]
+        data = _trim_recent(load_all(cfg), args.recent)
+        results["runs"] = [run_pool(data, f"base40(recent{args.recent or 'all'})")]
+    elif args.pool == "full":
+        data = load_large_pool(None, rng, add_base=True, recent=args.recent)
+        results["runs"] = [run_pool(data, f"full{len(data)}(40+大池,recent{args.recent or 'all'})")]
     else:
         k = None if args.full else args.k
         add_base = args.pool == "mix"
-        data = load_large_pool(k, rng, add_base=add_base)
+        data = load_large_pool(k, rng, add_base=add_base, recent=args.recent)
         results["runs"] = [run_pool(data,
                                     f"large{len(data)}" + ("(mix+base40)" if add_base else ""))]
     # 内存/时间外推（全量 599）
