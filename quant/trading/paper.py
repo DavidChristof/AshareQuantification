@@ -14,6 +14,7 @@ from datetime import date
 from pathlib import Path
 
 from .base import Broker, Position, TradeResult
+from .rules import limit_pct
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +255,19 @@ class PaperBroker(Broker):
                 if dyn["stop_pct"]:
                     sl, tp = dyn["stop_pct"], dyn["take_pct"]
                     trail = dyn["trail_pct"] if vol_cfg.get("trailing_enabled", True) else None
+
+            # 板块涨跌停封顶：主板 ±10% / 创业板·科创板 ±20%（见 rules.limit_pct）。
+            # A股一天最多到涨跌停，线若超出限幅：
+            #   止盈 → 当天到不了价、只能死等多日（纸面能成交、实盘排队未必）；
+            #   止损 → 触发被跌停天然延后，实际亏得比线更多（假止损）。
+            # 统一压到限幅内（动态与固定回退都适用）；高波动被钳到同一顶时止损留 5% 缓冲。
+            band = limit_pct(pos.symbol)
+            sl = min(float(sl), band)
+            tp = min(float(tp), band)
+            if tp <= sl:
+                sl = band * 0.95
+            if trail is not None:
+                trail = min(float(trail), band)
 
             reason = None
             if price <= cost * (1 - sl):

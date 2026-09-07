@@ -713,6 +713,14 @@ def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict) -> di
             if dyn["stop_pct"]:
                 sl, tp = dyn["stop_pct"], dyn["take_pct"]
                 mode, atr_pct = "dynamic", v["atr_pct"]
+    # 与撮合层 apply_stop_rules 一致的板块涨跌停封顶（主板±10%/创业·科创±20%）：
+    # 让卡片显示的止损/止盈线 = 实际会触发的线，避免“线超涨跌停、当天永远到不了/假止损”。
+    from quant.trading.rules import limit_pct
+    band = limit_pct(symbol)
+    sl = min(float(sl), band)
+    tp = min(float(tp), band)
+    if tp <= sl:
+        sl = band * 0.95
     return {
         "stop_price": cost * (1 - sl),
         "take_price": cost * (1 + tp),

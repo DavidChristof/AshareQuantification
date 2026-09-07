@@ -137,7 +137,11 @@ def test_apply_stop_rules_fixed_fallback():
 
 
 def test_dynamic_trailing_uses_high():
-    """动态移动止损基于持仓最高价：从高点回撤 ATR 倍数。"""
+    """动态移动止损基于持仓最高价：从高点回撤 ATR 倍数。
+
+    注：止盈线已按板块封顶（主板±10%），故“先涨 12%”会先触发止盈（110 即卖），
+    这里用“先涨到 109（<止盈 110.02）”→ 再跌到 98（≤109×0.90）触发移动止损。
+    """
     tmp = _tmp_db()
     b = _broker(tmp)
     try:
@@ -146,9 +150,9 @@ def test_dynamic_trailing_uses_high():
         vol_cfg = dict(atr_stop_mult=2.5, atr_take_mult=3.5, atr_trailing_mult=2.5,
                        vol_min_pct=0.03, vol_max_pct=0.15,
                        take_min_pct=0.05, take_max_pct=0.30, trailing_enabled=True)
-        # 先涨到 112（更新 max_price），再从高点回撤 2.5×4%=10% → ≤100.8 触发移动止损
-        b.apply_stop_rules("2026-08-10", {"T": 112.0}, vol=vol, vol_cfg=vol_cfg)
-        tr = b.apply_stop_rules("2026-08-11", {"T": 100.0}, vol=vol, vol_cfg=vol_cfg)
+        # 先涨到 109（< 封顶止盈≈110.02，更新 max_price），再从高点回撤 10% → ≤98.1 触发移动止损
+        b.apply_stop_rules("2026-08-10", {"T": 109.0}, vol=vol, vol_cfg=vol_cfg)
+        tr = b.apply_stop_rules("2026-08-11", {"T": 98.0}, vol=vol, vol_cfg=vol_cfg)
         assert tr and "移动止损" in tr[0]["reason"]
     finally:
         _rm(tmp)
