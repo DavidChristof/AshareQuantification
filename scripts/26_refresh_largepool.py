@@ -15,12 +15,11 @@ import logging
 import socket
 import sqlite3
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))     # noqa: E402
-
-from pathlib import Path                                            # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
 
@@ -46,10 +45,11 @@ def main():
     have = {c: con.execute("SELECT MAX(date) FROM large_daily WHERE symbol=?", (c,)).fetchone()[0]
             for c in codes}
     start = cfg["data"]["start_date"]
+    _end = datetime.now().strftime("%Y-%m-%d")
 
     def _one(code: str):
         try:
-            df = fetch_daily(code, start)
+            df = fetch_daily(code, start, _end)
             return code, df
         except Exception:  # noqa: BLE001
             return code, None
