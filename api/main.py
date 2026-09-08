@@ -768,6 +768,10 @@ def _apply_manual_stops(_live: dict | None = None) -> list:
         vol=vol_map, vol_cfg=vol_cfg,
         apply_stop=True, apply_take=False,
     )
+    # 记牌：今日风控卖出的股票，组合当日不再买入（防止盈锁仓后又被请回）
+    _sold = [x["symbol"] for x in out if x.get("symbol")]
+    if _sold:
+        _mark_risk_sold(_sold)
     return out
 
 
@@ -1017,6 +1021,40 @@ def _display_name(symbol: str) -> str:
     return _name(symbol)
 
 
+def _risk_sold_fname(day: str | None = None) -> Path:
+    """当日“风控卖出(止盈/止损)”记牌文件（按日期分文件，次日自动失效）。"""
+    d = day or datetime.now().strftime("%Y-%m-%d")
+    return cfg.resolve("logs") / f"risk_sold_{d}.json"
+
+
+def _mark_risk_sold(symbols: list[str]):
+    """记录今日止盈/止损自动卖出的股票 → 组合当日不再买入它们（防锁盈后又被请回来）。"""
+    if not symbols:
+        return
+    f = _risk_sold_fname()
+    prev = set()
+    if f.exists():
+        try:
+            prev = set(__import__("json").loads(f.read_text(encoding="utf-8")).get("symbols", []))
+        except Exception:  # noqa: BLE001
+            prev = set()
+    f.write_text(__import__("json").dumps(
+        {"date": datetime.now().strftime("%Y-%m-%d"),
+         "symbols": sorted(prev | set(symbols))}, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+
+
+def _risk_sold_today() -> set:
+    """今日已被风控卖出的代码集合（组合选目标/补买时跳过，禁止当日再买）。"""
+    f = _risk_sold_fname()
+    if not f.exists():
+        return set()
+    try:
+        return set(__import__("json").loads(f.read_text(encoding="utf-8")).get("symbols", []))
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _selection_rows() -> list[dict]:
     """最近一次每日选股结果（600 只大池 topN，含 price/综合分）。无则返回 []。"""
     sel = SELECTION_RESULT or {}
@@ -1070,6 +1108,8 @@ def _portfolio_from_selection(rows: list[dict], n: int):
     chosen = [r for r in ranked if str(r.get("code")) in held]
 
     # ---- 2) 顺位补买：空位按分数补「能整手起配」的候选（1手 ≤ 单票上限 且现金够）----
+    # 当日已被风控卖出（止盈/止损自动平仓）的票，跳过补买 → 不把它们再买回来
+    blocked_today = _risk_sold_today()
     chosen_syms = {str(r.get("code")) for r in chosen}
     cash_left = cash
     for r in ranked:
@@ -1077,6 +1117,8 @@ def _portfolio_from_selection(rows: list[dict], n: int):
             break
         symbol = str(r.get("code"))
         if symbol in chosen_syms or symbol in held_sh:
+            continue
+        if symbol in blocked_today:
             continue
         price = r.get("price")
         if not price or price <= 0:
