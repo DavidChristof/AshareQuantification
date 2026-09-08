@@ -309,8 +309,8 @@ def _auto_open_execute_worker():
                     and marker.read_text(encoding="utf-8").strip() == today.isoformat():
                 return                                    # 本日已自动执行过
             try:
-                logger.info("[auto-open] 触发自动组合调仓 ...")
-                summary = portfolio_apply()
+                logger.info("[auto-open] 触发自动组合调仓（开盘参考价成交）...")
+                summary = portfolio_apply(force_open_ref=True)
                 logger.info("[auto-open] 完成: %s", summary)
             except HTTPException as exc:
                 logger.info("[auto-open] 跳过（%s）", exc.detail)
@@ -1564,8 +1564,13 @@ def portfolio():
 
 
 @app.post("/api/portfolio/apply")
-def portfolio_apply():
-    """一键组合调仓：卖掉落出 topN 的，按资金决策买入/加仓新进与不足的 topN（整手）。"""
+def portfolio_apply(force_open_ref: bool = False):
+    """一键组合调仓：卖掉落出 topN 的，按资金决策买入/加仓新进与不足的 topN（整手）。
+
+    force_open_ref=True（供 9:31 自动开盘执行调用）：即便 exec_mode=live，
+    也用「开盘参考价=昨收×(1+open_premium_pct)」成交，贴近开盘价/回测口径；
+    手动一键（False）仍按 exec_mode 走（live=实时价+追高拦截，open=仅开盘窗口）。
+    """
     if not _in_trading_hours():
         raise HTTPException(
             400, "非交易时段无法调仓（A股交易 9:30-11:30 / 13:00-15:00，周一至周五）")
@@ -1585,6 +1590,11 @@ def portfolio_apply():
             raise HTTPException(
                 400, "回测式开盘调仓仅在开盘后窗口内执行（9:30 起 "
                      f"{cfg.get('portfolio_risk', {}).get('open_window_minutes', 15)} 分钟内）")
+        refs = _open_ref_prices(all_syms, prev_close)
+        if refs:
+            prices = {**prices, **refs}
+    elif force_open_ref:
+        # 自动开盘：不经 exec_mode=open 的窗口限制，直接按开盘参考价成交（防跳空追价）
         refs = _open_ref_prices(all_syms, prev_close)
         if refs:
             prices = {**prices, **refs}
