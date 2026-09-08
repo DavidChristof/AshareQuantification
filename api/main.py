@@ -729,18 +729,28 @@ def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict) -> di
     }
 
 
-def _apply_manual_stops(prices: dict) -> list:
-    """手动模拟盘止盈止损检查（查询时触发，触发则自动平仓）。"""
+def _apply_manual_stops(_live: dict | None = None) -> list:
+    """手动盘止盈止损检查（按**当日收盘价**触发，触发则自动平仓）。
+
+    改为收盘触发（2026-09-08）：策略是日频、且组合多为反转/低波持仓，盘中插针
+    （实时价瞬时触线又收回）会被频繁震出后再踏空反弹。故只用 SIGNALS 最新收盘价
+    判止损/止盈/移动止损，一天最多在收盘数据刷新后触发一次。
+    `_live` 参数保留仅为兼容旧调用，已不使用。
+    """
     risk = _risk_config()
     if not risk.get("enabled", True):
         return []
     dates = [sig.index[-1].date() for sig in SIGNALS.values() if not sig.empty]
     if not dates:
         return []
+    # 只用每只已收盘（SIGNALS 最新）的收盘价评估；缺失的持仓忽略（不触发）
+    close_prices = {s: float(sig["close"].iloc[-1])
+                    for s, sig in SIGNALS.items()
+                    if sig is not None and not sig.empty}
     vol_map = _build_vol_map(risk)
     vol_cfg = _build_vol_cfg(risk) if vol_map else None
     return MANUAL_BROKER.apply_stop_rules(
-        str(max(dates)), prices,
+        str(max(dates)), close_prices,
         stop_loss_pct=risk.get("stop_loss_pct", 0.08),
         take_profit_pct=risk.get("take_profit_pct", 0.15),
         trailing_pct=risk.get("trailing_pct") if risk.get("trailing_stop", False) else None,

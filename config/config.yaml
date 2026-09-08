@@ -210,7 +210,7 @@ risk:
   # 按波动率动态止盈止损（ATR 自适应）：不同波动股票用不同宽窄的止损/止盈
   dynamic_volatility: true
   vol_window: 20          # ATR 计算窗口（日）
-  atr_stop_mult: 2.5      # 止损 = 成本 - 2.5 × ATR
+  atr_stop_mult: 3.0      # 止损 = 成本 - 3.0 × ATR（2.5 曾致高波动周期股被反复震出，放宽到 3）
   atr_take_mult: 3.5      # 止盈 = 成本 + 3.5 × ATR
   atr_trailing_mult: 2.5  # 移动止损 = 高点 - 2.5 × ATR
   vol_min_pct: 0.03       # 止损百分比下限（低波动股不设过窄）
