@@ -349,7 +349,8 @@ class PaperBroker(Broker):
         }
 
     def live_summary(self, latest_prices: dict[str, float],
-                     trading_today: bool = True) -> dict:
+                     trading_today: bool = True,
+                     session_started: bool = True) -> dict:
         """按最新价格（盘中实时价）估算总资产，不回写历史净值快照。
 
         Args:
@@ -357,6 +358,9 @@ class PaperBroker(Broker):
             trading_today: 今天是否 A股交易日。周末/法定休市日传入 False，
                            当日收益归零（休市无“当日”盈亏），避免拿上一交易日的
                            盘中历史点当基准产生假的“当日收益”。
+            session_started: 今天（交易日）的连续交易时段是否已开始。集合竞价/开盘前
+                           （09:30 前）实时源返回的是竞价撮合价，非真实成交 → 归零，
+                           避免“还没开盘就有当日收益”。
         """
         cash = self.query_cash()
         mv = 0.0
@@ -376,8 +380,9 @@ class PaperBroker(Broker):
             if str(_r["date"])[:10] < today:
                 prev_close = _r["equity"]
         base = float(prev_close) if prev_close is not None else float(initial)
-        if not trading_today:
-            # 今日休市（周末/节假日）：无当日收益，基准对齐当前，避免假盈亏
+        if not (trading_today and session_started):
+            # 今日休市 或 尚未开盘（周末/节假日/集合竞价期）：无“当日”收益，
+            # 基准对齐当前，避免拿竞价撮合价/上一交易日盘中点当基准产生假盈亏
             base = equity
         day_pnl = equity - base
         return {

@@ -797,7 +797,10 @@ def manual_account():
     prices = _live_prices()          # 实时价优先（盘中总资产随行情同步）
     _apply_manual_stops(prices)      # 止盈止损按最新价检查
     _sync_manual_equity()            # 净值曲线对齐最新交易日（历史快照仍按日线）
-    return MANUAL_BROKER.live_summary(prices, trading_today=_today_is_trading())
+    _hm = datetime.now().hour * 100 + datetime.now().minute
+    # 当日收益只在“连续交易已开始(≥09:30)”后实时计；集合竞价/开盘前实时源给的是竞价撮合价 → 归零
+    return MANUAL_BROKER.live_summary(prices, trading_today=_today_is_trading(),
+                                      session_started=_hm >= 930)
 
 
 @app.get("/api/manual/positions")
