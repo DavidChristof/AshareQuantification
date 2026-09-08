@@ -69,8 +69,8 @@ def dynamic_pcts(vol: dict, cost: float, high: float | None = None,
                 "stop_price": None, "take_price": None}
     stop_pct = _clamp(stop_mult * atr / cost, min_pct, max_pct)
     take_pct = _clamp(take_mult * atr / cost, take_min_pct, take_max_pct)
-    if take_pct <= stop_pct:            # 保证止盈始终 > 止损
-        take_pct = stop_pct * 1.5
+    # 注意：止损(向下)与止盈(向上)分属价格两侧，允许 take ≤ stop（如保守风格
+    # stop_mult 3.0 > take_mult 2.5 时，止盈目标可小于止损宽度，各自独立生效）。
     trail_pct = _clamp(trail_mult * atr / ref, min_pct, max_pct)
     return {
         "stop_pct": stop_pct,

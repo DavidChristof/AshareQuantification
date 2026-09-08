@@ -718,9 +718,7 @@ def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict) -> di
     from quant.trading.rules import limit_pct
     band = limit_pct(symbol)
     sl = min(float(sl), band)
-    tp = min(float(tp), band)
-    if tp <= sl:
-        sl = band * 0.95
+    tp = min(float(tp), band)          # 止损/止盈各自独立（允许 take ≤ stop，保守锁盈）
     return {
         "stop_price": cost * (1 - sl),
         "take_price": cost * (1 + tp),
@@ -730,12 +728,12 @@ def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict) -> di
 
 
 def _apply_manual_stops(_live: dict | None = None) -> list:
-    """手动盘止盈止损检查（按**当日收盘价**触发，触发则自动平仓）。
+    """手动盘止盈止损（2026-09-08 拆分口径）：
 
-    改为收盘触发（2026-09-08）：策略是日频、且组合多为反转/低波持仓，盘中插针
-    （实时价瞬时触线又收回）会被频繁震出后再踏空反弹。故只用 SIGNALS 最新收盘价
-    判止损/止盈/移动止损，一天最多在收盘数据刷新后触发一次。
-    `_live` 参数保留仅为兼容旧调用，已不使用。
+    - 止盈（+ 盘中锁盈，保守）：用**实时价**，强势日冲到止盈线即落袋，不等收盘回落；
+    - 止损 / 移动止损：用**当日收盘价**判（盘中插针不算打损），与日频策略一致、避免被震出。
+
+    一天内止盈可盘中触发、止损仅在收盘数据刷新后触发一次。`_live` 为实时价快照（旧调用兼容）。
     """
     risk = _risk_config()
     if not risk.get("enabled", True):
@@ -743,19 +741,34 @@ def _apply_manual_stops(_live: dict | None = None) -> list:
     dates = [sig.index[-1].date() for sig in SIGNALS.values() if not sig.empty]
     if not dates:
         return []
-    # 只用每只已收盘（SIGNALS 最新）的收盘价评估；缺失的持仓忽略（不触发）
     close_prices = {s: float(sig["close"].iloc[-1])
                     for s, sig in SIGNALS.items()
                     if sig is not None and not sig.empty}
+    live_prices = {**close_prices, **(_live or {})}       # 实时价缺的用最近收盘补
     vol_map = _build_vol_map(risk)
     vol_cfg = _build_vol_cfg(risk) if vol_map else None
-    return MANUAL_BROKER.apply_stop_rules(
-        str(max(dates)), close_prices,
+    maxd = str(max(dates))
+    out = []
+    # 1) 止盈（盘中·实时价）：保守锁盈，冲到目标就卖
+    out += MANUAL_BROKER.apply_stop_rules(
+        maxd, live_prices,
         stop_loss_pct=risk.get("stop_loss_pct", 0.08),
-        take_profit_pct=risk.get("take_profit_pct", 0.15),
-        trailing_pct=risk.get("trailing_pct") if risk.get("trailing_stop", False) else None,
+        take_profit_pct=risk.get("take_profit_pct", 0.08),
+        trailing_pct=None,
         vol=vol_map, vol_cfg=vol_cfg,
+        apply_stop=False, apply_take=True,
     )
+    # 2) 止损/移动止损（收盘价）：盘中插针不触发
+    out += MANUAL_BROKER.apply_stop_rules(
+        maxd, close_prices,
+        stop_loss_pct=risk.get("stop_loss_pct", 0.08),
+        take_profit_pct=risk.get("take_profit_pct", 0.08),
+        trailing_pct=(risk.get("trailing_pct")
+                      if risk.get("trailing_stop", False) else None),
+        vol=vol_map, vol_cfg=vol_cfg,
+        apply_stop=True, apply_take=False,
+    )
+    return out
 
 
 def _sync_manual_equity():

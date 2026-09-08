@@ -213,7 +213,8 @@ class PaperBroker(Broker):
     def apply_stop_rules(self, date: str, prices: dict[str, float],
                          stop_loss_pct: float = 0.08, take_profit_pct: float = 0.15,
                          trailing_pct: float | None = None,
-                         vol: dict | None = None, vol_cfg: dict | None = None
+                         vol: dict | None = None, vol_cfg: dict | None = None,
+                         apply_stop: bool = True, apply_take: bool = True
                          ) -> list[dict]:
         """止盈止损检查：持仓触发条件则自动卖出。
 
@@ -222,6 +223,11 @@ class PaperBroker(Broker):
         当传入 ``vol``（每只股票的 ATR 信息，来自 build_vol_map）和 ``vol_cfg``
         （动态参数，来自 vol_cfg_from_risk）时，改用「按波动率动态」百分比：
         高波动股票止损/止盈线更宽，低波动股票更窄；否则用固定百分比。
+
+        Args:
+            apply_stop / apply_take: 是否启用止损 / 止盈。用于「止盈盘中触发、止损收盘触发」
+            的分开调用（2026-09-08 起手动盘：止盈用实时价盘中落袋，止损用当日收盘价判，避免插针震出）。
+            默认两者都开（自动盘/回测保持原行为）。
 
         Returns: 触发的卖出列表 [{symbol, reason, price}]。
         """
@@ -260,21 +266,19 @@ class PaperBroker(Broker):
             # A股一天最多到涨跌停，线若超出限幅：
             #   止盈 → 当天到不了价、只能死等多日（纸面能成交、实盘排队未必）；
             #   止损 → 触发被跌停天然延后，实际亏得比线更多（假止损）。
-            # 统一压到限幅内（动态与固定回退都适用）；高波动被钳到同一顶时止损留 5% 缓冲。
+            # 统一压到限幅内（动态与固定回退都适用）；止损/止盈各自独立（允许 take ≤ stop）。
             band = limit_pct(pos.symbol)
             sl = min(float(sl), band)
             tp = min(float(tp), band)
-            if tp <= sl:
-                sl = band * 0.95
             if trail is not None:
                 trail = min(float(trail), band)
 
             reason = None
-            if price <= cost * (1 - sl):
+            if apply_stop and price <= cost * (1 - sl):
                 reason = f"止损：现价{price:.2f}≤成本{cost:.2f}×{1 - sl:.1%}"
-            elif price >= cost * (1 + tp):
+            elif apply_take and price >= cost * (1 + tp):
                 reason = f"止盈：现价{price:.2f}≥成本{cost:.2f}×{1 + tp:.1%}"
-            elif trail:
+            elif apply_stop and trail:
                 high = self._get_max_price(pos.symbol)
                 if high > cost and price <= high * (1 - trail):
                     reason = f"移动止损：从高点{high:.2f}回撤{trail:.1%}"

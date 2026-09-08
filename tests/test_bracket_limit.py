@@ -120,10 +120,47 @@ def test_fixed_fallback_15pct_take_capped_on_main_board():
         _rm(tmp)
 
 
+def test_separate_stop_take_flags():
+    """apply_stop=False → 只止盈不触止损；apply_take=False → 只止损不止盈。
+
+    用于「止盈盘中(实时价)、止损收盘」的分开调用（2026-09-08 手动盘口径）。
+    成本≈100.02，固定止损 8%、止盈 10%：
+      - apply_stop=False + 现价 90(≤止损92) → 不卖
+      - apply_stop=False + 现价 115(≥止盈110) → 止盈卖出
+      - apply_take=False + 现价 90 → 止损卖出
+      - apply_take=False + 现价 115 → 不卖
+    """
+    tmp = _tmp_db()
+    b = _broker(tmp)
+    try:
+        b.buy("600519", 100, 100.0, "2026-08-01")   # 主板，固定 8%/10%
+        args = dict(stop_loss_pct=0.08, take_profit_pct=0.10)
+        assert b.apply_stop_rules("2026-08-10", {"600519": 90.0},
+                                  apply_stop=False, apply_take=True, **args) == []
+        tr = b.apply_stop_rules("2026-08-10", {"600519": 115.0},
+                                apply_stop=False, apply_take=True, **args)
+        assert tr and "止盈" in tr[0]["reason"], tr
+    finally:
+        _rm(tmp)
+    tmp = _tmp_db()
+    b = _broker(tmp)
+    try:
+        b.buy("600519", 100, 100.0, "2026-08-01")
+        args = dict(stop_loss_pct=0.08, take_profit_pct=0.10)
+        tr = b.apply_stop_rules("2026-08-10", {"600519": 90.0},
+                                apply_stop=True, apply_take=False, **args)
+        assert tr and "止损" in tr[0]["reason"], tr
+        assert b.apply_stop_rules("2026-08-10", {"600519": 115.0},
+                                  apply_stop=True, apply_take=False, **args) == []
+    finally:
+        _rm(tmp)
+
+
 if __name__ == "__main__":
     tests = [test_main_board_high_vol_lines_capped_at_10pct,
              test_chinext_allows_up_to_20pct,
-             test_fixed_fallback_15pct_take_capped_on_main_board]
+             test_fixed_fallback_15pct_take_capped_on_main_board,
+             test_separate_stop_take_flags]
     failed = 0
     for fn in tests:
         try:

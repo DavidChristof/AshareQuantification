@@ -204,14 +204,14 @@ portfolio_risk:
 risk:
   enabled: true
   stop_loss_pct: 0.08
-  take_profit_pct: 0.15
+  take_profit_pct: 0.08   # 固定回退止盈（无 vol 时用）：保守 ≈+8% 落袋
   trailing_stop: true
   trailing_pct: 0.08
   # 按波动率动态止盈止损（ATR 自适应）：不同波动股票用不同宽窄的止损/止盈
   dynamic_volatility: true
   vol_window: 20          # ATR 计算窗口（日）
   atr_stop_mult: 3.0      # 止损 = 成本 - 3.0 × ATR（2.5 曾致高波动周期股被反复震出，放宽到 3）
-  atr_take_mult: 3.5      # 止盈 = 成本 + 3.5 × ATR
+  atr_take_mult: 2.5      # 止盈 = 成本 + 2.5 × ATR（保守锁盈：赢利 ≈+6~8% 即落袋）
   atr_trailing_mult: 2.5  # 移动止损 = 高点 - 2.5 × ATR
   vol_min_pct: 0.03       # 止损百分比下限（低波动股不设过窄）
   vol_max_pct: 0.15       # 止损百分比上限（高波动股不设过宽）
