@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import json
 import logging
@@ -325,6 +326,110 @@ def _auto_open_execute_worker():
 
 # 启动「开盘自动组合调仓」线程（daemon；配置关闭时立即空转退出）
 threading.Thread(target=_auto_open_execute_worker, daemon=True).start()
+
+
+# ============ 收盘后：自动维护 600 池 + 影子 A/B（scripts 26→27→28） ============
+# 替代“等 Claude 17:17 定时跑”：只要服务在 15:45 前后挂着就自动跑，比原来提前 ~1.5h，
+# 且不依赖 Claude 会话是否开着。Claude 的 17:17 定时保留为兜底 + STABLE 提醒。
+_SHADOW_STEPS = [
+    ("26_refresh_largepool.py", "--workers {workers}"),
+    ("27_shadow_ab.py", "--recent {recent}"),
+    ("28_shadow_check.py", ""),
+]
+
+
+def _shadow_ab_pipeline(sab: dict) -> None:
+    """在**独立子进程**里依次跑 26→27→28，逐步释放内存，崩溃不连累服务。
+
+    与每日选股（scripts/30）同策略：subprocess 隔离。完整输出落
+    logs/shadow_ab_<日期>.log，另把每步尾部打进服务日志方便排查。
+    """
+    repo = Path(__file__).resolve().parent.parent
+    logs = cfg.resolve("logs")
+    logs.mkdir(parents=True, exist_ok=True)
+    logf = logs / f"shadow_ab_{datetime.now():%Y-%m-%d}.log"
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}   # 强制子进程 UTF-8，日志不乱码
+    workers = str(sab.get("workers", 4))
+    recent = str(sab.get("recent", 700))
+    with logf.open("a", encoding="utf-8") as fh:
+        for name, args_tpl in _SHADOW_STEPS:
+            argv = [sys.executable, "-u", str(repo / "scripts" / name)]
+            if args_tpl:
+                argv += [args_tpl.format(workers=workers, recent=recent).split()]
+            fh.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {name} =====\n")
+            fh.flush()
+            logger.info("[shadow] 启动 %s ...", name)
+            try:
+                r = subprocess.run(argv, cwd=str(repo), env=env,
+                                   capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=3600)
+            except subprocess.TimeoutExpired:
+                logger.error("[shadow] %s 超时(>1h)，中止本日流水线", name)
+                fh.write("[超时>1h]\n")
+                break
+            out = (r.stdout or "") + (r.stderr or "")
+            fh.write(out + "\n")
+            fh.flush()
+            tail = "\n".join(x for x in out.splitlines()[-12:] if x.strip())
+            logger.info("[shadow] %s 结束 rc=%d\n%s", name, r.returncode, tail)
+            if r.returncode != 0:
+                # 28 返回非 0 是常态（尚无 OOS / NOT_YET），只在本日志留判定；26/27 失败继续后续
+                if name.startswith("28_"):
+                    logger.info("[shadow] 28 判定 → %s",
+                                "STABLE：600 已在真正前向 OOS 稳压，可提醒上线新版600池"
+                                if "STABLE" in out else "NOT_YET：继续每日累积")
+                else:
+                    logger.warning("[shadow] %s 返回 rc=%d（不中断，继续下一步）",
+                                   name, r.returncode)
+
+
+def _shadow_ab_worker():
+    """服务挂着时，在 run_time（默认 15:45）自动跑 600 池维护流水线，每日一次。
+
+    与 _auto_open_execute_worker 同理：没到点就睡；错过 grace 窗口 → 本日跳过；
+    logs/shadow_ab_date 防同日重复（中途重启也不重跑）。跑 27 前确保 40 池
+    (market.db) 今日已刷新 —— 15:30 自动刷新若还没跑到（服务刚起），这里补一次幂等更新。
+    """
+    try:
+        sab = (cfg.get("auto_refresh", {}) or {}).get("shadow_ab") or {}
+        if not sab.get("enabled", False):
+            return
+        today = datetime.now().date()
+        holidays = parse_dates(
+            (cfg.get("risk", {}) or {}).get("pre_holiday", {}).get("holiday_dates") or [])
+        if not is_ashare_trading_day(today, holidays):
+            return
+        run_time = str(sab.get("run_time", "15:45"))
+        grace_min = int(sab.get("grace_min", 120))
+        rh, rm = map(int, run_time.split(":"))
+        trigger = datetime(today.year, today.month, today.day, rh, rm, 0)
+        while True:
+            now = datetime.now()
+            if now < trigger:
+                time.sleep(max(1.0, min(20.0, (trigger - now).total_seconds())))
+                continue
+            if (now - trigger).total_seconds() > grace_min * 60:
+                logger.info("[shadow] 错过今日触发点（%s 后 %d 分钟仍不在），本日不自动跑",
+                            run_time, grace_min)
+                return
+            marker = cfg.resolve("logs") / "shadow_ab_date"
+            if marker.exists() and marker.read_text(encoding="utf-8").strip() == today.isoformat():
+                logger.info("[shadow] 今日已自动跑过，跳过")
+                return
+            if _last_updated is None or _last_updated.date() != today:
+                _run_auto_update()      # 补一次 40 池收盘刷新（幂等，含自动调仓/选股）
+            logger.info("[shadow] 触发：维护 600 池 + 影子 A/B（26→27→28，约几分钟）...")
+            _shadow_ab_pipeline(sab)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(today.isoformat(), encoding="utf-8")
+            logger.info("[shadow] 本日自动维护完成 → logs/shadow_ab_%s.log", today)
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[shadow] worker 异常退出: %s", exc, exc_info=True)
+
+
+# 启动「收盘后自动维护 600 池」线程（daemon；配置关 / 非交易日 / 错过窗口则当日不跑）
+threading.Thread(target=_shadow_ab_worker, daemon=True).start()
 
 
 @app.get("/")

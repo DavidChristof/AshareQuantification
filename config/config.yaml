@@ -143,6 +143,17 @@ auto_refresh:
   check_interval_minutes: 30
   update_time: '15:30'
   auto_rebalance: true
+  # 收盘后自动维护 600 池 + 影子 A/B（scripts 26→27→28）：服务在 run_time 时刻挂着才跑，
+  # 没挂当日跳过（符合“本地无法 24h 挂服务”约束）。run_time 需在 40 池收盘刷新
+  # (update_time 15:30)之后 —— 先保证 market.db 的 40 只今天已就绪，26 补大池、
+  # 27 才能在完整 ~599 截面上打分。比“等 Claude 17:17 定时”提前约 1.5h；
+  # Claude 定时保留为兜底 + STABLE 提醒。
+  shadow_ab:
+    enabled: true
+    run_time: '15:45'     # 触发时刻（15:00 收盘 → 15:30 40池刷新 → 15:45 自动跑）
+    grace_min: 120        # 触发点过后仍允许补跑（服务开晚了也在当天内补）；超过则当日跳过
+    workers: 4            # scripts/26 的大池拉取并发（服务在跑时别用 8，防内存不够）
+    recent: 700           # scripts/27 每只取最近 N 交易日打分（控耗时）
 selection:
   auto: true        # 每日选股：收盘后随自动刷新运行（寻找大盘优质股）
   n: 12             # 展示优质股数量
