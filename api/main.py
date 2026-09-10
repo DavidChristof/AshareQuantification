@@ -2114,6 +2114,24 @@ def _real_advice_payload() -> dict:
         plan["notes"].insert(0, (
             "⏸ 当前非交易时段（休市/盘后）——以下为**下一交易日计划**，"
             "需在 9:30-11:30 / 13:00-15:00 才能委托；价格与判定以最新行情为准。"))
+        # 「建议委托价」= 最新盘口快照（盘后即最后一笔成交价），**不是**明日开盘价的预测。
+        # 明日开盘会跳空 → 另给「开盘参考价」= 今收 ×(1±open_premium_pct%)（与开盘自动调仓同口径），
+        # 供盘前预挂/心里有数；开盘后请以实时卖一/买一价为准。
+        prem = float((cfg.get("portfolio_risk") or {}).get("open_premium_pct", 0.5) or 0.0)
+        for row in (plan.get("buy", []) + plan.get("backup", []) + plan.get("pending", [])):
+            base = _fnum(row.get("price")) or _fnum((row.get("fill") or {}).get("price"))
+            if base > 0:
+                row["open_ref_price"] = fill_mod.tick_round(base * (1 + prem / 100.0), "buy")
+                row["price_basis"] = "last_session"
+        for row in plan.get("sell", []):
+            base = _fnum(row.get("price")) or _fnum((row.get("fill") or {}).get("price"))
+            if base > 0:
+                row["open_ref_price"] = fill_mod.tick_round(base * (1 - prem / 100.0), "sell")
+                row["price_basis"] = "last_session"
+        plan["notes"].insert(1 if plan["notes"] else 0, (
+            f"价格口径：「建议委托价」为**最新盘口快照价**（盘后 = 最后一笔成交价），"
+            f"不是明日开盘价的预测；明日开盘会跳空，故另给「开盘参考价 = 今收×(1±{prem}%)」作近似 —— "
+            f"开盘后请以实时卖一/买一价为准。"))
     for row in plan.get("buy", []) + plan.get("backup", []) + plan.get("pending", []):
         row.setdefault("name", _display_name(row.get("symbol")))
     for row in plan.get("sell", []):

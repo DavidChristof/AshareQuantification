@@ -543,7 +543,8 @@
       <div class="panel">
         <h2>🎯 今日实盘建议 <span class="muted" style="font-size:12px">模型只给建议，你去券商 App 下单（本程序不会自动交易）</span></h2>
         <div v-if="rAdvice.session && rAdvice.session !== 'open'" class="warn-bar">
-          ⏸ 当前非交易时段（休市/盘后）——以下为<b>下一交易日计划</b>，需在 9:30-11:30 / 13:00-15:00 才能委托；价格与判定以最新行情为准。
+          ⏸ 当前非交易时段（休市/盘后）——以下为<b>下一交易日计划</b>，需在 9:30-11:30 / 13:00-15:00 才能委托。
+          <b>「建议委托价」是盘口快照价、判定依据的是上一交易日盘口</b>；明日开盘会跳空，请以「开盘参考价」为起点，开盘后按实时卖一/买一价刷新。
         </div>
         <div v-if="rAdvice.capacity && rAdvice.capacity.band_text" class="info-bar">
           💰 {{ rAdvice.capacity.band_text }}
@@ -564,7 +565,8 @@
               <td>{{ b.score != null ? b.score.toFixed(1) : '-' }}</td>
               <td class="muted">{{ b.reference_price != null ? fmt(b.reference_price) : '-' }}</td>
               <td>{{ fmt(b.price) }}</td>
-              <td><b>{{ fmt(b.suggested_price) }}</b></td>
+              <td><b>{{ fmt(b.suggested_price) }}</b>
+                <div v-if="b.open_ref_price" class="muted" style="font-size:11px">开盘参考 ≈ ¥{{ fmt(b.open_ref_price) }}</div></td>
               <td>{{ b.est_shares != null ? b.est_shares.toFixed(0) : '-' }}</td>
               <td>{{ b.est_cash_needed != null ? '¥'+fmt(b.est_cash_needed) : '-' }}</td>
               <td class="muted">{{ b.est_fee != null ? '¥'+fmt(b.est_fee) : '-' }}</td>
@@ -594,7 +596,8 @@
               <td class="muted">{{ s.stop_price != null ? fmt(s.stop_price) : '-' }}</td>
               <td class="muted">{{ s.take_price != null ? fmt(s.take_price) : '-' }}</td>
               <td class="muted">{{ s.breakeven_price != null ? fmt(s.breakeven_price) : '-' }}</td>
-              <td><b>{{ fmt(s.suggested_price) }}</b></td>
+              <td><b>{{ fmt(s.suggested_price) }}</b>
+                <div v-if="s.open_ref_price" class="muted" style="font-size:11px">开盘参考 ≈ ¥{{ fmt(s.open_ref_price) }}</div></td>
               <td><span class="fill-badge" :class="'fill-'+(s.fill||{}).status" :title="((s.fill||{}).reasons||[]).join('\n')">{{ (s.fill||{}).label || '-' }}</span></td>
               <td class="muted" style="font-size:12px">{{ s.reason }}</td>
               <td><button v-if="s.action==='sell'" class="order-btn sell" style="padding:3px 10px;font-size:12px;margin:0"
