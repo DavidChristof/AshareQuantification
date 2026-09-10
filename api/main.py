@@ -233,6 +233,9 @@ def _run_auto_update():
             before = db.latest_date()
             refresh_market_data(cfg)
             data, signals = rebuild_signals(cfg, PREDICTOR)
+            # 兜底清洗：close 有缺失→前收、prob NaN→0.5。否则个别行 close=NaN 会让
+            # 自动调仓算出 NaN 单子把现金写成 NULL（2026-09-09 事故），也会污染 SIGNALS。
+            signals = {s: _sanitize_signal_table(t) for s, t in signals.items()}
             date = latest_trade_date(data)
             if str(date) == (before or ""):
                 logger.info("[auto] 行情未推进到新交易日（最新 %s）→ 休市或已更新，跳过调仓/选股", date)

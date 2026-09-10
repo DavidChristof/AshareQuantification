@@ -13,6 +13,7 @@ from ..data.loader import load_all
 from ..data.storage import MarketDB
 from ..models.predict import ModelPredictor
 from .engine import TradingEngine
+from .paper import _valid_price
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,9 @@ def rebalance_auto(cfg: Config, broker, signals: dict, date: str, data: dict | N
     """
     bt = cfg["backtest"]
     max_positions = cfg.get("trading", {}).get("max_positions", 3)
-    prices = {s: float(t["close"].iloc[-1]) for s, t in signals.items() if not t.empty}
+    # 只收有效收盘价；个别行 close 为 NaN 时剔除（防 NaN 单子把现金写成 NULL，2026-09-09 事故）
+    prices = {s: float(t["close"].iloc[-1]) for s, t in signals.items()
+              if not t.empty and _valid_price(t["close"].iloc[-1])}
 
     # 1. 先执行止盈止损（止损/止盈/移动止损，支持按波动率动态）
     risk = cfg.get("risk", {})

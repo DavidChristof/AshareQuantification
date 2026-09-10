@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from datetime import date
 from pathlib import Path
@@ -17,6 +18,18 @@ from .base import Broker, Position, TradeResult
 from .rules import limit_pct
 
 logger = logging.getLogger(__name__)
+
+
+def _valid_price(price) -> bool:
+    """价格是否可用（非 None/非 NaN/非 inf 且 > 0）。
+
+    防御：信号表个别行 close 可能是 NaN；`not price` 对 NaN 为 False（NaN 是 truthy），
+    `nan > cash` 也恒 False → 会让 NaN 单子通过所有判断、把现金写成 NULL（2026-09-09 事故）。
+    """
+    try:
+        return math.isfinite(float(price)) and float(price) > 0
+    except (TypeError, ValueError):
+        return False
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_account (
@@ -98,7 +111,8 @@ class PaperBroker(Broker):
     def query_cash(self) -> float:
         with self._connect() as conn:
             row = conn.execute("SELECT value FROM paper_account WHERE key='cash'").fetchone()
-        return float(row[0]) if row else 0.0
+        # row[0] 可能为 NULL（历史 NaN 事故写入）：视作 0，避免 float(None) 抛错打挂接口
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     def query_positions(self) -> list[Position]:
         with self._connect() as conn:
@@ -109,8 +123,12 @@ class PaperBroker(Broker):
 
     def buy(self, symbol: str, shares: float, price: float, date: str,
             remark: str = "") -> TradeResult:
-        if shares <= 0:
+        if shares is None or not math.isfinite(float(shares)) or shares <= 0:
             return TradeResult(symbol, "buy", 0, price, 0, 0, False, "买入数量必须为正")
+        if not _valid_price(price):
+            # 价格缺失/NaN → 拒单（否则 shares*NaN 会把现金写成 NULL，见 2026-09-09 事故）
+            return TradeResult(symbol, "buy", 0, price, 0, 0, False,
+                               f"买入价无效（{price!r}），已拒单")
         if self.lot_size > 1 and shares % self.lot_size != 0:
             return TradeResult(symbol, "buy", 0, price, 0, 0, False,
                                f"买入必须为 {self.lot_size} 股整数倍（A股整手）")
@@ -153,8 +171,11 @@ class PaperBroker(Broker):
 
     def sell(self, symbol: str, shares: float, price: float, date: str,
              remark: str = "") -> TradeResult:
-        if shares <= 0:
+        if shares is None or not math.isfinite(float(shares)) or shares <= 0:
             return TradeResult(symbol, "sell", 0, price, 0, 0, False, "卖出数量必须为正")
+        if not _valid_price(price):
+            return TradeResult(symbol, "sell", 0, price, 0, 0, False,
+                               f"卖出价无效（{price!r}），已拒单")
         with self._connect() as conn:
             pos = conn.execute(
                 "SELECT shares, avg_cost FROM paper_positions WHERE symbol=?", (symbol,)).fetchone()
@@ -311,7 +332,7 @@ class PaperBroker(Broker):
         market_value = 0.0
         for pos in self.query_positions():
             price = latest_prices.get(pos.symbol)
-            if price:
+            if _valid_price(price):                     # 挡 NaN，避免 NaN 净值落库
                 market_value += pos.shares * price
         equity = cash + market_value
         with self._connect() as conn:
@@ -343,8 +364,9 @@ class PaperBroker(Broker):
                 "SELECT value FROM paper_account WHERE key='initial_capital'").fetchone()
             latest = conn.execute(
                 "SELECT equity FROM paper_equity ORDER BY date DESC LIMIT 1").fetchone()
-        initial = float(init[0]) if init else cash
-        equity = float(latest[0]) if latest else cash
+        initial = float(init[0]) if init and init[0] is not None else cash
+        # latest[0] 可能为 NULL（NaN 事故落库）→ 回退现金，别让 float(None) 打挂接口
+        equity = float(latest[0]) if latest and latest[0] is not None else cash
         return {
             "cash": cash,
             "equity": equity,

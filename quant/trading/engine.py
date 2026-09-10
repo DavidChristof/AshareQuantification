@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 
 from .base import Broker
-from .paper import PaperBroker
+from .paper import PaperBroker, _valid_price
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ class TradingEngine:
             for pos in self.broker.query_positions():
                 if pos.symbol not in core_set:
                     price = prices.get(pos.symbol)
-                    if price:
+                    if _valid_price(price):
                         r = self.broker.sell(pos.symbol, pos.shares, price, date)
                         actions.append(f"卖出 {pos.symbol} {pos.shares:.0f}股 -> {r.message or 'OK'}")
             self._top_up_core(date, core, prices, actions)
@@ -90,7 +90,7 @@ class TradingEngine:
         held = {p.symbol: p for p in self.broker.query_positions()}
         for sym, pos in held.items():
             price = prices.get(sym)
-            if not price:
+            if not _valid_price(price):        # 价格缺失/NaN → 本日不动该票（防 NaN 落库）
                 continue
             p = probs.get(sym)
             if p is None or p < self.clear_threshold:
@@ -127,7 +127,7 @@ class TradingEngine:
         budget_per = equity * self.position_pct / len(core)
         for sym in core:
             price = prices.get(sym)
-            if not price:
+            if not _valid_price(price):        # 价格缺失/NaN → 跳过该票（防 NaN 落库）
                 continue
             cur_val = self._position_value(sym, price)
             if cur_val >= budget_per * 0.85:      # 已达/接近目标 → 持有
@@ -164,8 +164,11 @@ class TradingEngine:
 
     def _current_equity(self, prices: dict[str, float]) -> float:
         cash = self.broker.query_cash()
-        mv = sum(pos.shares * prices.get(pos.symbol, 0)
-                 for pos in self.broker.query_positions())
+        mv = 0.0
+        for pos in self.broker.query_positions():
+            p = prices.get(pos.symbol)
+            if _valid_price(p):                # 只认有效价，NaN 不进市值（否则总资产变 NaN）
+                mv += pos.shares * p
         return cash + mv
 
     def _position_value(self, symbol: str, price: float) -> float:
