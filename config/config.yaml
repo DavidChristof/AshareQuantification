@@ -138,6 +138,43 @@ manual:
   max_order_shares: 10000
   enforce_trading_hours: true   # 闭市/休市禁止下单（仅交易日 9:30-11:30 / 13:00-15:00）
   lot_size: 100                # A股买入整手（100 股整数倍）
+# 实盘炒股账户（本金 ¥3000 · 模型只给「建议」· 人工在券商 App 下单后回来记账）。
+# ⚠️ 程序绝不自动下单、不接入任何券商 API（故无需程序化交易报备）；本段与上面两个账户完全隔离。
+real:
+  enabled: true
+  initial_capital: 3000.0
+  db_path: paper/real_account.db
+  lot_size: 100                # A股整手（买入须 100 股整数倍）
+  max_order_shares: 2000       # 单笔上限（¥3000 本金下足够）
+  enforce_trading_hours: true  # 只约束「建议」时效；记账不受限（成交回报常在盘后补录）
+  # ---- 仓位政策：¥3000 只够 2 只；默认组合逻辑的 5 只/单票20% 完全不适用 ----
+  max_positions: 2             # 持仓上限
+  target_position_pct: 0.95    # 目标总仓位
+  max_stock_pct: 0.50          # 单票市值上限（2 仓 → 每只 ≤50%）
+  single_position_pct: 0.90    # 仅空仓且无第二只可负担时，放宽单只上限（例外，界面会注明）
+  # ---- 费用（真实口径：单笔最低佣金 ¥5 是 ¥3000 账户的主要成本）----
+  commission: 0.0003           # 佣金 万3
+  min_commission: 5.0          # 单笔最低佣金 ¥5（买卖各收一次）
+  stamp_tax: 0.0005            # 印花税（卖出单边 0.05%）
+  transfer_fee: 0.00001        # 过户费（双边 0.001%）
+  slippage: 0.0                # 按人工回报的成交价记账，不加滑点
+  max_breakeven_pct: 1.5       # 往返费用需涨幅 > 该值 → 不建议（低价股费用占比过高）
+  min_order_amount: 500.0      # 单笔金额下限（低于此费用占比过大）
+  # 成交可行性判定（严格档）——阈值见 quant/trading/fill.py:FillConfig
+  fill:
+    drift_tol_pct: 1.0         # 现价 vs 参考价漂移 > 1% → 需改价方能成交（hard）
+    miss_tol_pct: 2.0          # 漂移 > 2% → 已错过
+    touch_tol_pct: 0.3         # 委托价贴近当日已触及区间边缘 → 降级 likely
+    near_limit_pct: 0.5        # 距涨跌停 ≤0.5% → 封板风险
+    depth_ratio: 1.0           # 盘口量/建议股数 < 该值 → 可能部分成交
+    open_grace_min: 5          # 开盘后前 N 分钟漂移阈值放宽（集合竞价跳空）
+  # 建议参数（stop/take 为实盘建议线；空表示沿用全局 risk 段）
+  advice:
+    n: 3                       # 最多输出 3 条买入建议（2 仓位 + 备选）
+    stop_loss_pct: 0.08
+    take_profit_pct: 0.10
+    trailing_pct: 0.08
+    use_selection: true        # 候选来源 = 每日选股 topN（同组合调仓）；false = 40 只模型池
 auto_refresh:
   enabled: true
   check_interval_minutes: 30

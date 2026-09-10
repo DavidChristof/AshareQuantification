@@ -52,7 +52,10 @@ from quant.timing.engine import TimingEngine                           # noqa: E
 from quant.timing.regime import MarketRegime                           # noqa: E402
 from quant.timing.selector import explain as timing_explain            # noqa: E402
 from quant.timing.selector import select_weights                       # noqa: E402
-from quant.trading.paper import PaperBroker                            # noqa: E402
+from quant.trading.paper import PaperBroker, _valid_price as _valid_price  # noqa: E402
+from quant.trading.real_account import RealBroker                      # noqa: E402
+from quant.trading import fill as fill_mod                             # noqa: E402
+from quant.trading.real_advice import AdviceInput, plan_real_portfolio  # noqa: E402
 from quant.risk.calendar import (                                      # noqa: E402
     is_ashare_trading_day, parse_dates, upcoming_closure_run,
 )
@@ -131,6 +134,20 @@ MANUAL_BROKER = PaperBroker(
     slippage=cfg["backtest"]["slippage"],
     stamp_tax=cfg["backtest"].get("stamp_tax", 0.0005),
     lot_size=int(cfg["manual"].get("lot_size", 100)),
+)
+
+# 实盘账户（本金 ¥3000 · 模型只给建议 · 人工在券商 App 下单后回来记账）。
+# ⚠️ 只有 POST /api/real/order 会写入它，且写入的是「人工回报的成交」；绝无券商下单接口。
+_REAL_CFG = cfg.get("real", {}) or {}
+REAL_BROKER = RealBroker(
+    cfg.resolve(_REAL_CFG.get("db_path", "paper/real_account.db")),
+    initial_capital=float(_REAL_CFG.get("initial_capital", 3000.0)),
+    commission=float(_REAL_CFG.get("commission", 0.0003)),
+    slippage=float(_REAL_CFG.get("slippage", 0.0)),
+    stamp_tax=float(_REAL_CFG.get("stamp_tax", 0.0005)),
+    lot_size=int(_REAL_CFG.get("lot_size", 100)),
+    min_commission=float(_REAL_CFG.get("min_commission", 0.0)),
+    transfer_fee=float(_REAL_CFG.get("transfer_fee", 0.0)),
 )
 
 # 买卖决策辅助引擎
@@ -812,12 +829,14 @@ def _build_vol_cfg(risk: dict) -> dict:
     return vol_cfg_from_risk(risk)
 
 
-def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict) -> dict:
+def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict,
+                   risk: dict | None = None) -> dict:
     """计算某持仓的止损/止盈位：动态波动率优先，回退固定百分比。
 
+    risk: 自定义风控参数（如 config 的 real.advice）；None = 全局 risk 段（原行为）。
     Returns: {stop_price, take_price, sl_pct, tp_pct, mode(动态/固定), atr_pct}
     """
-    risk = _risk_config()
+    risk = risk or _risk_config()
     sl = risk.get("stop_loss_pct", 0.08)
     tp = risk.get("take_profit_pct", 0.15)
     mode, atr_pct = "fixed", None
@@ -1022,13 +1041,15 @@ def _today_is_trading() -> bool:
     return is_ashare_trading_day(datetime.now().date(), holidays)
 
 
-def _in_trading_hours() -> bool:
+def _in_trading_hours(tag: str = "manual") -> bool:
     """是否处于 A股交易时段（工作日 9:30-11:30 / 13:00-15:00 且今日确为交易日）。
 
     节假日感知：即便在工作日时段，若实时快照显示最近成交日 ≠ 今天（market_closed，
     即法定节假日休市），也不放行；快照缺失/状态未知时回退到「周几+时段」判定。
+
+    tag: 读哪个配置段的 enforce_trading_hours（manual / real）。默认 manual 保持原行为。
     """
-    if not cfg.get("manual", {}).get("enforce_trading_hours", True):
+    if not cfg.get(tag, {}).get("enforce_trading_hours", True):
         return True
     now = datetime.now()
     if now.weekday() >= 5:
@@ -1143,17 +1164,21 @@ def _display_name(symbol: str) -> str:
     return _name(symbol)
 
 
-def _risk_sold_fname(day: str | None = None) -> Path:
-    """当日“风控卖出(止盈/止损)”记牌文件（按日期分文件，次日自动失效）。"""
+def _risk_sold_fname(day: str | None = None, tag: str = "") -> Path:
+    """当日“风控卖出(止盈/止损)”记牌文件（按日期分文件，次日自动失效）。
+
+    tag: 账户标记（如 "real"），让不同账户的记牌互不串扰；默认空 = 手动盘（原行为）。
+    """
     d = day or datetime.now().strftime("%Y-%m-%d")
-    return cfg.resolve("logs") / f"risk_sold_{d}.json"
+    mid = f"_{tag}" if tag else ""
+    return cfg.resolve("logs") / f"risk_sold{mid}_{d}.json"
 
 
-def _mark_risk_sold(symbols: list[str]):
+def _mark_risk_sold(symbols: list[str], tag: str = ""):
     """记录今日止盈/止损自动卖出的股票 → 组合当日不再买入它们（防锁盈后又被请回来）。"""
     if not symbols:
         return
-    f = _risk_sold_fname()
+    f = _risk_sold_fname(tag=tag)
     prev = set()
     if f.exists():
         try:
@@ -1166,9 +1191,9 @@ def _mark_risk_sold(symbols: list[str]):
         encoding="utf-8")
 
 
-def _risk_sold_today() -> set:
+def _risk_sold_today(tag: str = "") -> set:
     """今日已被风控卖出的代码集合（组合选目标/补买时跳过，禁止当日再买）。"""
-    f = _risk_sold_fname()
+    f = _risk_sold_fname(tag=tag)
     if not f.exists():
         return set()
     try:
@@ -1847,6 +1872,426 @@ def selection_run():
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"started": True, "message": "选股已启动，约 1-2 分钟后完成（可稍后刷新查看）"}
+
+
+# ============ 实盘炒股（¥3000 · 模型只给建议 · 人工在券商下单后回来记账） ============
+# ⚠️ 本段**没有任何券商下单接口**：GET 只读（positions/advice 会更新持仓最高价用于移动
+#    止损并对齐净值快照，属"读时写"，与手动盘同模式）；唯一写交易的是 POST /api/real/order，
+#    写入的是**人工回报的成交**。
+_REAL_QUOTE_TTL = 10.0                 # 新浪实时行情限速 → 10 秒缓存
+_real_quote_cache: dict[str, tuple[float, dict]] = {}
+_real_quote_lock = threading.Lock()
+
+
+def _fnum(v, default: float = 0.0) -> float:
+    """安全转 float（None/NaN/inf/字符串 → default）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if f == f and abs(f) != float("inf") else default
+
+
+def _signal_date() -> str:
+    """最新信号日期（与手动盘同口径：以 SIGNALS 最后一天为「今天」）。"""
+    for sig in SIGNALS.values():
+        try:
+            if sig is not None and len(sig):
+                return str(sig.index[-1].date())
+        except Exception:  # noqa: BLE001
+            continue
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _session_started() -> bool:
+    now = datetime.now()
+    return now.weekday() < 5 and (now.hour * 100 + now.minute) >= 930
+
+
+def _real_quotes(symbols) -> dict[str, dict]:
+    """实盘实时行情：池内走 QuoteManager，池外按 10s TTL 批量抓（600 池候选没有常驻行情）。"""
+    syms = [s for s in dict.fromkeys(symbols or []) if s]
+    out: dict[str, dict] = {}
+    need: list[str] = []
+    now = time.monotonic()
+    with _real_quote_lock:
+        for s in syms:
+            try:
+                q = QUOTE_MANAGER.get(s) if QUOTE_MANAGER else None
+            except Exception:  # noqa: BLE001
+                q = None
+            if q and _fnum(q.get("price")) > 0:
+                out[s] = q
+                _real_quote_cache[s] = (now, q)
+                continue
+            hit = _real_quote_cache.get(s)
+            if hit and now - hit[0] < _REAL_QUOTE_TTL:
+                out[s] = hit[1]
+                continue
+            need.append(s)
+    if need:
+        try:
+            from quant.realtime.quoter import fetch_quotes
+            fresh = fetch_quotes(need) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[real] 实时行情抓取失败: %s", exc)
+            fresh = {}
+        with _real_quote_lock:
+            for s in need:
+                q = fresh.get(s)
+                if q and _fnum(q.get("price")) > 0:
+                    out[s] = q
+                    _real_quote_cache[s] = (time.monotonic(), q)
+    return out
+
+
+def _real_prices(symbols) -> dict[str, float]:
+    """实盘用价格：实时报价优先 → SIGNALS 收盘兜底。"""
+    out: dict[str, float] = {}
+    for s, q in _real_quotes(list(symbols)).items():
+        px = _fnum(q.get("price"))
+        if px > 0:
+            out[s] = px
+    for s in symbols:
+        if s in out:
+            continue
+        sig = SIGNALS.get(s)
+        if sig is not None and len(sig):
+            px = _fnum(sig["close"].iloc[-1])
+            if px > 0:
+                out[s] = px
+    return out
+
+
+def _real_fill_cfg() -> "fill_mod.FillConfig":
+    return fill_mod.FillConfig.from_config(_REAL_CFG)
+
+
+def _real_risk_params() -> dict:
+    """实盘风控：全局 risk 段 + real.advice 覆盖（止损/止盈/移动止损可单独设）。"""
+    risk = dict(cfg.get("risk", {}) or {})
+    risk.update({k: v for k, v in (_REAL_CFG.get("advice", {}) or {}).items()
+                 if k in ("stop_loss_pct", "take_profit_pct", "trailing_pct")})
+    return risk
+
+
+def _real_risk_and_sells(prices: dict) -> tuple[dict, dict, dict]:
+    """持仓的止损/止盈线 + 卖出提示（实盘只提醒，绝不自动卖）。"""
+    risk = _real_risk_params()
+    vol_map, vol_cfg = _build_vol_map(risk), _build_vol_cfg(risk)
+    lines: dict[str, dict] = {}
+    rules: dict[str, str] = {}
+    for p in REAL_BROKER.query_positions():
+        r = _position_risk(p.symbol, p.avg_cost, vol_map, vol_cfg, risk=risk)
+        lines[p.symbol] = r
+        px = _fnum(prices.get(p.symbol)) or p.avg_cost
+        if r.get("stop_price") and px <= r["stop_price"]:
+            rules[p.symbol] = f"止损：现价 {px:.2f} ≤ 止损线 {r['stop_price']:.2f}"
+        elif r.get("take_price") and px >= r["take_price"]:
+            rules[p.symbol] = f"止盈：现价 {px:.2f} ≥ 止盈线 {r['take_price']:.2f}"
+    return risk, lines, rules
+
+
+def _real_positions_payload(prices: dict, lines: dict | None = None) -> list[dict]:
+    d = _signal_date()
+    lines = lines or {}
+    out = []
+    for p in REAL_BROKER.query_positions():
+        sellable = REAL_BROKER.sellable_shares(p.symbol, d)
+        r = lines.get(p.symbol, {}) or {}
+        px = _fnum(prices.get(p.symbol)) or p.avg_cost
+        out.append({
+            "symbol": p.symbol, "name": _display_name(p.symbol),
+            "shares": round(p.shares, 2), "avg_cost": round(p.avg_cost, 3),
+            "price": round(px, 3), "market_value": round(px * p.shares, 2),
+            "sellable_shares": round(sellable, 2),
+            "t1_locked": sellable < p.shares - 1e-6,
+            "unrealized_pnl": round((px - p.avg_cost) * p.shares, 2),
+            "pnl_pct": round(px / p.avg_cost - 1, 4) if p.avg_cost > 0 else None,
+            "breakeven_price": round(fill_mod.breakeven_price(
+                p.avg_cost, p.shares, _real_fill_cfg()), 3) if p.avg_cost > 0 else None,
+            "stop_price": round(r["stop_price"], 3) if r.get("stop_price") else None,
+            "take_price": round(r["take_price"], 3) if r.get("take_price") else None,
+            "sl_pct": r.get("sl_pct"), "tp_pct": r.get("tp_pct"),
+            "atr_pct": r.get("atr_pct"), "mode": r.get("mode"),
+        })
+    return out
+
+
+def _real_fees_info() -> dict:
+    f = _real_fill_cfg()
+    one_lot = 1000.0                       # 以 ¥1000 一单估算往返费用占比
+    rt = fill_mod.buy_fees(one_lot, f)["fee"] + fill_mod.sell_fees(one_lot, f)["fee"]
+    return {"commission": f.commission, "min_commission": f.min_commission,
+            "stamp_tax": f.stamp_tax, "transfer_fee": f.transfer_fee,
+            "round_trip_hint": round(rt, 2),
+            "round_trip_pct": round(rt / one_lot, 5)}
+
+
+def _sync_real_equity():
+    """实盘净值快照：盘中每小时记一个实时点，收盘后对齐最新交易日（与手动盘同口径）。
+
+    只写 real_account.db。
+    """
+    try:
+        hist = REAL_BROKER.equity_history()
+        held = [p.symbol for p in REAL_BROKER.query_positions()]
+        if _in_trading_hours("real"):
+            hour_key = datetime.now().strftime("%Y-%m-%d %H")
+            if hist and str(hist[-1]["date"]).startswith(hour_key):
+                return
+            REAL_BROKER.snapshot_equity(datetime.now().strftime("%Y-%m-%d %H:00"),
+                                        _real_prices(held))
+            return
+        latest = _signal_date()
+        if hist and str(hist[-1]["date"]) >= latest:
+            return
+        REAL_BROKER.snapshot_equity(latest, _real_prices(held))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[real] 净值快照失败: %s", exc)
+
+
+def _real_account_payload() -> dict:
+    prices = _real_prices([p.symbol for p in REAL_BROKER.query_positions()])
+    _sync_real_equity()
+    summ = REAL_BROKER.live_summary(prices, trading_today=_today_is_trading(),
+                                    session_started=_session_started())
+    n = len(REAL_BROKER.query_positions())
+    return {**summ, "position_count": n,
+            "max_positions": int(_REAL_CFG.get("max_positions", 2) or 2),
+            "slots": max(int(_REAL_CFG.get("max_positions", 2) or 2) - n, 0),
+            "fees": _real_fees_info(),
+            "market": _market_status_now(),
+            "session": _real_session()}
+
+
+def _real_session() -> str:
+    if _in_trading_hours("real"):
+        return "open"
+    now = datetime.now()
+    if _today_is_trading() and (now.hour * 100 + now.minute) < 930:
+        return "pre"
+    return "closed"
+
+
+def _real_advice_payload() -> dict:
+    """实盘建议：候选来自每日选股（同组合调仓），尺寸/仓位按 real 段。"""
+    fcfg = _real_fill_cfg()
+    session = _real_session()
+    if (_REAL_CFG.get("advice", {}) or {}).get("use_selection", True):
+        rows = [r for r in _selection_rows() if r.get("code")]
+    else:
+        rows = []
+    positions = REAL_BROKER.query_positions()
+    syms = [str(r.get("code")) for r in rows] + [p.symbol for p in positions]
+    quotes = _real_quotes(syms)
+    prices = _real_prices(syms)
+    prev = _prev_closes(syms)
+    for s, q in quotes.items():                      # 实时前收优先
+        pc = _fnum(q.get("prev_close"))
+        if pc > 0:
+            prev[s] = pc
+    guards = {}
+    for r in rows:
+        s = str(r.get("code"))
+        px = _fnum(prices.get(s))
+        if px > 0:
+            guards[s] = _guard_check(s, px, prev)
+    _risk, lines, sell_rules = _real_risk_and_sells(prices)
+    # 建议口径：可行性按「盘口/当日区间」判，不因收市把所有票一票否决（否则盘后打开
+    # 全是"不可下单"）。是否现在能下单由外层 session + 顶部横幅说明。
+    inp = AdviceInput(
+        rows=rows, cash=REAL_BROKER.query_cash(),
+        positions=[{"symbol": p.symbol, "shares": p.shares, "avg_cost": p.avg_cost,
+                    "sellable": REAL_BROKER.sellable_shares(p.symbol, _signal_date())}
+                   for p in positions],
+        prices=prices, prev_closes=prev, quotes=quotes,
+        risk_lines=lines, guards=guards, blocked=_risk_sold_today(tag="real"),
+        sell_rules=sell_rules, session="open",
+        market_weak=_market_weakness(), cfg=_REAL_CFG, fill_cfg=fcfg)
+    plan = plan_real_portfolio(inp)
+    if session != "open":
+        plan["notes"].insert(0, (
+            "⏸ 当前非交易时段（休市/盘后）——以下为**下一交易日计划**，"
+            "需在 9:30-11:30 / 13:00-15:00 才能委托；价格与判定以最新行情为准。"))
+    for row in plan.get("buy", []) + plan.get("backup", []) + plan.get("pending", []):
+        row.setdefault("name", _display_name(row.get("symbol")))
+    for row in plan.get("sell", []):
+        row["name"] = _display_name(row["symbol"])
+    plan["positions"] = _real_positions_payload(prices, lines)
+    plan["account"] = _real_account_payload()
+    plan["market"] = {**_market_status_now(), "weak": bool(_market_weakness().get("weak"))}
+    plan["session"] = session
+    plan["date"] = _signal_date()
+    plan["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    plan["fees"] = _real_fees_info()
+    plan["trading_hours"] = _in_trading_hours("real")
+    return plan
+
+
+@app.get("/api/real/account")
+def real_account():
+    """实盘账户（¥3000）：资金 / 持仓数 / 仓位上限 / 费用口径 / 市场状态。"""
+    return _real_account_payload()
+
+
+@app.get("/api/real/positions")
+def real_positions():
+    """实盘持仓：含可卖(T+1)、止损止盈线、含费回本价。"""
+    prices = _real_prices([p.symbol for p in REAL_BROKER.query_positions()])
+    _risk, lines, _rules = _real_risk_and_sells(prices)
+    _sync_real_equity()
+    return {"positions": _real_positions_payload(prices, lines),
+            "fees": _real_fees_info()}
+
+
+@app.get("/api/real/trades")
+def real_trades(limit: int = 50):
+    """实盘已成交流水（带 id，供误录删除）。"""
+    return {"trades": REAL_BROKER.trade_history_with_id(min(max(limit, 1), 500))}
+
+
+@app.get("/api/real/orders")
+def real_orders(limit: int = 50):
+    """订单留痕：含**未成交/放弃**（对照建议价与当时的成交判定）。"""
+    return {"orders": REAL_BROKER.orders(min(max(limit, 1), 500))}
+
+
+@app.get("/api/real/equity")
+def real_equity():
+    return {"equity_curve": REAL_BROKER.equity_history()}
+
+
+@app.get("/api/real/advice")
+def real_advice():
+    """实盘建议（核心）：可买价格带 + 买入建议 + 卖出/止损提醒，每条都带成交可行性判定。"""
+    return _real_advice_payload()
+
+
+@app.get("/api/real/check")
+def real_check(symbol: str, side: str, shares: float = 100, price: float | None = None):
+    """「这单能成交吗」试算（买入/卖出共用一个判定引擎）。"""
+    if side not in ("buy", "sell"):
+        raise HTTPException(400, "side 必须是 buy 或 sell")
+    fcfg = _real_fill_cfg()
+    q = _real_quotes([symbol]).get(symbol)
+    pc = _fnum((q or {}).get("prev_close")) or _prev_closes([symbol]).get(symbol)
+    pos = next((p for p in REAL_BROKER.query_positions() if p.symbol == symbol), None)
+    held = pos.shares if pos else 0.0
+    sellable = REAL_BROKER.sellable_shares(symbol, _signal_date()) if pos else 0.0
+    ref = price if (price and price > 0) else None
+    cost = pos.avg_cost if pos else None
+    if side == "buy":
+        a = fill_mod.assess_buy(symbol, quote=q, cfg=fcfg, cash=REAL_BROKER.query_cash(),
+                                shares=shares, prev_close=pc, reference=ref or pc,
+                                session=_real_session())
+    else:
+        a = fill_mod.assess_sell(symbol, quote=q, cfg=fcfg, shares=shares, held=held,
+                                 sellable=sellable, prev_close=pc, reference=ref or pc,
+                                 session=_real_session(), cost=cost)
+    return {"symbol": symbol, "side": side, "quote": q,
+            "limits": {"limit_up": a.limit_up, "limit_down": a.limit_down},
+            "fill": a.to_dict(), "fees": _real_fees_info()}
+
+
+class RealOrderRequest(BaseModel):
+    symbol: str
+    side: str                                # buy / sell
+    shares: float = 0
+    price: float | None = None               # 实际成交价
+    fee: float | None = None                 # 券商实际手续费（不填 = 按配置估算）
+    date: str | None = None                  # 成交日期（默认最新信号日）
+    filled: bool = True                      # False = 没成交/放弃 → 只留痕不动账
+    reason: str = ""                         # 未成交原因
+    advice_price: float | None = None        # 当时的建议委托价
+    advice_status: str | None = None         # 当时的成交判定
+    remark: str = ""
+    force: bool = False                      # 价格越涨跌停/日期过旧时需显式确认
+
+
+@app.post("/api/real/order")
+def real_order(order: RealOrderRequest):
+    """记账：把**人工在券商的实际成交**录进来（不成交也算留痕）。
+
+    记账本身不受交易时段限制（成交回报常在盘后）；越界价/过期日期需 force。
+    """
+    if order.side not in ("buy", "sell"):
+        raise HTTPException(400, "side 必须是 buy 或 sell")
+    date = (order.date or "").strip() or _signal_date()
+    _d = datetime.strptime(date, "%Y-%m-%d")                 # 格式校验
+    max_sh = int(_REAL_CFG.get("max_order_shares", 2000) or 0)
+
+    # —— 未成交/放弃：只留痕，不动资金 ——
+    if not order.filled:
+        oid = REAL_BROKER.log_order(order.symbol, order.side, order.shares,
+                                    _fnum(order.price), date, status="unfilled",
+                                    reason=order.reason or "未成交",
+                                    advice_price=order.advice_price,
+                                    advice_status=order.advice_status,
+                                    remark=order.remark)
+        return {"ok": True, "filled": False, "order_id": oid,
+                "message": "已留痕（未成交），资金/持仓未变"}
+
+    if order.shares <= 0:
+        raise HTTPException(400, "成交股数必须为正")
+    if max_sh and order.shares > max_sh:
+        raise HTTPException(400, f"单笔最多 {max_sh} 股（风控）")
+    if not _valid_price(order.price):
+        raise HTTPException(400, f"成交价无效（{order.price!r}）")
+    price = float(order.price)
+    # 越界价（超出涨跌停）防护：手滑多打一位数时兜底
+    pc = _prev_closes([order.symbol]).get(order.symbol)
+    q = _real_quotes([order.symbol]).get(order.symbol)
+    pc = _fnum((q or {}).get("prev_close")) or pc
+    if pc and not order.force:
+        up, down = fill_mod.limit_band(pc, order.symbol)
+        if up and (price > up + 1e-6 or price < down - 1e-6):
+            raise HTTPException(400, (
+                f"成交价 {price:.2f} 超出今日涨跌停区间 [{down:.2f}, {up:.2f}]；"
+                "若确系成交请勾选强制"))
+    # 过期日期防护（防补录打错年份）
+    if not order.force:
+        try:
+            delta = abs((datetime.now().date() - _d.date()).days)
+            if delta > 7:
+                raise HTTPException(400, f"成交日期 {date} 距今 {delta} 天，疑似误录；"
+                                         "若确需补录请勾选强制")
+        except ValueError:
+            raise HTTPException(400, f"成交日期格式应为 YYYY-MM-DD，收到 {date}")
+
+    r = REAL_BROKER.record_execution(order.symbol, order.side, order.shares, price,
+                                     date, fee=order.fee, remark=order.remark,
+                                     advice_price=order.advice_price,
+                                     advice_status=order.advice_status)
+    if not r.success:
+        raise HTTPException(400, r.message)
+    _sync_real_equity()
+    warnings = []
+    if order.advice_status and order.advice_status in ("hard", "missed", "blocked"):
+        warnings.append(f"当时的成交判定为「{order.advice_status}」但实际成交了 —— "
+                        "判定偏保守，已记录用于校准")
+    return {"ok": True, "filled": True, "warnings": warnings,
+            "trade": {"date": date, "symbol": order.symbol, "side": order.side,
+                      "shares": r.shares, "price": round(r.price, 3),
+                      "fee": round(r.fee, 2), "amount": round(r.amount, 2)},
+            "account": _real_account_payload()}
+
+
+@app.post("/api/real/order/{order_id}/void")
+def real_order_void(order_id: int):
+    """作废一条订单留痕（不影响资金/持仓）。"""
+    if not REAL_BROKER.void_order(order_id):
+        raise HTTPException(404, f"订单留痕 {order_id} 不存在")
+    return {"ok": True, "order_id": order_id}
+
+
+@app.delete("/api/real/trade/{trade_id}")
+def real_trade_delete(trade_id: int):
+    """删除一条错误流水，并按现存流水**全量重建** cash/持仓（自洽）。"""
+    if not REAL_BROKER.delete_trade(trade_id):
+        raise HTTPException(404, f"流水 {trade_id} 不存在")
+    rebuilt = REAL_BROKER.rebuild_from_trades()
+    return {"ok": True, "removed": trade_id, "rebuilt": rebuilt}
 
 
 if __name__ == "__main__":

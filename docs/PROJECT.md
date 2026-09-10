@@ -186,6 +186,8 @@ python tests/test_cross_model.py          # 任一测试文件；全量见第 8 
 | `GET /api/selection` · `POST /api/selection/run` | 查看 / 触发每日选股 |
 | `GET /api/portfolio` · `POST /api/portfolio/apply` | 组合目标 / 一键调仓（候选来自选股 topN） |
 | `GET /api/manual/account` · `POST /api/manual/order` | 手动模拟盘账户 / 下单 |
+| `GET /api/real/account` · `/positions` · `/trades` · `/orders` · `/equity` | 实盘（¥3000）账户 / 持仓(T+1) / 流水 / 未成交留痕 / 净值 |
+| `GET /api/real/advice` · `/check` · `POST /api/real/order` · `DELETE /api/real/trade/{id}` | 实盘建议 / 成交试算 / **人工成交回报记账** / 删误录重建（程序绝不下单） |
 | `GET /api/minute/{symbol}` / `api/realtime` / `api/market/indices*` | 分钟信号 / 实时行情 / 大盘指数 |
 | `GET /api/backtest/{symbol}` | 单股历史回测 |
 

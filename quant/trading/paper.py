@@ -67,12 +67,17 @@ class PaperBroker(Broker):
 
     def __init__(self, db_path: str | Path, initial_capital: float = 100_000.0,
                  commission: float = 0.0003, slippage: float = 0.0002,
-                 stamp_tax: float = 0.0005, lot_size: int = 1):
+                 stamp_tax: float = 0.0005, lot_size: int = 1,
+                 min_commission: float = 0.0, transfer_fee: float = 0.0):
         self.db_path = Path(db_path)
         self.commission = commission
         self.slippage = slippage
         self.stamp_tax = stamp_tax      # 印花税（卖出单边，A股 0.05%）
         self.lot_size = lot_size        # 整手限制：>1 时买入必须是其整数倍（A股 100 股）
+        # 最低佣金/过户费：默认 0 → 与旧行为完全一致（既有账户/回测逐字节不变）；
+        # 实盘账户用真实口径（单笔最低 ¥5、过户费 0.001%）。
+        self.min_commission = float(min_commission or 0.0)
+        self.transfer_fee = float(transfer_fee or 0.0)
         self._initial_capital = initial_capital
         self._init_schema()
         self._ensure_initialized(initial_capital)
@@ -107,6 +112,39 @@ class PaperBroker(Broker):
                     (initial_capital,))
                 logger.info("纸面账户初始化完成，初始资金 %.2f", initial_capital)
 
+    # ---------- 费用 ----------
+    def _buy_fee(self, amount: float) -> float:
+        """买入费用 = 佣金（≥最低佣金）+ 过户费。min_commission=0 时与旧公式一致。"""
+        try:
+            amt = float(amount)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(amt) or amt <= 0:
+            return 0.0
+        return max(amt * self.commission, self.min_commission) + amt * self.transfer_fee
+
+    def _sell_fee(self, proceeds: float) -> float:
+        """卖出费用 = 佣金（≥最低佣金）+ 印花税（单边）+ 过户费。"""
+        try:
+            p = float(proceeds)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(p) or p <= 0:
+            return 0.0
+        return (max(p * self.commission, self.min_commission)
+                + p * self.stamp_tax + p * self.transfer_fee)
+
+    @staticmethod
+    def _resolve_fee(override, computed: float) -> float:
+        """实盘按券商回报的**实际手续费**记账；未给/非法则退回配置估算值。"""
+        if override is None:
+            return computed
+        try:
+            f = float(override)
+        except (TypeError, ValueError):
+            return computed
+        return f if math.isfinite(f) and f >= 0 else computed
+
     # ---------- Broker 接口实现 ----------
     def query_cash(self) -> float:
         with self._connect() as conn:
@@ -122,7 +160,7 @@ class PaperBroker(Broker):
         return [Position(symbol=r[0], shares=float(r[1]), avg_cost=float(r[2])) for r in rows]
 
     def buy(self, symbol: str, shares: float, price: float, date: str,
-            remark: str = "") -> TradeResult:
+            remark: str = "", fee_override: float | None = None) -> TradeResult:
         if shares is None or not math.isfinite(float(shares)) or shares <= 0:
             return TradeResult(symbol, "buy", 0, price, 0, 0, False, "买入数量必须为正")
         if not _valid_price(price):
@@ -134,7 +172,7 @@ class PaperBroker(Broker):
                                f"买入必须为 {self.lot_size} 股整数倍（A股整手）")
         buy_price = price * (1 + self.slippage)      # 滑点抬高买价
         amount = shares * buy_price
-        fee = amount * self.commission
+        fee = self._resolve_fee(fee_override, self._buy_fee(amount))
         total_cost = amount + fee
 
         cash = self.query_cash()
@@ -170,7 +208,7 @@ class PaperBroker(Broker):
         return TradeResult(symbol, "buy", shares, buy_price, fee, total_cost)
 
     def sell(self, symbol: str, shares: float, price: float, date: str,
-             remark: str = "") -> TradeResult:
+             remark: str = "", fee_override: float | None = None) -> TradeResult:
         if shares is None or not math.isfinite(float(shares)) or shares <= 0:
             return TradeResult(symbol, "sell", 0, price, 0, 0, False, "卖出数量必须为正")
         if not _valid_price(price):
@@ -191,7 +229,8 @@ class PaperBroker(Broker):
                                    f"T+1：今日已买入 {today_buy:.0f} 股，当日不能卖出")
         sell_price = price * (1 - self.slippage)     # 滑点压低卖价
         proceeds = shares * sell_price
-        fee = proceeds * (self.commission + self.stamp_tax)   # 佣金 + 印花税（卖出单边）
+        # 佣金(≥最低佣金) + 印花税(单边) + 过户费
+        fee = self._resolve_fee(fee_override, self._sell_fee(proceeds))
         net = proceeds - fee
 
         with self._connect() as conn:
