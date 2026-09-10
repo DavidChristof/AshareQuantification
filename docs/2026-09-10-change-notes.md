@@ -59,3 +59,25 @@ Start-Process -FilePath '.venv\Scripts\python.exe' `
 
 > 注：本次未改任何策略/参数；纯属健壮性修复。新 600 池收盘自动流水线（`auto_refresh.shadow_ab`，
 > 15:45）随本次重启一并生效（见 `docs/2026-09-09-change-notes.md`）。
+
+---
+
+## 二、收盘自动流水线首日（09-10 15:45）未跑成：两个原因 + 修复
+
+### 原因 1：`_shadow_ab_pipeline` 组装子进程参数写错（本仓库 bug，已修）
+`argv += [args_tpl.format(...).split()]` —— 多套了一层 `[]`，把 list 塞进 list，
+`subprocess.run` 抛 `TypeError: expected str, bytes or os.PathLike object, not list`；
+异常被 worker 外层 except 吞掉 → 无 marker、无 26/27/28。
+- 修：`argv += args_tpl.format(...).split()`。
+- 同时把「启动失败/超时/worker 异常」写进 `logs/shadow_ab_<日期>.log`
+  （服务 stdout 不含 api 模块 logger，否则故障只在内存里看不到）。
+
+### 原因 2：内存不足 → py_mini_racer(V8) FATAL
+akshare 新浪日线每 worker 起一个 V8 上下文。09-10 收盘时机器可用内存仅 **854MB/16GB**
+（同时开着游戏 DeltaForce + NVIDIA Overlay + QQ + VSCode）：
+- `scripts/26 --workers 4` **秒崩**（V8 partition_address_space FATAL）；
+- `--workers 1` 可正常跑完。
+- 修：`auto_refresh.shadow_ab.workers` 4 → **2**；仍建议收盘时段别开大内存程序。
+
+> 教训：自动流水线要能「静默失败可诊断」——本次两者都踩了（异常被吞 + 参数 bug）。
+> 现在任何失败都会在 `logs/shadow_ab_<日期>.log` 留痕。

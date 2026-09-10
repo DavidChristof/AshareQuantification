@@ -152,7 +152,10 @@ auto_refresh:
     enabled: true
     run_time: '15:45'     # 触发时刻（15:00 收盘 → 15:30 40池刷新 → 15:45 自动跑）
     grace_min: 120        # 触发点过后仍允许补跑（服务开晚了也在当天内补）；超过则当日跳过
-    workers: 4            # scripts/26 的大池拉取并发（服务在跑时别用 8，防内存不够）
+    # scripts/26 的大池拉取并发。akshare 新浪日线每 worker 起一个 py_mini_racer(V8) 上下文，
+    # 内存占用高：服务在跑(约1GB)再叠加并发易触发 V8 FATAL(partition_address_space) 崩溃
+    # （2026-09-10 实测：可用内存仅 854MB 时 workers=4 秒崩、=1 正常）。故自动流水线取 2。
+    workers: 2
     recent: 700           # scripts/27 每只取最近 N 交易日打分（控耗时）
 selection:
   auto: true        # 每日选股：收盘后随自动刷新运行（寻找大盘优质股）

@@ -358,7 +358,7 @@ def _shadow_ab_pipeline(sab: dict) -> None:
         for name, args_tpl in _SHADOW_STEPS:
             argv = [sys.executable, "-u", str(repo / "scripts" / name)]
             if args_tpl:
-                argv += [args_tpl.format(workers=workers, recent=recent).split()]
+                argv += args_tpl.format(workers=workers, recent=recent).split()
             fh.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {name} =====\n")
             fh.flush()
             logger.info("[shadow] 启动 %s ...", name)
@@ -369,6 +369,12 @@ def _shadow_ab_pipeline(sab: dict) -> None:
             except subprocess.TimeoutExpired:
                 logger.error("[shadow] %s 超时(>1h)，中止本日流水线", name)
                 fh.write("[超时>1h]\n")
+                break
+            except Exception as exc:  # noqa: BLE001
+                # 例如 argv 组装错误：写进 shadow 日志（服务 stdout 未必含 api 模块日志）
+                logger.error("[shadow] %s 启动失败: %s", name, exc)
+                fh.write(f"[启动失败] {name}: {exc!r}\n")
+                fh.flush()
                 break
             out = (r.stdout or "") + (r.stderr or "")
             fh.write(out + "\n")
@@ -429,6 +435,14 @@ def _shadow_ab_worker():
             return
     except Exception as exc:  # noqa: BLE001
         logger.error("[shadow] worker 异常退出: %s", exc, exc_info=True)
+        # 落盘留痕：服务 stdout 未必包含 api 模块的 logger，故障要能在 shadow 日志里看到
+        try:
+            import traceback
+            with (cfg.resolve("logs") / f"shadow_ab_{datetime.now():%Y-%m-%d}.log").open(
+                    "a", encoding="utf-8") as fh:
+                fh.write(f"\n[worker 异常] {exc!r}\n{traceback.format_exc()}\n")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # 启动「收盘后自动维护 600 池」线程（daemon；配置关 / 非交易日 / 错过窗口则当日不跑）
