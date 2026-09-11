@@ -153,6 +153,20 @@ def test_plan_does_not_mutate_input():
     assert (inp.rows, inp.prices, inp.positions, inp.cash) == snapshot
 
 
+def test_shipped_config_gate_filters_inefficient_orders():
+    """仓库 config 的 max_breakeven_pct（2026-09-11 由 1.5 收紧到 1.2）：
+    ¥9.9 一手（名义 ¥990，费用≈1.06%）可过；¥7 一手（名义 ¥700，费用≈1.45%）被费用闸门滤掉。
+    """
+    from quant.config import load_config
+    from quant.trading.fill import breakeven_pct
+    cfg = load_config()["real"]
+    fcfg = FillConfig.from_config(cfg)
+    cap = float(cfg["max_breakeven_pct"])
+    assert cap == 1.2
+    assert breakeven_pct(9.9, 100, fcfg) * 100 <= cap
+    assert breakeven_pct(7.0, 100, fcfg) * 100 > cap
+
+
 def test_plan_has_no_broker_parameter():
     """安全断言：本模块不接收账本对象 → 结构上不可能下单。"""
     import inspect
