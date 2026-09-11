@@ -60,6 +60,7 @@ from quant.trading.real_advice import AdviceInput, plan_real_portfolio  # noqa: 
 from quant.risk.calendar import (                                      # noqa: E402
     is_ashare_trading_day, parse_dates, upcoming_closure_run,
 )
+from quant.risk import drawdown as drawdown_mod                        # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -1553,7 +1554,8 @@ def _market_weakness() -> dict:
 
 def _portfolio_allocation(targets: list, target_set: set, held: set,
                           prices: dict, market_weak: dict | None = None,
-                          prev_close: dict | None = None) -> list[dict]:
+                          prev_close: dict | None = None,
+                          brake: dict | None = None) -> list[dict]:
     """基于现有资金 + 风控决策：等权目标、个股上限、大盘弱势降仓、分钟否决、A股整手。
 
     规则（对应复盘改进 + 2026-09-04 修复 + 追高/接飞刀保护）：
@@ -1591,6 +1593,11 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
     pre_h = _pre_holiday_info()
     if pre_h.get("active"):
         pos_pct = min(pos_pct, pre_h["reduce_to_pct"])   # 长假前降仓（取更严）
+    # 账户回撤熔断：触发期间总仓位上限降到 brake.position_pct（看"自己亏多少"）
+    brake = brake or {}
+    risk_off = bool(brake.get("tripped"))
+    if risk_off:
+        pos_pct = min(pos_pct, float(brake.get("position_pct", 0.5)))
     budget = total_assets * pos_pct
     n = max(len(targets), 1)
     per = budget / n
@@ -1632,8 +1639,18 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
             row["target_value"] = round(slot_eff, 2)
 
         if cur_sh > 0:
-            # ---- 已持有：达目标整手→持有；低于目标且能整手补→add；否则持有 ----
+            # ---- 已持有：达目标整手→持有（弱势/熔断时**主动减持到目标**）；不足且能整手补→add ----
             if cur_sh >= target_sh:
+                excess = float(int((cur_sh - target_sh) // lot) * lot)
+                trim_on = bool(pr.get("weak_trim", True)) and (weak or risk_off) and excess >= lot
+                if trim_on:
+                    why = "账户回撤熔断" if risk_off else "大盘弱势"
+                    out.append({**row, "action": "trim",
+                                "reason": f"{why}：减持至目标整手 {target_sh} 股"
+                                          f"（原持有 {cur_sh:.0f} 股）",
+                                "est_shares": excess,
+                                "est_amount": round(excess * price, 2)})
+                    continue
                 out.append({**row, "action": "hold",
                             "reason": f"已持有 {cur_sh:.0f} 股，已达目标整手 {target_sh} 股，持有",
                             "est_shares": 0, "est_amount": 0.0})
@@ -1660,6 +1677,11 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
             continue
 
         # ---- 未持有：能整手起配就买（slot<1手时按 1 手起配）；否则明确原因 ----
+        if risk_off and brake.get("block_new_buys", True):
+            out.append({**row, "action": "skip",
+                        "reason": f"账户回撤熔断：暂停开新仓（{brake.get('reason', '')}）",
+                        "est_shares": 0, "est_amount": 0.0})
+            continue
         if target_sh < lot:
             out.append({**row, "action": "skip",
                         "reason": (f"现价 {price:.2f}，1 手约 {one_lot_cost:.0f} 元，"
@@ -1696,8 +1718,9 @@ def portfolio():
         {p.symbol for p in MANUAL_BROKER.query_positions()}
     prev_close = _prev_closes(syms)
     prices = _build_prices(syms)
+    brake = _drawdown_state(MANUAL_BROKER)
     allocation = _portfolio_allocation(targets, target_set, held, prices, market_weak,
-                                       prev_close=prev_close)
+                                       prev_close=prev_close, brake=brake)
 
     # 买卖动作与资金决策对齐：只列 allocation 里真正能整手成交的买卖（避免"建议买茅台却买不起"）
     tgt_prob = {t["symbol"]: t["prob"] for t in targets}
@@ -1745,6 +1768,7 @@ def portfolio():
         "regime": {"regime": regime.get("regime") if regime else None,
                    "text": regime.get("text") if regime else None},
         "trading_hours": _in_trading_hours(),
+        "drawdown_brake": brake,
     }
 
 
@@ -1823,9 +1847,25 @@ def portfolio_apply(force_open_ref: bool = False):
                                  "side": "sell", "error": r.message})
 
     # 2. 基于现有资金 + 风控决策买入/加仓（大盘弱势降仓 + 分钟否决 + 个股上限 + 追高拦截）
+    brake = _drawdown_state(MANUAL_BROKER)
     allocation = _portfolio_allocation(targets, target_set, held, prices, market_weak,
-                                       prev_close=prev_close)
+                                       prev_close=prev_close, brake=brake)
     for a in allocation:
+        if a["action"] == "trim":
+            # 弱势/熔断主动减仓：把超出目标整手的部分卖出
+            sh = a.get("est_shares") or 0
+            if sh >= 100 and a["symbol"] in prices:
+                r = MANUAL_BROKER.sell(a["symbol"], sh, prices[a["symbol"]], today,
+                                       remark=f"组合调仓·{a['reason']}")
+                if r.success:
+                    executed.append({"symbol": a["symbol"], "name": a["name"],
+                                     "side": "sell", "price": round(r.price, 2),
+                                     "shares": round(r.shares, 2)})
+                else:
+                    executed.append({"symbol": a["symbol"], "name": a["name"],
+                                     "side": "sell", "error": r.message})
+            risk_notes.append(f"⇩ {a['symbol']} {a['name']}：{a['reason']}")
+            continue
         if a["action"] == "skip":
             # 被风控暂停的买入也要透出到结果（前端可见"未买入+原因"，避免静默跳过）
             executed.append({"symbol": a["symbol"], "name": a["name"],
@@ -2001,6 +2041,49 @@ def _real_prices(symbols) -> dict[str, float]:
     return out
 
 
+def _drawdown_cfg() -> dict:
+    return (cfg.get("portfolio_risk", {}) or {}).get("drawdown_brake", {}) or {}
+
+
+def _drawdown_state(broker=None, tag: str = "") -> dict:
+    """账户回撤熔断状态（带滞回，状态持久化 logs/drawdown_brake[_tag].json）。
+
+    看的是**账户自己的净值回撤**（与"大盘今天弱"互补）：触发 → 降仓 + 停开新仓。
+    """
+    dc = _drawdown_cfg()
+    if not dc.get("enabled", False):
+        return {"enabled": False, "tripped": False, "dd_pct": 0.0,
+                "reason": "回撤熔断未启用"}
+    b = broker or MANUAL_BROKER
+    name = f"drawdown_brake_{tag}.json" if tag else "drawdown_brake.json"
+    marker = cfg.resolve("logs") / name
+    before = False
+    try:
+        if marker.exists():
+            before = bool(json.loads(marker.read_text(encoding="utf-8")).get("tripped"))
+    except Exception:  # noqa: BLE001
+        before = False
+    try:
+        hist = b.equity_history()
+    except Exception:  # noqa: BLE001
+        hist = []
+    st = drawdown_mod.evaluate(
+        hist, trip_pct=float(dc.get("trip_pct", 8.0)),
+        release_pct=float(dc.get("release_pct", 4.0)),
+        window_days=int(dc.get("window_days", 60) or 60), tripped_before=before)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(
+            {"date": datetime.now().strftime("%Y-%m-%d"), "tripped": st.tripped,
+             "dd_pct": round(st.dd_pct, 2)}, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    out = st.to_dict()
+    out.update({"enabled": True, "position_pct": float(dc.get("position_pct", 0.5)),
+                "block_new_buys": bool(dc.get("block_new_buys", True))})
+    return out
+
+
 def _real_fill_cfg() -> "fill_mod.FillConfig":
     return fill_mod.FillConfig.from_config(_REAL_CFG)
 
@@ -2170,6 +2253,8 @@ def _real_advice_payload() -> dict:
         px = _fnum(prices.get(s))
         if px > 0:
             guards[s] = _guard_check(s, px, prev)
+    # 账户回撤熔断（实盘自己的净值）
+    brake = _drawdown_state(REAL_BROKER, tag="real")
     # 入场择时（只改"何时下手"）：现价在 5 日均线上方 → 降级为"等回踩"
     entry: dict = {}
     if (_REAL_CFG.get("advice", {}) or {}).get("entry_gate", False):
@@ -2187,6 +2272,7 @@ def _real_advice_payload() -> dict:
                    for p in positions],
         prices=prices, prev_closes=prev, quotes=quotes,
         risk_lines=lines, guards=guards, entry_gate=entry,
+        risk_off=brake,
         blocked=_risk_sold_today(tag="real"),
         sell_rules=sell_rules, session="open",
         market_weak=_market_weakness(), cfg=_REAL_CFG, fill_cfg=fcfg)
@@ -2219,6 +2305,7 @@ def _real_advice_payload() -> dict:
         row["name"] = _display_name(row["symbol"])
     plan["positions"] = _real_positions_payload(prices, lines)
     plan["account"] = _real_account_payload()
+    plan["drawdown_brake"] = brake
     plan["market"] = {**_market_status_now(), "weak": bool(_market_weakness().get("weak"))}
     plan["session"] = session
     plan["date"] = _signal_date()

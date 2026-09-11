@@ -172,6 +172,21 @@ def test_entry_gate_downgrades_buy_to_wait():
     assert len(plain["buy"]) == 1
 
 
+def test_risk_off_blocks_new_buys_and_halves_budget():
+    """账户回撤熔断：暂停开新仓；且目标仓位上限下调（per_slot 减半）。"""
+    base = dict(rows=[_row("600160", 10.0)], cash=3000.0, prices={"600160": 10.0},
+                prev_closes={"600160": 10.0}, quotes={"600160": _q(10.0)},
+                cfg=REAL_CFG, fill_cfg=FC)
+    normal = plan_real_portfolio(AdviceInput(**base))
+    assert len(normal["buy"]) == 1
+    off = plan_real_portfolio(AdviceInput(**base, risk_off={
+        "tripped": True, "position_pct": 0.5, "block_new_buys": True,
+        "reason": "账户自近60日高点回撤 9.1% ≥ 8%"}))
+    assert off["buy"] == []
+    assert any("熔断" in s["reason"] for s in off["skipped"])
+    assert off["capacity"]["per_slot"] < normal["capacity"]["per_slot"]
+
+
 def test_shipped_config_gate_filters_inefficient_orders():
     """仓库 config 的 max_breakeven_pct（2026-09-11 由 1.5 收紧到 1.2）：
     ¥9.9 一手（名义 ¥990，费用≈1.06%）可过；¥7 一手（名义 ¥700，费用≈1.45%）被费用闸门滤掉。

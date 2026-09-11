@@ -40,6 +40,8 @@ class AdviceInput:
     guards: dict[str, tuple] = field(default_factory=dict)  # {symbol: (ok, reason)}
     # 入场择时：{symbol: {"ma5": float, "ok": bool}}；ok=False（现价在 5 日均线上方）→ 降级为"等回踩"
     entry_gate: dict = field(default_factory=dict)
+    # 账户回撤熔断/弱势减仓：{"tripped":bool,"position_pct":float,"block_new_buys":bool,"reason":str}
+    risk_off: dict = field(default_factory=dict)
     blocked: set = field(default_factory=set)               # 今日已建议止损卖出 → 不买回
     sell_rules: dict[str, str] = field(default_factory=dict)  # {symbol: 触发原因}
     session: str = "open"
@@ -49,11 +51,16 @@ class AdviceInput:
     fill_cfg: FillConfig = field(default_factory=FillConfig)
 
 
-def capacity_band(equity: float, cfg: Mapping, fill_cfg: FillConfig) -> dict:
-    """本账户「买得起的价格带」—— ¥3000 的硬约束，必须算给用户看。"""
+def capacity_band(equity: float, cfg: Mapping, fill_cfg: FillConfig,
+                  pos_pct_override: float | None = None) -> dict:
+    """本账户「买得起的价格带」—— ¥3000 的硬约束，必须算给用户看。
+
+    pos_pct_override: 回撤熔断等场景下传入下调后的总仓位上限（默认取配置值）。
+    """
     n = max(int(cfg.get("max_positions", 2) or 2), 1)
     lot = max(int(cfg.get("lot_size", 100) or 100), 1)
-    pos_pct = float(cfg.get("target_position_pct", 0.95) or 0.95)
+    pos_pct = float(pos_pct_override if pos_pct_override is not None
+                    else (cfg.get("target_position_pct", 0.95) or 0.95))
     cap_pct = float(cfg.get("max_stock_pct", 0.5) or 0.5)
     equity = max(_num(equity), 0.0)
     cap_value = equity * cap_pct
@@ -109,11 +116,16 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
         px = _num(inp.prices.get(sym)) or _num(p.get("avg_cost"))
         held_value += px * _num(p.get("shares"))
     equity = _num(inp.cash) + held_value
+    # 账户回撤熔断：触发期间总仓位上限下调（与组合层同口径）
+    risk_off = dict(inp.risk_off or {})
+    brake_on = bool(risk_off.get("tripped"))
+    if brake_on:
+        pos_pct = min(pos_pct, float(risk_off.get("position_pct", 0.5) or 0.5))
     cap_value = equity * cap_pct
     per_slot = min(equity * pos_pct / n, cap_value) if equity > 0 else 0.0
     slots = max(n - len(positions), 0)
 
-    capacity = capacity_band(equity, cfg, fcfg)
+    capacity = capacity_band(equity, cfg, fcfg, pos_pct_override=pos_pct)
     notes: list[str] = []
     skipped: list[dict] = []
     buy: list[dict] = []
@@ -139,6 +151,10 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
             continue
         if sym in inp.blocked:
             skipped.append({**base, "reason": "今日已建议止损卖出，不买回"})
+            continue
+        if brake_on and risk_off.get("block_new_buys", True):
+            skipped.append({**base, "reason": (
+                f"账户回撤熔断：暂停开新仓（{risk_off.get('reason', '')}）")})
             continue
 
         one = buy_fees(price * lot, fcfg)
@@ -247,7 +263,10 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
             skipped.append({**base, "reason": "；".join(a.reasons[:1]) or a.label})
 
     # ---- 空仓且两手都配不齐 → 放宽到单只（例外，注明）----
-    if not buy and not positions and slots > 0 and rows:
+    # ⚠️ 例外通道只放宽「单票上限」，**其余闸门一条都不能绕**（熔断/blocked/追高/入场择时/费用）。
+    #    历史上这里先后漏过 追高保护、入场择时，现补熔断 —— 新增闸门时务必同步此处。
+    brake_blocking = brake_on and risk_off.get("block_new_buys", True)
+    if not buy and not positions and slots > 0 and rows and not brake_blocking:
         single_pct = float(cfg.get("single_position_pct", 0.0) or 0.0)
         if single_pct > cap_pct:
             cap2 = equity * single_pct
