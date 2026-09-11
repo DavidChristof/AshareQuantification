@@ -2005,6 +2005,41 @@ def _real_fill_cfg() -> "fill_mod.FillConfig":
     return fill_mod.FillConfig.from_config(_REAL_CFG)
 
 
+def _real_ma5(symbols) -> dict:
+    """候选股的 5 日均线（入场择时用）：现价在 MA5 上方 → 不追、等回踩。
+
+    数据来源：market.db(40池) + large_pool.db(600池) 的最近日线收盘。
+    与回测口径一致：MA5 = 最近 5 个收盘的均值（若当日线已入库则含当日）。
+    """
+    syms = [s for s in dict.fromkeys(symbols or []) if s]
+    if not syms:
+        return {}
+    closes: dict[str, list] = {}
+    for db, tbl in (("data/market.db", "daily_bars"), ("data/large_pool.db", "large_daily")):
+        try:
+            con = sqlite3.connect(f"file:{cfg.resolve(db)}?mode=ro", uri=True)
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            q = ("SELECT symbol, close FROM " + tbl + " WHERE symbol IN (%s) "
+                 "ORDER BY symbol, date DESC" % ",".join("?" * len(syms)))
+            rows = con.execute(q, syms).fetchall()
+        except Exception:  # noqa: BLE001
+            rows = []
+        finally:
+            con.close()
+        for sym, cl in rows:
+            lst = closes.setdefault(sym, [])
+            if sym not in ("", None) and len(lst) < 5 and cl is not None:
+                lst.append(float(cl))
+    out = {}
+    for sym in syms:
+        cs = closes.get(sym) or []
+        if len(cs) >= 5:
+            out[sym] = sum(cs[:5]) / 5.0
+    return out
+
+
 def _real_risk_params() -> dict:
     """实盘风控：全局 risk 段 + real.advice 覆盖（止损/止盈/移动止损可单独设）。"""
     risk = dict(cfg.get("risk", {}) or {})
@@ -2135,6 +2170,13 @@ def _real_advice_payload() -> dict:
         px = _fnum(prices.get(s))
         if px > 0:
             guards[s] = _guard_check(s, px, prev)
+    # 入场择时（只改"何时下手"）：现价在 5 日均线上方 → 降级为"等回踩"
+    entry: dict = {}
+    if (_REAL_CFG.get("advice", {}) or {}).get("entry_gate", False):
+        for s, m in _real_ma5(syms).items():
+            px = _fnum(prices.get(s))
+            if px > 0 and m > 0:
+                entry[s] = {"ma5": round(m, 3), "ok": px <= m}
     _risk, lines, sell_rules = _real_risk_and_sells(prices)
     # 建议口径：可行性按「盘口/当日区间」判，不因收市把所有票一票否决（否则盘后打开
     # 全是"不可下单"）。是否现在能下单由外层 session + 顶部横幅说明。
@@ -2144,7 +2186,8 @@ def _real_advice_payload() -> dict:
                     "sellable": REAL_BROKER.sellable_shares(p.symbol, _signal_date())}
                    for p in positions],
         prices=prices, prev_closes=prev, quotes=quotes,
-        risk_lines=lines, guards=guards, blocked=_risk_sold_today(tag="real"),
+        risk_lines=lines, guards=guards, entry_gate=entry,
+        blocked=_risk_sold_today(tag="real"),
         sell_rules=sell_rules, session="open",
         market_weak=_market_weakness(), cfg=_REAL_CFG, fill_cfg=fcfg)
     plan = plan_real_portfolio(inp)

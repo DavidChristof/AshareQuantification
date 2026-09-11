@@ -38,6 +38,8 @@ class AdviceInput:
     quotes: dict[str, dict] = field(default_factory=dict)
     risk_lines: dict[str, dict] = field(default_factory=dict)
     guards: dict[str, tuple] = field(default_factory=dict)  # {symbol: (ok, reason)}
+    # 入场择时：{symbol: {"ma5": float, "ok": bool}}；ok=False（现价在 5 日均线上方）→ 降级为"等回踩"
+    entry_gate: dict = field(default_factory=dict)
     blocked: set = field(default_factory=set)               # 今日已建议止损卖出 → 不买回
     sell_rules: dict[str, str] = field(default_factory=dict)  # {symbol: 触发原因}
     session: str = "open"
@@ -216,6 +218,16 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
             "in_universe": bool(r.get("in_universe", False)),
         }
         if a.status in OK_STATUSES:
+            gate = inp.entry_gate.get(sym) or {}
+            if gate and gate.get("ok") is False:
+                # 入场择时：现价在 5 日均线上方 → 不追，降级为"等回踩"（不改选谁，只改何时下手）
+                ma5 = _num(gate.get("ma5"))
+                row["action"] = "wait"
+                row["trigger_price"] = round(ma5, 3) if ma5 > 0 else None
+                row["reason"] = (f"未回踩：现价在 5 日均线 ¥{ma5:.2f} 上方 → 不追高，"
+                                 f"等回到 ¥{ma5:.2f} 下方再买（实证：回踩入场 5 日收益更优）")
+                pending.append(row)
+                continue
             row["action"] = "buy"
             row["reason"] = "按建议委托价下单（人工）"
             if as_backup:
@@ -244,8 +256,10 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
                 price = _num(inp.prices.get(sym)) or _num(r.get("price"))
                 if price <= 0 or sym in inp.blocked:
                     continue
-                # 例外通道同样必须过闸门与费用关，否则等于绕过追高保护/经济性筛选
+                # 例外通道同样必须过闸门与费用关，否则等于绕过追高保护/经济性筛选/入场择时
                 if not inp.guards.get(sym, (True, ""))[0]:
+                    continue
+                if (inp.entry_gate.get(sym) or {}).get("ok") is False:
                     continue
                 if price * lot < float(cfg.get("min_order_amount", 0.0) or 0.0):
                     continue

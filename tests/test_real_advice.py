@@ -153,6 +153,25 @@ def test_plan_does_not_mutate_input():
     assert (inp.rows, inp.prices, inp.positions, inp.cash) == snapshot
 
 
+def test_entry_gate_downgrades_buy_to_wait():
+    """入场择时：现价在 5 日均线上方 → 不买，降级为「等回踩」并给出触发价（不改选谁）。"""
+    base = dict(rows=[_row("600160", 10.0)], cash=3000.0, prices={"600160": 10.0},
+                prev_closes={"600160": 10.0}, quotes={"600160": _q(10.0)},
+                cfg=REAL_CFG, fill_cfg=FC)
+    # 闸门放行（现价 ≤ MA5）→ 正常买入
+    ok = plan_real_portfolio(AdviceInput(**base, entry_gate={"600160": {"ma5": 10.2, "ok": True}}))
+    assert len(ok["buy"]) == 1 and ok["buy"][0]["action"] == "buy"
+    # 闸门不放行（现价 > MA5）→ 降级为等回踩，触发价 = MA5
+    wait = plan_real_portfolio(AdviceInput(**base, entry_gate={"600160": {"ma5": 9.7, "ok": False}}))
+    assert wait["buy"] == [] and len(wait["pending"]) == 1
+    row = wait["pending"][0]
+    assert row["action"] == "wait" and row["trigger_price"] == 9.7
+    assert "回踩" in row["reason"]
+    # 不给闸门数据 → 不干预（向后兼容）
+    plain = plan_real_portfolio(AdviceInput(**base))
+    assert len(plain["buy"]) == 1
+
+
 def test_shipped_config_gate_filters_inefficient_orders():
     """仓库 config 的 max_breakeven_pct（2026-09-11 由 1.5 收紧到 1.2）：
     ¥9.9 一手（名义 ¥990，费用≈1.06%）可过；¥7 一手（名义 ¥700，费用≈1.45%）被费用闸门滤掉。
