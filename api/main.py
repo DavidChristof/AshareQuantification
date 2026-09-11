@@ -22,6 +22,7 @@ import os
 import sys
 import json
 import logging
+import sqlite3
 import subprocess
 import threading
 import time
@@ -409,6 +410,25 @@ def _shadow_ab_pipeline(sab: dict) -> None:
                                    name, r.returncode)
 
 
+def _shadow_data_current(day) -> bool:
+    """大池库是否已推进到 day —— 判断行情源的「当日日线」是否已发布。
+
+    实测（2026-09-11）：15:46 跑 26 拿到 **0 行**（源尚未发布当日线），16:55 才拿到 558 行。
+    所以跑完必须校验，没推进就重试；**校验通过才写 marker**。
+    """
+    try:
+        db = cfg.resolve("data/large_pool.db")
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            mx = con.execute("SELECT MAX(date) FROM large_daily").fetchone()[0]
+        finally:
+            con.close()
+        return bool(mx) and str(mx) >= day.isoformat()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[shadow] 校验大池数据日期失败: %s", exc)
+        return False
+
+
 def _shadow_ab_worker():
     """服务挂着时，在 run_time（默认 15:45）自动跑 600 池维护流水线，每日一次。
 
@@ -444,11 +464,29 @@ def _shadow_ab_worker():
                 return
             if _last_updated is None or _last_updated.date() != today:
                 _run_auto_update()      # 补一次 40 池收盘刷新（幂等，含自动调仓/选股）
-            logger.info("[shadow] 触发：维护 600 池 + 影子 A/B（26→27→28，约几分钟）...")
-            _shadow_ab_pipeline(sab)
+            # 行情源的「当日日线」常在收盘后一段时间才发布 → 跑完校验，没推进就重试；
+            # **校验通过才写 marker**（否则兜底定时会误以为服务已跑、白白跳过补跑）。
+            retry_min = max(int(sab.get("retry_interval_min", 10) or 10), 1)
+            uh, um = map(int, str(sab.get("retry_until", "18:30")).split(":"))
+            retry_until = max(datetime(today.year, today.month, today.day, uh, um, 0), trigger)
+            while True:
+                logger.info("[shadow] 触发：维护 600 池 + 影子 A/B（26→27→28，约几分钟）...")
+                _shadow_ab_pipeline(sab)
+                if _shadow_data_current(today):
+                    break
+                now = datetime.now()
+                if now >= retry_until:
+                    logger.error("[shadow] 今日日线仍未发布（大池库未推进到 %s）且已过重试截止 "
+                                 "%s —— 本次**不写 marker**，留给兜底定时补跑", today,
+                                 retry_until.strftime("%H:%M"))
+                    return
+                logger.warning("[shadow] 今日日线尚未发布（大池库仍停在昨日），%d 分钟后重试",
+                               retry_min)
+                time.sleep(retry_min * 60)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(today.isoformat(), encoding="utf-8")
-            logger.info("[shadow] 本日自动维护完成 → logs/shadow_ab_%s.log", today)
+            logger.info("[shadow] 本日自动维护完成（数据已推进到 %s）→ logs/shadow_ab_%s.log",
+                        today, today)
             return
     except Exception as exc:  # noqa: BLE001
         logger.error("[shadow] worker 异常退出: %s", exc, exc_info=True)
