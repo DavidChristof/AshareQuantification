@@ -371,3 +371,40 @@ def load_panels(con: sqlite3.Connection, cols: Sequence[str], dates: Sequence,
         p.index = pd.to_datetime(p.index)
         out[c] = p.astype("float32")
     return out
+
+
+def load_raw_close(con: sqlite3.Connection, dates: Sequence, symbols: Sequence[str],
+                   ) -> pd.DataFrame:
+    """**不复权**收盘价面板 = `amount / volume`（成交额 / 成交量 = 当日元/股）。
+
+    ## 为什么必须有这个函数：qfq 价不能用来算历史 PE
+
+    `full_daily.close` 是 **qfq 前复权**，锚定在**今天**。也就是说历史价已经被
+    「今天之后发生的所有送转与分红」折算过了，而财务数据里的 EPS 是 **as-reported**
+    （报告期当时的股本口径，未经追溯重述）。两者相除，历史 PE 会被系统性低估：
+
+        送转前真实 PE = 100/1.0 = 100
+        qfq 价已被 10送10 折半 => qfq价/EPS = 50/1.0 = 50   （低估一半）
+
+    实测（`scripts/39_validate_fundamentals.py` E 段，2020-04-30 截面）：
+    两种口径的 PE **排序相关只有 0.938**；按「日后是否送转」分层，
+    有送转的票低到 **0.862**、比值 p5 = 0.235（失真 4 倍）。
+    PE 是线上选股 60% 的权重 => 回测用 qfq 口径会得到错误的选股结果。
+
+    ⚠️ 对照：**线上选股不受影响**——`selector._fetch_pe` 取的是百度估值接口的
+    PE(TTM) 当日值，qfq 在「今天」无折算差。本函数只服务历史回测。
+
+    Returns: date × symbol 的 float64 面板（volume=0 的停牌行 -> NaN）。
+    """
+    if not len(symbols):
+        return pd.DataFrame(index=pd.DatetimeIndex(dates), dtype="float64")
+    q = ",".join("?" * len(symbols))
+    ds = ",".join("?" * len(dates))
+    df = pd.read_sql_query(
+        f"SELECT date, symbol, amount, volume FROM full_daily "
+        f"WHERE date IN ({ds}) AND symbol IN ({q})",
+        con, params=[*[str(d)[:10] for d in dates], *symbols])
+    df["raw"] = df["amount"] / df["volume"].replace(0, np.nan)
+    p = df.pivot_table(index="date", columns="symbol", values="raw").sort_index()
+    p.index = pd.to_datetime(p.index)
+    return p.reindex(index=pd.DatetimeIndex(dates), columns=list(symbols)).astype("float64")

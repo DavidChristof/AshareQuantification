@@ -143,8 +143,17 @@ def pit_pe_roe_panels(fin: pd.DataFrame, close: pd.DataFrame,
                       symbols: list[str] | None = None):
     """→ (pe, roe) 两个 date × symbol 面板（**无未来函数**）。
 
-    pe(t)  = close(t) / EPS_ttm(t)      —— 用前复权价与前复权口径的 EPS 一致
+    pe(t)  = close(t) / EPS_ttm(t)
     roe(t) = 最近可见的 TTM ROE（单季 ROE 滚动 4 期之和；A股口径下 ≈ 年化 ROE）
+
+    ⚠️ **`close` 必须传不复权价**（`universe_pit.load_raw_close`），不能传 qfq 前复权价。
+
+    原因：EPS 是 as-reported 的（报告期当时的股本口径，未经追溯重述），而 **qfq 价
+    已被"今天之后发生的所有送转与分红"折算过**。两者相除，历史 PE 系统性偏低，
+    送转前可差到 4 倍。实测 2020-04-30 截面：两种口径的 PE 排序相关仅 0.938，
+    按送转分层低到 0.862 —— 而 PE 是选股主因子，排序错 = 选股错。
+
+    （`roe` 不受影响：它是比值，不含价格项。）
     """
     dates = close.index
     syms = symbols or list(close.columns)
