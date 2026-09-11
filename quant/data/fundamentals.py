@@ -102,18 +102,24 @@ def load_financials(con: sqlite3.Connection) -> pd.DataFrame:
     return prepare_financials(df)
 
 
-def ttm_panel(fin: pd.DataFrame, col: str, dates, symbols) -> pd.DataFrame:
-    """把单季值滚动 4 期求和 → TTM 面板（date × symbol），按**可见日**对齐。
+def ttm_panel(fin: pd.DataFrame, col: str, dates, symbols,
+              window: int = 4) -> pd.DataFrame:
+    """把单季值滚动 `window` 期求和 → 面板（date × symbol），按**可见日**对齐。
+
+    - `window=4`（默认）→ TTM（滚动四个单季之和）
+    - `window=1` → **最近可见的单期值**。线上 `_fetch_roe` 取的就是这个
+      （`stock_financial_analysis_indicator` 的最后一期「净资产收益率」，
+      **是年内累计口径、不是 TTM**）⇒ 忠实复刻线上选股时必须用 `window=1`。
 
     ⚠️ 对齐方式：对每个交易日 t，取 `avail_date <= t` 的**最新一期**，
-    再取该期往前 4 期的和。绝不把整表先 ffill 到每日再 shift。
+    再取该期往前 `window` 期的和。绝不把整表先 ffill 到每日再 shift。
     """
     if fin.empty:
         return pd.DataFrame(index=pd.DatetimeIndex(dates), columns=symbols, dtype="float64")
     sub = fin[fin["symbol"].isin(symbols)][["symbol", "report_date", "avail_date", col]]
     sub = sub.sort_values(["symbol", "report_date"])
     sub["ttm"] = (sub.groupby("symbol")[col]
-                     .rolling(4, min_periods=4).sum()
+                     .rolling(window, min_periods=window).sum()
                      .reset_index(level=0, drop=True))
     sub = sub.dropna(subset=["ttm"])
     if sub.empty:
