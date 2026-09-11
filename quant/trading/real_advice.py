@@ -42,6 +42,8 @@ class AdviceInput:
     entry_gate: dict = field(default_factory=dict)
     # 账户回撤熔断/弱势减仓：{"tripped":bool,"position_pct":float,"block_new_buys":bool,"reason":str}
     risk_off: dict = field(default_factory=dict)
+    # 大盘趋势闸门：{"below":bool,"reason":str} —— 跌破 MA20 → 当日不开新仓（保留持仓）
+    market_gate: dict = field(default_factory=dict)
     blocked: set = field(default_factory=set)               # 今日已建议止损卖出 → 不买回
     sell_rules: dict[str, str] = field(default_factory=dict)  # {symbol: 触发原因}
     session: str = "open"
@@ -119,6 +121,9 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
     # 账户回撤熔断：触发期间总仓位上限下调（与组合层同口径）
     risk_off = dict(inp.risk_off or {})
     brake_on = bool(risk_off.get("tripped"))
+    mkt_gate = dict(inp.market_gate or {})
+    gate_below = bool(mkt_gate.get("below"))
+    gate_reason = str(mkt_gate.get("reason") or "指数跌破均线")
     if brake_on:
         pos_pct = min(pos_pct, float(risk_off.get("position_pct", 0.5) or 0.5))
     cap_value = equity * cap_pct
@@ -155,6 +160,10 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
         if brake_on and risk_off.get("block_new_buys", True):
             skipped.append({**base, "reason": (
                 f"账户回撤熔断：暂停开新仓（{risk_off.get('reason', '')}）")})
+            continue
+        if gate_below:
+            skipped.append({**base, "reason": (
+                f"大盘趋势闸门：{gate_reason}")})
             continue
 
         one = buy_fees(price * lot, fcfg)
@@ -266,7 +275,8 @@ def plan_real_portfolio(inp: AdviceInput) -> dict:
     # ⚠️ 例外通道只放宽「单票上限」，**其余闸门一条都不能绕**（熔断/blocked/追高/入场择时/费用）。
     #    历史上这里先后漏过 追高保护、入场择时，现补熔断 —— 新增闸门时务必同步此处。
     brake_blocking = brake_on and risk_off.get("block_new_buys", True)
-    if not buy and not positions and slots > 0 and rows and not brake_blocking:
+    no_new = brake_blocking or gate_below        # 熔断 / 大盘跌破均线 → 连例外通道也关闭
+    if not buy and not positions and slots > 0 and rows and not no_new:
         single_pct = float(cfg.get("single_position_pct", 0.0) or 0.0)
         if single_pct > cap_pct:
             cap2 = equity * single_pct

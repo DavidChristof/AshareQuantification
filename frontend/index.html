@@ -364,6 +364,10 @@
              style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4);color:#d29922;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
           ⚠️ 大盘弱势（沪深300/上证 {{ portfolio.market_weak.index_pct }}%，阈值 {{ portfolio.market_weak.threshold }}%）→ 已降仓保护：买入仓位≤{{ (portfolio.market_weak.weak_position_pct||0.5)*100 }}% · 单票≤20% · 盘中分钟看空暂停买入 · <b>弱势主动减仓（超目标持仓减持至目标）</b>
         </div>
+        <div v-if="portfolio.market_gate && portfolio.market_gate.below"
+             style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4);color:#d29922;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
+          📉 <b>大盘趋势闸门</b>：{{ portfolio.market_gate.reason }}（保留现有持仓，只停止开新仓）
+        </div>
         <div v-if="portfolio.drawdown_brake && portfolio.drawdown_brake.tripped"
              style="background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.45);color:#f85149;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
           🛑 <b>账户回撤熔断</b>：{{ portfolio.drawdown_brake.reason }} → 总仓位上限降至 {{ ((portfolio.drawdown_brake.position_pct||0.5)*100).toFixed(0) }}% 且<b>暂停开新仓</b>（回撤收窄后自动解除）
@@ -550,6 +554,10 @@
         <div v-if="rAdvice.session && rAdvice.session !== 'open'" class="warn-bar">
           ⏸ 当前非交易时段（休市/盘后）——以下为<b>下一交易日计划</b>，需在 9:30-11:30 / 13:00-15:00 才能委托。
           <b>「建议委托价」是盘口快照价、判定依据的是上一交易日盘口</b>；明日开盘会跳空，请以「开盘参考价」为起点，开盘后按实时卖一/买一价刷新。
+        </div>
+        <div v-if="rAdvice.market_gate && rAdvice.market_gate.below"
+             style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4);color:#d29922;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
+          📉 <b>大盘趋势闸门</b>：{{ rAdvice.market_gate.reason }}（保留现有持仓，只停止开新仓）
         </div>
         <div v-if="rAdvice.drawdown_brake && rAdvice.drawdown_brake.tripped"
              style="background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.45);color:#f85149;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">

@@ -187,6 +187,20 @@ def test_risk_off_blocks_new_buys_and_halves_budget():
     assert off["capacity"]["per_slot"] < normal["capacity"]["per_slot"]
 
 
+def test_market_gate_blocks_new_buys():
+    """大盘跌破均线 → 不开新仓；但**不影响卖出/持仓建议**（只停开新仓）。"""
+    base = dict(rows=[_row("600160", 10.0)], cash=3000.0, prices={"600160": 10.0},
+                prev_closes={"600160": 10.0}, quotes={"600160": _q(10.0)},
+                cfg=REAL_CFG, fill_cfg=FC)
+    blocked = plan_real_portfolio(AdviceInput(**base, market_gate={
+        "below": True, "reason": "大盘 3800.00 跌破 20 日均线 3900.00 → 当日不开新仓"}))
+    assert blocked["buy"] == []
+    assert any("趋势闸门" in s["reason"] for s in blocked["skipped"])
+    # 持仓的卖出/止损提醒不受影响（这里无持仓 → sell 为空，但字段存在且为列表）
+    assert isinstance(blocked["sell"], list)
+    assert len(plan_real_portfolio(AdviceInput(**base, market_gate={"below": False}))["buy"]) == 1
+
+
 def test_shipped_config_gate_filters_inefficient_orders():
     """仓库 config 的 max_breakeven_pct（2026-09-11 由 1.5 收紧到 1.2）：
     ¥9.9 一手（名义 ¥990，费用≈1.06%）可过；¥7 一手（名义 ¥700，费用≈1.45%）被费用闸门滤掉。
