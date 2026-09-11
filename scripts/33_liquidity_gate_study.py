@@ -87,6 +87,17 @@ def main():
     mcap = (am / tv.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
     def capw_return(msk=None) -> float:
+        """每日再归一化市值加权。
+
+        [!] **这个口径有假象，别再用它下结论。**
+        `mcap = amount/turnover` 随**股本变动**（增发/解禁）与**成交均价**波动，
+        每日把它重新归一化当权重，等于持续把权重压向当期最大市值，产生虚假收益。
+        实测（同一 PIT 宇宙 2021-07~2026-09）：加权 **+129.9%** vs 买入持有 **+27.9%**
+        （差 100pp，且权重很分散、无 NaN，排除长尾解释）。
+        本脚本 A 段报的 **+97.9pp 超额因此被高估**，真量级约 +10pp；
+        但 B 段的**冷热差**结论（+88.7pp，偏差挂在流动性轴上）用买入持有口径同样成立。
+        详见 docs/2026-09-11-pit-universe.md 第四节。**稳健判据请用买入持有。**
+        """
         w = mcap.where(msk) if msk is not None else mcap
         w = w.div(w.sum(axis=1), axis=0)
         return float((1 + (w * ret1).sum(axis=1).fillna(0)).prod() - 1)

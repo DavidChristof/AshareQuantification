@@ -53,7 +53,11 @@ def _pivot(df: pd.DataFrame, col: str) -> pd.DataFrame:
 
 def load_panels(db: Path
                 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """→ (close, volume, turnover, float_shares) 四个 date × symbol 宽表。"""
+    """老的 559 池 → (close, volume, turnover, 流通股本)。
+
+    [!]️ 该池有**严重幸存者偏差**（见 docs/2026-09-11-survivorship-bias.md），
+    结果只能作同池相对比较；要看真实水平请用 `--universe pit`。
+    """
     con = sqlite3.connect(str(db))
     bars = pd.read_sql_query(
         "SELECT symbol, date, close, volume, amount FROM large_daily", con)
@@ -62,9 +66,48 @@ def load_panels(db: Path
     con.close()
     close, vol = _pivot(bars, "close"), _pivot(bars, "volume")
     tv, fl = _pivot(tur, "turnover"), _pivot(tur, "outstanding_share")
-    logger.info("面板: close %s, turnover %s（覆盖 %d 只）",
+    logger.info("面板(large)：close %s, turnover %s（覆盖 %d 只）",
                 close.shape, tv.shape, tv.notna().any().sum())
-    return close, vol, tv, fl
+    # 第 4 项统一为**流通市值**（与 pit 路径对齐）。注：large 的 close 是前复权，
+    # 所以这里是近似值（实测偏差 3%~11.5%），仅用于 5.2 的分组对照，不影响结论。
+    return close, vol, tv, close * fl
+
+
+def load_pit_panels(cfg, start: str
+                    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """时点宇宙（重建的中证500∪1000）→ (close, volume, turnover, 流通市值)。
+
+    与 large 的区别：
+      - 宇宙 = **按编制规则逐期重建**的成分（无未来函数），掩码之外置 NaN，
+        这样后面所有截面统计/排序都只在成员内进行，无需改其余算法；
+      - 第 4 个返回值是**流通市值**（`float_mcap = amount/turnover`），
+        不是流通股本——因为量纲口径不同，直接换掉更不容易用错。
+    """
+    from quant.data.universe_pit import CSI1000, CSI500, build_mask  # noqa: PLC0415
+
+    db = Path(cfg.resolve("data")) / "full_market.db"
+    if not db.exists():
+        raise SystemExit(f"缺 {db}：请先跑 scripts/35_fetch_full_market.py")
+    con = sqlite3.connect(str(db))
+    dates = pd.DatetimeIndex([r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM full_daily WHERE date >= ? ORDER BY date", (start,))])
+    mask = build_mask(con, (CSI500, CSI1000), dates)
+    syms = list(mask.columns)
+    if not syms:
+        raise SystemExit("pit_members 为空：请先跑 scripts/36_validate_pit_universe.py --build")
+    ph = ",".join("?" * len(syms))
+    df = pd.read_sql_query(
+        f"SELECT symbol, date, close, volume, turnover, float_mcap FROM full_daily "
+        f"WHERE date >= ? AND symbol IN ({ph})", con, params=[start, *syms])
+    con.close()
+    close, vol = _pivot(df, "close"), _pivot(df, "volume")
+    tv, mcap = _pivot(df, "turnover"), _pivot(df, "float_mcap")
+    m = mask.reindex(close.index).fillna(False).astype(bool)
+    for p in (close, vol, tv, mcap):                    # 掩码外置 NaN
+        p[~m.reindex(columns=p.columns, fill_value=False)] = np.nan
+    logger.info("面板(pit)：%d 只 PIT 成员 · close %s · 覆盖 %d 只",
+                len(syms), close.shape, close.notna().any().sum())
+    return close, vol, tv, mcap
 
 
 def build_panels(close: pd.DataFrame, vol: pd.DataFrame, tv: pd.DataFrame) -> dict:
@@ -139,7 +182,7 @@ def backtest(score: pd.DataFrame, close: pd.DataFrame, topn: int = 12,
 
     口径：d 日收盘按分数选 topn → 等权持有到 d2=d+rebal 日收盘。
     **组合区间收益 = 成分股区间收益的算术平均**（等权），不是连乘
-    （连乘会把 12 只股票的收益复利成 −11%，是错的）。
+    （连乘会把 12 只股票的收益复利成 -11%，是错的）。
     """
     dates = score.index
     nav, curve, cur = 1.0, [], None
@@ -194,11 +237,17 @@ def main():
     ap.add_argument("--horizons", type=int, nargs="+", default=[5, 20])
     ap.add_argument("--topn", type=int, default=12)
     ap.add_argument("--start", default="2021-07-01", help="回测起点（预留因子预热期）")
+    ap.add_argument("--universe", choices=["large", "pit"], default="large",
+                    help="large=老的 559 池（**有幸存者偏差**，只能做同池相对比较）；"
+                         "pit=时点重建宇宙（中证500∪1000，无未来函数）")
     args = ap.parse_args()
 
     cfg = load_config()
     db = Path(cfg.resolve("data")) / "large_pool.db"
-    close, vol, tv, fl = load_panels(db)
+    if args.universe == "pit":
+        close, vol, tv, mcap4 = load_pit_panels(cfg, args.start)
+    else:
+        close, vol, tv, mcap4 = load_panels(db)
     panels = build_panels(close, vol, tv)
 
     # ---------- 1. RankIC ----------
@@ -264,7 +313,7 @@ def main():
     # ---------- 5. 稳健性：单因子 D 的 Sharpe 1.19 是真的吗？ ----------
     print("\n==================== 稳健性检验（先证伪再上线）====================")
     # 线上口径 = 选股时点的**当日成交额** ≥ 1 亿（selector.MIN_AMOUNT），不是 20 日均额。
-    # 两者结果差很多（当日额 −3.4% vs 20日均额 −22.8%），必须用线上口径。
+    # 两者结果差很多（当日额 -3.4% vs 20日均额 -22.8%），必须用线上口径。
     mask = (close * vol).loc[start:] >= 1e8
     n_ok = mask.sum(axis=1)
     print(f"\n【5.1】叠加线上同款流动性过滤（**当日成交额** ≥ 1 亿，与 selector.MIN_AMOUNT 一致）"
@@ -292,7 +341,7 @@ def main():
                   f"回撤 {m['maxdd']:>6.1f}%  Sharpe {m['sharpe']:>5.2f}")
 
     print("\n【5.2】市值暴露（组合的流通市值中位数，亿元）——低换手是不是「小市值」的马甲？")
-    mcap = close * fl                            # 流通市值（close 未复权 → 近似）
+    mcap = mcap4                                 # 流通市值（两个宇宙都已统一口径）
     rows_mc = []
     for d in list(base_score.loc[start:].index)[::20]:
         for tag, sc in [("全池", None), ("基准 top12", base_score),
