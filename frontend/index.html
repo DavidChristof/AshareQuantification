@@ -770,17 +770,6 @@
         </table>
       </div>
 
-      <div class="grid2">
-        <div class="panel">
-          <h2>账户净值曲线</h2>
-          <div id="rEquityChart" style="height:260px"></div>
-        </div>
-        <div class="panel">
-          <h2>资产结构</h2>
-          <div id="rAssetsChart" style="height:260px"></div>
-        </div>
-      </div>
-
       <div class="panel">
         <h2>实盘成交流水 <span class="muted" style="font-size:12px">录错可删除（会按流水全量重建资金/持仓）</span></h2>
         <table>
@@ -987,7 +976,6 @@ createApp({
       // 切到模拟炒股时容器变为可见，重新绘制图表（修正 display:none 时的 0 尺寸）
       if (v === 'manual') this.$nextTick(() => this.drawManualCharts());
       // 切到实盘时容器可见 → 重绘图表（display:none 期间尺寸为 0）
-      if (v === 'real') this.$nextTick(() => this.drawRealCharts());
       // 切回买卖决策时重绘大盘K线 + 分钟K线（display:none 期间图表尺寸为 0）
       if (v === 'advisor') {
         this.$nextTick(() => {
@@ -1328,13 +1316,11 @@ createApp({
         this.rTrades = t.trades || [];
         this.rOrders = o.orders || [];
         this.rEquity = (e && e.equity_curve) || [];
-        this.drawRealCharts();
       } catch (err) { console.error('实盘账户加载失败:', err); }
     },
     async loadRealAdvice() {
       try {
         this.rAdvice = await this.api('/api/real/advice');
-        this.drawRealCharts();
       } catch (err) { console.error('实盘建议加载失败:', err); }
     },
     async refreshReal() {
@@ -1342,7 +1328,6 @@ createApp({
         const [a, p] = await Promise.all([
           this.api('/api/real/account'), this.api('/api/real/positions')]);
         this.rAcct = a; this.rPositions = p.positions || [];
-        this.drawRealCharts();
       } catch (err) { /* 静默（轮询） */ }
     },
     openRealRecord(row) {
@@ -1414,82 +1399,6 @@ createApp({
         this.checkResult = await this.api('/api/real/check?' + qs);
       } catch (err) { alert('判定失败：' + err.message); }
       finally { this.checkBusy = false; }
-    },
-    drawRealCharts() {
-      this.drawRealEquity();
-      this.drawRealAssets();
-    },
-    drawRealEquity() {
-      const el = document.getElementById('rEquityChart');
-      if (!el) return;
-      if (this._rEq) this._rEq.dispose();
-      const curve = this.rEquity || [];
-      const initCap = +(this.rAcct.initial_capital || 3000);
-      const chart = echarts.init(el);
-      this._rEq = chart;
-      const fmtAxis = d => {
-        const s = d.date || '';
-        if (s.includes(' ')) { const [date, hm] = s.split(' '); return date.slice(5) + ' ' + hm.slice(0, 5); }
-        return s.slice(5);
-      };
-      const labels = curve.map(fmtAxis);
-      const data = curve.map(c => (c && isFinite(c.equity)) ? c.equity : null);
-      chart.setOption({
-        grid: { left: 70, right: 20, top: 20, bottom: 40 },
-        tooltip: {
-          trigger: 'axis',
-          formatter: (params) => {
-            const ps = Array.isArray(params) ? params : [params];
-            let val = null;
-            for (const p of ps) {
-              if (p.seriesName === '本金') continue;
-              if (p.value != null && isFinite(p.value)) { val = p.value; break; }
-            }
-            const head = (ps[0] && ps[0].axisValue) ? ps[0].axisValue : '';
-            return (head ? head + '<br/>' : '') +
-              (val == null ? '总资产：--' : '总资产：<b>¥' + Number(val).toFixed(2) + '</b>');
-          }
-        },
-        legend: { show: false },
-        xAxis: { type: 'category', data: labels, axisLine: { lineStyle: { color: '#30363d' } } },
-        yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#21262d' } } },
-        series: [{
-          name: '总资产', type: 'line', data,
-          smooth: 0.35, showSymbol: curve.length <= 40, connectNulls: true,
-          lineStyle: { width: 2, color: '#58a6ff' }, itemStyle: { color: '#58a6ff' },
-          areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: 'rgba(88,166,255,.22)' },
-                         { offset: 1, color: 'rgba(88,166,255,0)' }] } },
-        }, {
-          name: '本金', type: 'line', data: labels.map(() => initCap),
-          smooth: false, showSymbol: false,
-          lineStyle: { type: 'dashed', width: 1, color: '#8b949e' },
-          tooltip: { show: false },
-        }],
-      });
-    },
-    drawRealAssets() {
-      const el = document.getElementById('rAssetsChart');
-      if (!el) return;
-      if (this._rAs) this._rAs.dispose();
-      const cash = +(this.rAcct.cash || 0);
-      const items = [
-        { name: '现金', value: cash },
-        ...this.rPositions.map(p => ({ name: p.name, value: +(p.market_value || 0) })),
-      ];
-      if (items.every(i => i.value <= 0)) items[0].value = 1;
-      const chart = echarts.init(el);
-      this._rAs = chart;
-      chart.setOption({
-        tooltip: { trigger: 'item', valueFormatter: v => '¥' + Number(v).toFixed(2) },
-        legend: { bottom: 0, type: 'scroll', textStyle: { color: '#8b949e' } },
-        series: [{
-          type: 'pie', radius: ['45%', '70%'], center: ['50%', '44%'],
-          label: { color: '#c9d1d9', formatter: '{b}: {d}%' },
-          data: items,
-          color: ['#58a6ff', '#3fb950', '#f85149', '#d29922', '#bc8cff', '#39c5cf', '#ff7b72'],
-        }],
-      });
     },
     drawManualCharts() {
       this.drawMEquity();
