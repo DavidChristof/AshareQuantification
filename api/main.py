@@ -522,9 +522,15 @@ def root():
 
 @app.get("/dashboard")
 def dashboard_page():
-    """返回看板页面（前端单文件 index.html），便于在 VSCode 内置浏览器/浏览器里访问。"""
+    """返回看板页面（前端单文件 index.html），便于在 VSCode 内置浏览器/浏览器里访问。
+
+    `Cache-Control: no-store` —— 前端是**边改边看**的单文件，一旦被浏览器缓存，
+    改了代码却还看到旧页面，会误判成"改动没生效"（踩过：删掉的面板刷新后仍显示）。
+    """
     page = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
-    return FileResponse(page) if page.exists() else {"error": "frontend/index.html 不存在"}
+    if not page.exists():
+        return {"error": "frontend/index.html 不存在"}
+    return FileResponse(page, headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 @app.get("/api/stocks")
