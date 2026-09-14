@@ -424,6 +424,75 @@ def _shadow_ab_pipeline(sab: dict) -> None:
                                    name, r.returncode)
 
 
+def _free_mem_mb() -> float:
+    """可用物理内存（MB）。取不到时返回 inf（=不拦，绝不因探测失败而卡住流水线）。
+
+    为什么需要它：`scripts/26` 用 akshare 新浪日线，**每个 worker 起一个
+    py_mini_racer(V8) 上下文**；V8 启动时要预留一块 partition 地址空间，内存紧张时
+    直接 `[FATAL:partition_address_space.cc(243)] Check failed` **进程级崩溃**
+    （2026-09-10 实测：可用 854MB 时 workers=4 秒崩；2026-09-14 实测：可用仅 400MB
+    （开着游戏）时 workers=2 也在 7 秒内崩）。崩了整个 26 就是 0 行，白跑一轮。
+    """
+    try:
+        import ctypes                                        # noqa: PLC0415
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(_MemStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return float("inf")
+        return st.ullAvailPhys / 1048576.0
+    except Exception:  # noqa: BLE001
+        return float("inf")
+
+
+def _shadow_log(day, msg: str) -> None:
+    """把一行信息写进当日 shadow 日志。
+
+    本模块只 `getLogger(__name__)`、未配 handler，INFO 基本进不了服务 stdout
+    ⇒ 「在等数据 / 在等内存」这类状态必须落到 shadow 日志才看得见。
+    """
+    try:
+        with (cfg.resolve("logs") / f"shadow_ab_{day}.log").open(
+                "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {msg.splitlines()[0]} =====\n"
+                     f"[shadow] {msg}\n")
+    except OSError:
+        pass
+
+
+def _pool_data_current(day) -> bool:
+    """40 池（market.db）是否已推进到 day —— 「行情源发布当日日线了吗」的探针。
+
+    ⚠️ **不能拿 `_last_updated` 当探针**：它只是**本进程**「我更新过」的标记。
+    `_run_auto_update` 里 `if date == before: return`（数据本来就已推进时判定为
+    "已更新/休市"）**不会**置 `_last_updated` ⇒ 若数据已被**上一个进程**刷新过，
+    新进程永远设不上它，预检将永远失败、流水线永远不跑（2026-09-14 实际踩到）。
+    所以这里直接读**数据状态**，与进程内标记无关。
+    """
+    try:
+        db = cfg.resolve(cfg["data"]["db_path"])
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            mx = con.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0]
+        finally:
+            con.close()
+        return bool(mx) and str(mx) >= day.isoformat()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[shadow] 校验 40 池数据日期失败: %s", exc)
+        return False
+
+
 def _shadow_data_current(day) -> bool:
     """大池库是否已推进到 day —— 判断行情源的「当日日线」是否已发布。
 
@@ -476,26 +545,61 @@ def _shadow_ab_worker():
             if marker.exists() and marker.read_text(encoding="utf-8").strip() == today.isoformat():
                 logger.info("[shadow] 今日已自动跑过，跳过")
                 return
-            if _last_updated is None or _last_updated.date() != today:
-                _run_auto_update()      # 补一次 40 池收盘刷新（幂等，含自动调仓/选股）
-            # 行情源的「当日日线」常在收盘后一段时间才发布 → 跑完校验，没推进就重试；
-            # **校验通过才写 marker**（否则兜底定时会误以为服务已跑、白白跳过补跑）。
             retry_min = max(int(sab.get("retry_interval_min", 10) or 10), 1)
             uh, um = map(int, str(sab.get("retry_until", "18:30")).split(":"))
             retry_until = max(datetime(today.year, today.month, today.day, uh, um, 0), trigger)
             while True:
+                # 先补一次 40 池收盘刷新（幂等，含自动调仓/选股）
+                if not _pool_data_current(today):
+                    _run_auto_update()
+                # **先判源发布没发布，再跑昂贵流水线**。旧写法是「先跑完整 26→27→28、
+                # 再校验大池库、不合格就 10 分钟后重跑」——从 run_time 到当日日线发布之间
+                # 会每 10 分钟全量重跑一次（559 次请求 + 约 7 分钟），纯属白跑，而且本项目
+                # 曾因高频请求被新浪软封（见 fetcher / scripts/38 的限速记录）。
+                # 40 池与大池同源，所以 40 池没推进 ⇒ 大池必然也拿不到今天的日线。
+                if not _pool_data_current(today):
+                    if datetime.now() >= retry_until:
+                        logger.error("[shadow] 今日日线仍未发布（40 池未推进到 %s）且已过重试截止 "
+                                     "%s —— 本次**不写 marker**，留给兜底定时补跑", today,
+                                     retry_until.strftime("%H:%M"))
+                        _shadow_log(today, f"等待当日日线发布：已过重试截止 "
+                                           f"{retry_until:%H:%M}，本次不写 marker")
+                        return
+                    msg = (f"行情源当日日线尚未发布（40 池仍停在昨日），{retry_min} 分钟后重试"
+                           f"（本轮跳过 26→27→28，避免白跑）")
+                    logger.info("[shadow] %s", msg)
+                    _shadow_log(today, msg)
+                    time.sleep(retry_min * 60)
+                    continue
+                # 内存闸门：26 的 py_mini_racer(V8) 在内存紧张时会**进程级 FATAL 崩溃**，
+                # 崩了就是 0 行、白跑一轮。与其撞上去，不如等内存够了再跑（见 _free_mem_mb）。
+                free_mb = _free_mem_mb()
+                min_mb = float(sab.get("min_free_mb", 1200) or 0)
+                if free_mb < min_mb:
+                    if datetime.now() >= retry_until:
+                        logger.error("[shadow] 可用内存仅 %.0fMB（< %.0fMB）且已过重试截止 %s —— "
+                                     "本次**不写 marker**，留给兜底定时补跑",
+                                     free_mb, min_mb, retry_until.strftime("%H:%M"))
+                        _shadow_log(today, f"可用内存仅 {free_mb:.0f}MB（< {min_mb:.0f}MB）："
+                                           f"已过重试截止，本次不写 marker")
+                        return
+                    msg = (f"可用内存仅 {free_mb:.0f}MB（< {min_mb:.0f}MB）—— "
+                           f"26 的 py_mini_racer(V8) 会在 partition_address_space 处 FATAL 崩溃，"
+                           f"本轮不跑，{retry_min} 分钟后重试（请关掉占内存的程序，如游戏）")
+                    logger.warning("[shadow] %s", msg)
+                    _shadow_log(today, msg)
+                    time.sleep(retry_min * 60)
+                    continue
                 logger.info("[shadow] 触发：维护 600 池 + 影子 A/B（26→27→28，约几分钟）...")
                 _shadow_ab_pipeline(sab)
                 if _shadow_data_current(today):
                     break
-                now = datetime.now()
-                if now >= retry_until:
-                    logger.error("[shadow] 今日日线仍未发布（大池库未推进到 %s）且已过重试截止 "
-                                 "%s —— 本次**不写 marker**，留给兜底定时补跑", today,
+                if datetime.now() >= retry_until:
+                    logger.error("[shadow] 大池库未推进到 %s 且已过重试截止 %s —— "
+                                 "本次**不写 marker**，留给兜底定时补跑", today,
                                  retry_until.strftime("%H:%M"))
                     return
-                logger.warning("[shadow] 今日日线尚未发布（大池库仍停在昨日），%d 分钟后重试",
-                               retry_min)
+                logger.warning("[shadow] 大池库仍停在昨日，%d 分钟后重试", retry_min)
                 time.sleep(retry_min * 60)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(today.isoformat(), encoding="utf-8")
