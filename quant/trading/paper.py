@@ -51,7 +51,6 @@ def trade_date(d: date | None = None) -> str:
     return (d or date.today()).isoformat()
 
 
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_account (
     key   TEXT PRIMARY KEY,
@@ -403,9 +402,20 @@ class PaperBroker(Broker):
         return equity
 
     def equity_history(self) -> list[dict]:
+        """净值点序列，按**时间先后**排序（同日：盘中点在先，日点在最后）。
+
+        ⚠️ 不能只写 `ORDER BY date`：date 列混存两种格式 ——
+        `'YYYY-MM-DD'`（日点/收盘点）与 `'YYYY-MM-DD HH:00'`（盘中小时点）。
+        字符串比较 `'2026-09-11' < '2026-09-11 09:00'`，会让**当日日点排到当日
+        09:00 之前**，净值曲线上表现为「收盘点画在开盘点前面、同一天来回跳」。
+        这里按 (自然日, 是否日点, date) 三级排序，把日点放到该日最后。
+        """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT date, cash, market_value, equity FROM paper_equity ORDER BY date"
+                "SELECT date, cash, market_value, equity FROM paper_equity "
+                "ORDER BY substr(date,1,10), "
+                "         CASE WHEN instr(date,' ')=0 THEN 1 ELSE 0 END, "
+                "         date"
             ).fetchall()
         return [{"date": r[0], "cash": r[1], "market_value": r[2], "equity": r[3]} for r in rows]
 

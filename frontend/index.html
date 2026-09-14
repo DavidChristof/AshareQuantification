@@ -1415,8 +1415,11 @@ createApp({
       this._mEq = chart;
       const fmtAxis = d => {
         const s = d.date || '';
+        // 两种格式：'YYYY-MM-DD HH:00'（盘中小时点）/ 'YYYY-MM-DD'（日点=收盘点）。
+        // 后端已保证排序为「同日盘中点在前、日点在最后」，这里给日点加"收"字区分，
+        // 否则同一天会在轴上出现两次（'09-11 15:00' 之后又冒出 '09-11'）看不出含义。
         if (s.includes(' ')) { const [date, hm] = s.split(' '); return date.slice(5) + ' ' + hm.slice(0, 5); }
-        return s.slice(5);   // 纯日期只显示 MM-DD
+        return s.slice(5) + ' 收';
       };
       const labels = curve.map(fmtAxis);
       // 账户净值曲线：单条连续平滑线（主题蓝）。

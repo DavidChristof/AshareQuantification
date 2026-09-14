@@ -96,6 +96,27 @@ def test_snapshot_equity_writes_the_date_given():
     _rm(tmp)
 
 
+def test_equity_history_orders_day_point_after_intraday():
+    """同日：盘中点在前，**日点（收盘点）在最后**。
+
+    `paper_equity.date` 混存 `'YYYY-MM-DD'`（日点）与 `'YYYY-MM-DD HH:00'`（盘中点），
+    字符串比较 `'2026-09-11' < '2026-09-11 09:00'` ⇒ 只写 `ORDER BY date` 会把
+    **当日日点排到当日 09:00 之前**，净值曲线上表现为「收盘点画在开盘点前面」。
+    这里**故意先写日点再写盘中点**，确保排序不依赖写入顺序。
+    """
+    tmp = _tmp_db()
+    b = _broker(tmp)
+    b.buy("601600", 100, 10.0, "2026-09-11")
+    b.snapshot_equity("2026-09-11", {"601600": 9.44})          # 日点（先写）
+    b.snapshot_equity("2026-09-11 09:00", {"601600": 9.50})
+    b.snapshot_equity("2026-09-11 15:00", {"601600": 9.60})
+    b.snapshot_equity("2026-09-14", {"601600": 9.70})          # 次日日点
+    dates = [r["date"] for r in b.equity_history()]
+    assert dates == ["2026-09-11 09:00", "2026-09-11 15:00", "2026-09-11",
+                     "2026-09-14"], dates
+    _rm(tmp)
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

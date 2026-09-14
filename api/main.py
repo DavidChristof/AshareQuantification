@@ -1126,7 +1126,11 @@ class OrderRequest(BaseModel):
 
 @app.post("/api/manual/order")
 def manual_order(order: OrderRequest):
-    """手动下单：用最新收盘价在模拟盘成交（仅限交易时段）。"""
+    """手动下单：按**实时价**在模拟盘成交（仅限交易时段；无实时价才回退最近收盘）。
+
+    涨跌停校验的基准昨收取自 `_prev_closes()`（= 信号表最新收盘；盘中尚未拉今日
+    数据时它本身就是昨收），不是 `sig.iloc[-2]`。
+    """
     # 交易时间限制：闭市/休市禁止下单（可配置关闭）
     if not _in_trading_hours():
         if (datetime.now().weekday() >= 5
@@ -1148,10 +1152,19 @@ def manual_order(order: OrderRequest):
         raise HTTPException(500, "该股票无预测信号")
     if len(sig) < 2:
         raise HTTPException(500, "该股票历史数据不足，无法判断涨跌停")
-    price = float(sig.iloc[-1]["close"])
-    prev_close = float(sig.iloc[-2]["close"])
+    # 成交价 = **实时价**优先（QUOTE_MANAGER 快照），无实时价才回退最近收盘。
+    # 原实现直接用 sig.iloc[-1]["close"]（最近一根日线）—— 而日线是收盘后才更新的
+    # （data.refresh 15:30），盘中会拿**上一交易日收盘价**成交，与实际价格明显偏离。
+    last_close = float(sig.iloc[-1]["close"])
+    price = float(_live_prices().get(order.symbol) or last_close)
+    # 昨收 = 涨跌停/风控的基准。用 _prev_closes（取信号表最新收盘；盘中尚未拉今日数据时
+    # 它本身就是昨收）。**不能**用 sig.iloc[-2] —— 那假设最后一根是今天，数据滞后时会取错一天。
+    prev_close = float(_prev_closes([order.symbol]).get(order.symbol) or last_close)
     # 记账日期 = 日历日期（同上；本函数开头已要求 _in_trading_hours()）
     today = trade_date()
+
+    if not _valid_price(price):
+        raise HTTPException(500, f"无法获取 {order.symbol} 的有效价格（实时价与收盘价均不可用）")
 
     # 涨跌停校验：一字涨停买不进、一字跌停卖不出（30/68 开头为创业板/科创板 ±20%）
     from quant.trading.rules import limit_prices
