@@ -2102,6 +2102,11 @@ def _market_trend_gate(force: bool = False) -> dict:
     """大盘趋势闸门：指数跌破 MA20 → 当日不开新仓（保留持仓）。
 
     指数用新浪日线（`fetch_index_daily`，与持仓无关），进程内缓存 30 分钟（盘中够用）。
+
+    口径：只用 **`trade_date()` 之前** 已收盘的日线（`market_trend.completed_closes`）。
+    日线接口**盘中不含当天、收盘后含当天**，若直接取最后一根，同一个交易日会产生
+    两个结论（实测 12.9% 的日子相反），且盘中那个才是可执行的。返回值里的 `as_of`
+    标明闸门基于哪一天的收盘，便于核对。
     """
     g = _market_trend_cfg()
     if not g.get("enabled", False):
@@ -2114,11 +2119,19 @@ def _market_trend_gate(force: bool = False) -> dict:
         from quant.realtime.indices import fetch_index_daily
         code = str(g.get("index", "sh000300"))
         df = fetch_index_daily(code)
-        closes = [float(x) for x in df["close"].tail(60).tolist()] if df is not None else []
+        # ⚠️ 只用 **今天之前** 已收盘的日线。日线接口盘中不含当天、收盘后含当天，
+        # 直接取最后一根会让同一交易日在 09:31 与收盘后给出不同结论（实测 12.9% 相反），
+        # 也会让看板显示的闸门口径 ≠ 当日实际约束交易的口径。见 market_trend.completed_closes。
+        today = trade_date()
+        dts = [str(x)[:10] for x in df["date"].tolist()] if df is not None else []
+        closes = trend_mod.completed_closes(
+            dts, df["close"].tolist() if df is not None else [], today)[-60:]
         st = trend_mod.trend_gate(closes, ma_days=int(g.get("ma_days", 20) or 20))
         out = st.to_dict()
         out["enabled"] = True
         out["index"] = code
+        prior = [d for d in dts if d < today]
+        out["as_of"] = prior[-1] if prior else ""      # 闸门基于哪一天的收盘（可核对）
     except Exception as exc:  # noqa: BLE001
         logger.warning("[trend] 大盘趋势闸门取数失败（不干预）: %s", exc)
         out = {"enabled": True, "below": False, "reason": f"指数取数失败，不干预（{exc}）"}

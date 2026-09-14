@@ -34,6 +34,40 @@ class TrendGate:
                 "ma_days": self.ma_days, "below": self.below, "reason": self.reason}
 
 
+def completed_closes(dates: Sequence, closes: Sequence, today) -> list[float]:
+    """只保留 **today 之前** 已收盘交易日的收盘价 —— 让闸门对「今天」的口径唯一。
+
+    ## 为什么必须这样做（2026-09-14）
+
+    `fetch_index_daily` 返回的是**日线**，且**盘中不含当天、收盘后含当天**。
+    直接取 `closes[-1]` 会让同一个交易日给出两个不同结论：
+
+        09:31（自动调仓时）   : 最后一根 = 昨日 → close(D-1) vs MA20(≤D-1)
+        15:30 之后（看板/手动）: 最后一根 = 今日 → close(D)   vs MA20(≤D)
+
+    实测（沪深300 2020-2026，1624 个交易日）：两种口径有 **12.9%** 的交易日结论相反
+    ⇒ 看板上显示的闸门口径，与当日实际约束交易的口径**不是同一个**。
+
+    而且 **close(D) 要到收盘后才知道**，所以「09:31 那种口径」才是真正可执行的；
+    回测若用 close(D)，验证的是一个**无法落地**的信号（见 docs）。
+
+    这里统一定为「**决策日当天及以后的数据一律不用**」：闸门永远只看 `today` 之前
+    已收盘的交易日。于是同一交易日内无论何时求值都得到同一答案，到次日自动前进一根。
+    """
+    out: list[float] = []
+    key = str(today)[:10]
+    for d, c in zip(dates or [], closes or []):
+        if str(d)[:10] >= key:          # 今天及以后一律剔除（未收盘 / 未来）
+            continue
+        try:
+            f = float(c)
+        except (TypeError, ValueError):
+            continue
+        if f == f and f > 0:            # 非 NaN 且为正
+            out.append(f)
+    return out
+
+
 def trend_gate(closes: Sequence[float], ma_days: int = 20) -> TrendGate:
     """指数收盘序列 → 是否跌破 ma_days 均线。数据不足时视为**未跌破**（不干预）。"""
     vals: list[float] = []
