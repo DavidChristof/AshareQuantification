@@ -31,6 +31,27 @@ def _valid_price(price) -> bool:
     except (TypeError, ValueError):
         return False
 
+def trade_date(d: date | None = None) -> str:
+    """成交/记账/净值点用的「今天」——**日历日期**，不是行情数据的最后一天。
+
+    ## 为什么必须有这个函数
+
+    行情数据是**收盘后**才刷新的（config `auto_refresh.update_time: 15:30`），所以
+    「信号表最后一天」在盘中、盘前都还停在**上一个交易日**。早期代码用
+    `str(sig.index[-1].date())` 当成交日期，于是：
+
+        周一盘中做的调仓 → 成交日期被记成上周五
+        → 净值的 `INSERT OR REPLACE` 还会用今天的账户状态**覆盖上周五的收盘点**
+          （2026-09-14 实际事故：09-11 的日点被写成卖出后的 75912.94，
+            而 09-11 盘中点还是卖出前的 58217.52，同一天自相矛盾）
+
+    凡是要写「这笔账发生在哪天」的地方，都必须用日历日期；行情数据的日期只代表
+    **数据覆盖到哪天**，是另一回事。相关：`docs/2026-09-14-trade-date-fix.md`。
+    """
+    return (d or date.today()).isoformat()
+
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_account (
     key   TEXT PRIMARY KEY,

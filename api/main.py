@@ -53,7 +53,8 @@ from quant.timing.engine import TimingEngine                           # noqa: E
 from quant.timing.regime import MarketRegime                           # noqa: E402
 from quant.timing.selector import explain as timing_explain            # noqa: E402
 from quant.timing.selector import select_weights                       # noqa: E402
-from quant.trading.paper import PaperBroker, _valid_price as _valid_price  # noqa: E402
+from quant.trading.paper import (PaperBroker, trade_date,             # noqa: E402
+                                 _valid_price as _valid_price)
 from quant.trading.real_account import RealBroker                      # noqa: E402
 from quant.trading import fill as fill_mod                             # noqa: E402
 from quant.trading.real_advice import AdviceInput, plan_real_portfolio  # noqa: E402
@@ -935,16 +936,16 @@ def _apply_manual_stops(_live: dict | None = None) -> list:
     risk = _risk_config()
     if not risk.get("enabled", True):
         return []
-    dates = [sig.index[-1].date() for sig in SIGNALS.values() if not sig.empty]
-    if not dates:
-        return []
     close_prices = {s: float(sig["close"].iloc[-1])
                     for s, sig in SIGNALS.items()
                     if sig is not None and not sig.empty}
+    if not close_prices:
+        return []
     live_prices = {**close_prices, **(_live or {})}       # 实时价缺的用最近收盘补
     vol_map = _build_vol_map(risk)
     vol_cfg = _build_vol_cfg(risk) if vol_map else None
-    maxd = str(max(dates))
+    # 止盈/止损卖出的**成交日期用日历日期**（不能用信号表最后一天，否则周一记成上周五）
+    maxd = trade_date()
     out = []
     # 1) 止盈（盘中·实时价）：保守锁盈，冲到目标就卖
     out += MANUAL_BROKER.apply_stop_rules(
@@ -988,15 +989,14 @@ def _sync_manual_equity():
                 return
             MANUAL_BROKER.snapshot_equity(stamp, _live_prices())
             return
-        # 非交易时段：对齐最新交易日（日线收盘点）
-        dates = [sig.index[-1] for sig in SIGNALS.values() if not sig.empty]
-        if not dates:
-            return
-        latest = max(dates).date()
-        if hist and str(hist[-1]["date"]) >= str(latest):
-            return
+        # 非交易时段：把日点对齐到**最新交易日**（「收盘点」属于交易日，不是日历上的「今天」）
+        latest = _latest_data_date()
         prices = {s: float(sig.iloc[-1]["close"]) for s, sig in SIGNALS.items() if not sig.empty}
-        MANUAL_BROKER.snapshot_equity(str(latest), prices)
+        if not prices:
+            return
+        if hist and str(hist[-1]["date"]) >= latest:
+            return
+        MANUAL_BROKER.snapshot_equity(latest, prices)
     except Exception:  # noqa: BLE001
         logger.exception("手动盘净值同步失败")
 
@@ -1150,7 +1150,8 @@ def manual_order(order: OrderRequest):
         raise HTTPException(500, "该股票历史数据不足，无法判断涨跌停")
     price = float(sig.iloc[-1]["close"])
     prev_close = float(sig.iloc[-2]["close"])
-    today = str(sig.index[-1].date())
+    # 记账日期 = 日历日期（同上；本函数开头已要求 _in_trading_hours()）
+    today = trade_date()
 
     # 涨跌停校验：一字涨停买不进、一字跌停卖不出（30/68 开头为创业板/科创板 ±20%）
     from quant.trading.rules import limit_prices
@@ -1832,13 +1833,12 @@ def portfolio_apply(force_open_ref: bool = False):
         refs = _open_ref_prices(all_syms, prev_close)
         if refs:
             prices = {**prices, **refs}
-    today = None
-    for s in all_syms:
-        sig = SIGNALS.get(s)
-        if sig is not None and not sig.empty:
-            today = today or str(sig.index[-1].date())
-    if today is None:
-        today = (SELECTION_RESULT or {}).get("date") or datetime.now().strftime("%Y-%m-%d")
+    # 成交日期 = **日历日期**，不能取信号表最后一天。
+    # 行情数据收盘后才刷新（auto_refresh.update_time 15:30），盘中/盘前信号表还停在
+    # 上一个交易日 ⇒ 会把今天的成交记成上周五，并让下面的 snapshot_equity 用今天的
+    # 账户状态覆盖上周五的收盘点（2026-09-14 实际事故，见 docs/2026-09-14-trade-date-fix.md）。
+    # 本函数开头已要求 _in_trading_hours()，所以「今天」必然是交易日。
+    today = trade_date()
     if not prices:
         raise HTTPException(500, "无行情数据")
 
@@ -1995,15 +1995,23 @@ def _fnum(v, default: float = 0.0) -> float:
     return f if f == f and abs(f) != float("inf") else default
 
 
-def _signal_date() -> str:
-    """最新信号日期（与手动盘同口径：以 SIGNALS 最后一天为「今天」）。"""
+def _latest_data_date() -> str:
+    """**行情数据覆盖到哪一天**（信号表里最后一个交易日）。
+
+    ⚠️ **不要拿它当「今天」用** —— 数据是收盘后才刷新的（`auto_refresh.update_time` 15:30），
+    所以盘中/盘前这个值还停在**上一个交易日**。它只适用于「把净值日点对齐到交易日」
+    这类**市场日期**场景；凡是记账、成交、T+1 判断，一律用 `trade_date()`。
+
+    2026-09-14 事故：全项目普遍把它当"今天"，导致周一盘中做的调仓被记成上周五，
+    并把上周五的收盘净值点用今天的账户状态覆盖掉。见 docs/2026-09-14-trade-date-fix.md。
+    """
     for sig in SIGNALS.values():
         try:
             if sig is not None and len(sig):
                 return str(sig.index[-1].date())
         except Exception:  # noqa: BLE001
             continue
-    return datetime.now().strftime("%Y-%m-%d")
+    return trade_date()
 
 
 def _session_started() -> bool:
@@ -2209,7 +2217,7 @@ def _real_risk_and_sells(prices: dict) -> tuple[dict, dict, dict]:
 
 
 def _real_positions_payload(prices: dict, lines: dict | None = None) -> list[dict]:
-    d = _signal_date()
+    d = trade_date()
     lines = lines or {}
     out = []
     for p in REAL_BROKER.query_positions():
@@ -2259,7 +2267,7 @@ def _sync_real_equity():
             REAL_BROKER.snapshot_equity(datetime.now().strftime("%Y-%m-%d %H:00"),
                                         _real_prices(held))
             return
-        latest = _signal_date()
+        latest = _latest_data_date()          # 日点属于交易日，用市场日期
         if hist and str(hist[-1]["date"]) >= latest:
             return
         REAL_BROKER.snapshot_equity(latest, _real_prices(held))
@@ -2328,7 +2336,7 @@ def _real_advice_payload() -> dict:
     inp = AdviceInput(
         rows=rows, cash=REAL_BROKER.query_cash(),
         positions=[{"symbol": p.symbol, "shares": p.shares, "avg_cost": p.avg_cost,
-                    "sellable": REAL_BROKER.sellable_shares(p.symbol, _signal_date())}
+                    "sellable": REAL_BROKER.sellable_shares(p.symbol, trade_date())}
                    for p in positions],
         prices=prices, prev_closes=prev, quotes=quotes,
         risk_lines=lines, guards=guards, entry_gate=entry,
@@ -2369,7 +2377,7 @@ def _real_advice_payload() -> dict:
     plan["market_gate"] = _market_trend_gate()
     plan["market"] = {**_market_status_now(), "weak": bool(_market_weakness().get("weak"))}
     plan["session"] = session
-    plan["date"] = _signal_date()
+    plan["date"] = trade_date()
     plan["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     plan["fees"] = _real_fees_info()
     plan["trading_hours"] = _in_trading_hours("real")
@@ -2425,7 +2433,7 @@ def real_check(symbol: str, side: str, shares: float = 100, price: float | None 
     pc = _fnum((q or {}).get("prev_close")) or _prev_closes([symbol]).get(symbol)
     pos = next((p for p in REAL_BROKER.query_positions() if p.symbol == symbol), None)
     held = pos.shares if pos else 0.0
-    sellable = REAL_BROKER.sellable_shares(symbol, _signal_date()) if pos else 0.0
+    sellable = REAL_BROKER.sellable_shares(symbol, trade_date()) if pos else 0.0
     ref = price if (price and price > 0) else None
     cost = pos.avg_cost if pos else None
     if side == "buy":
@@ -2464,7 +2472,7 @@ def real_order(order: RealOrderRequest):
     """
     if order.side not in ("buy", "sell"):
         raise HTTPException(400, "side 必须是 buy 或 sell")
-    date = (order.date or "").strip() or _signal_date()
+    date = (order.date or "").strip() or trade_date()
     _d = datetime.strptime(date, "%Y-%m-%d")                 # 格式校验
     max_sh = int(_REAL_CFG.get("max_order_shares", 2000) or 0)
 
