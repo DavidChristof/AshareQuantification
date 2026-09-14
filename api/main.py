@@ -296,8 +296,9 @@ def _scheduler():
         _run_auto_update()
 
 
-# 启动后台调度线程（daemon，随主进程退出）
-threading.Thread(target=_scheduler, daemon=True).start()
+# 后台调度线程在**文件末尾统一启动**，不在这里 —— 见文末「后台线程统一启动」。
+# 原因：在定义处启动会让 worker 在**模块 import 途中**就跑起来，此时文件后面定义的
+# 函数尚未绑定 → 实测踩到 `portfolio_apply` NameError（2026-09-14，见 docs）。
 
 
 def _auto_open_execute_worker():
@@ -332,23 +333,33 @@ def _auto_open_execute_worker():
             if marker.exists() \
                     and marker.read_text(encoding="utf-8").strip() == today.isoformat():
                 return                                    # 本日已自动执行过
+            # ⚠️ marker 只在**确认处理过**时才写。原来无条件写在 try 之外，
+            #    导致调仓抛异常（什么都没执行）也会被标记为「本日已跑」→ 当日永久跳过。
+            #    2026-09-14 实际事故即如此（NameError 被吞 + marker 照写）。
+            handled = False
             try:
                 logger.info("[auto-open] 触发自动组合调仓（开盘参考价成交）...")
                 summary = portfolio_apply(force_open_ref=True)
                 logger.info("[auto-open] 完成: %s", summary)
+                handled = True
             except HTTPException as exc:
+                # 业务性跳过（非交易日/非交易时段/已调仓等）：算已处理，不重试
                 logger.info("[auto-open] 跳过（%s）", exc.detail)
+                handled = True
             except Exception as exc:  # noqa: BLE001
-                logger.error("[auto-open] 执行异常: %s", exc, exc_info=True)
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(today.isoformat(), encoding="utf-8")
+                logger.error("[auto-open] 执行异常（**不写 marker**，"
+                             "grace 窗口内重启可重试）: %s", exc, exc_info=True)
+            if handled:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(today.isoformat(), encoding="utf-8")
             return
     except Exception as exc:  # noqa: BLE001
         logger.error("[auto-open] worker 异常退出: %s", exc)
 
 
-# 启动「开盘自动组合调仓」线程（daemon；配置关闭时立即空转退出）
-threading.Thread(target=_auto_open_execute_worker, daemon=True).start()
+# 「开盘自动组合调仓」线程同样在**文件末尾**启动（配置关闭时立即空转退出）。
+# ⚠️ 这个 worker 尤其不能提前启动：它的触发条件是「现在已过 09:31 且在 grace 窗口内」，
+#    若服务恰在 09:31~09:56 之间启动，它会在 import 途中立刻调用 portfolio_apply → NameError。
 
 
 # ============ 收盘后：自动维护 600 池 + 影子 A/B（scripts 26→27→28） ============
@@ -502,8 +513,7 @@ def _shadow_ab_worker():
             pass
 
 
-# 启动「收盘后自动维护 600 池」线程（daemon；配置关 / 非交易日 / 错过窗口则当日不跑）
-threading.Thread(target=_shadow_ab_worker, daemon=True).start()
+# 「收盘后自动维护 600 池」线程同样在**文件末尾**启动（配置关 / 非交易日 / 错过窗口则当日不跑）。
 
 
 @app.get("/")
@@ -2529,6 +2539,18 @@ def real_trade_delete(trade_id: int):
         raise HTTPException(404, f"流水 {trade_id} 不存在")
     rebuilt = REAL_BROKER.rebuild_from_trades()
     return {"ok": True, "removed": trade_id, "rebuilt": rebuilt}
+
+
+# ============================================================================
+# 后台线程统一启动（必须在文件**最后**，保证所有函数都已绑定）
+# ============================================================================
+# 三个 daemon 线程原来各自紧跟在定义处启动，导致「import 到一半线程就开始跑」的竞态：
+# worker 触发时若引用了**后面才定义**的函数，就会 NameError 并被 except 吞掉。
+# 2026-09-14 实际事故：服务在 09:31~09:56 之间启动 → auto-open worker 抢跑 →
+# `portfolio_apply`(定义在 1791 行) 尚未绑定 → 当日开盘调仓静默失败。
+threading.Thread(target=_scheduler, daemon=True).start()
+threading.Thread(target=_auto_open_execute_worker, daemon=True).start()
+threading.Thread(target=_shadow_ab_worker, daemon=True).start()
 
 
 if __name__ == "__main__":
