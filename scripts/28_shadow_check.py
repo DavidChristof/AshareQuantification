@@ -88,7 +88,11 @@ def main():
         "600>40(ICIR)": i60 > i40,
     }
     for k, v in checks.items():
-        print(f"      [{('✓' if v else '✗')}] {k}", flush=True)
+        # ⚠️ 只能用 ASCII：本机控制台是 GBK，'✓'(U+2713)/'✗'(U+2717) 不在 GBK 里，
+        #    print 会抛 UnicodeEncodeError —— 而这里恰好挡在 STABLE/NOT_YET 判定**之前**，
+        #    于是「结论永远打不出来」。2026-09-15 实测就是这样：GBK 下 28 崩在检查表，
+        #    兜底定时任务因此看不到 STABLE/NOT_YET。中文本身在 GBK 内，无需改。
+        print(f"      [{'OK' if v else '--'}] {k}", flush=True)
     stable = all(checks.values())
     if stable:
         print("\nSTABLE：600 池模型已在真正前向 OOS 稳压（>线上40）。→ 提醒用户：可以上线新版600池了。", flush=True)
