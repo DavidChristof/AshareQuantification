@@ -88,10 +88,11 @@ def main():
         "600>40(ICIR)": i60 > i40,
     }
     for k, v in checks.items():
-        # ⚠️ 只能用 ASCII：本机控制台是 GBK，'✓'(U+2713)/'✗'(U+2717) 不在 GBK 里，
-        #    print 会抛 UnicodeEncodeError —— 而这里恰好挡在 STABLE/NOT_YET 判定**之前**，
-        #    于是「结论永远打不出来」。2026-09-15 实测就是这样：GBK 下 28 崩在检查表，
-        #    兜底定时任务因此看不到 STABLE/NOT_YET。中文本身在 GBK 内，无需改。
+        # 只能用 ASCII：本机控制台是 GBK，checkmark(码位 U+2713) 和 ballot-X(U+2717)
+        # 都不在 GBK 里，print 会抛 UnicodeEncodeError —— 而这里恰好挡在 STABLE/NOT_YET
+        # 判定**之前**，于是「结论永远打不出来」。2026-09-15 实测就是这样：
+        # GBK 下 28 崩在检查表，兜底定时任务因此看不到 STABLE/NOT_YET。
+        # 中文本身在 GBK 内，无需改。（此处刻意不写那两个字符本身，见 docs 同名说明。）
         print(f"      [{'OK' if v else '--'}] {k}", flush=True)
     stable = all(checks.values())
     if stable:

@@ -56,7 +56,7 @@ def test_disclosure_date_known():
 def test_decumulate_single_quarter():
     fin = prepare_financials(_raw())
     got = dict(zip(fin["report_date"].dt.strftime("%Y-%m-%d"), fin["eps_q"]))
-    # 累计 1.0 → 2.5 → 4.0 → 5.0 ⇒ 单季 1.0 → 1.5 → 1.5 → 1.0
+    # 累计 1.0 → 2.5 → 4.0 → 5.0 => 单季 1.0 → 1.5 → 1.5 → 1.0
     assert got["2020-03-31"] == 1.0
     assert got["2020-06-30"] == 1.5
     assert got["2020-09-30"] == 1.5
@@ -95,10 +95,10 @@ def test_ttm_needs_four_quarters():
     d = _dates("2020-01-01", "2022-06-30")
     panel = ttm_panel(fin, "eps_q", d, ["600000"])
     s = panel["600000"]
-    # 2020-12-31 的报告要到 2021-04-30 才可见 ⇒ 之前只有 3 个单季，凑不满 TTM
+    # 2020-12-31 的报告要到 2021-04-30 才可见 => 之前只有 3 个单季，凑不满 TTM
     assert np.isnan(s.loc["2021-01-15"])
     assert np.isnan(s.loc["2021-04-29"])
-    # 2021-04-30 起年报可见（当天一季报也同时可见，取最新）⇒ TTM = 1.5+1.5+1.0+1.2 = 5.2
+    # 2021-04-30 起年报可见（当天一季报也同时可见，取最新）=> TTM = 1.5+1.5+1.0+1.2 = 5.2
     assert abs(s.loc["2021-04-30"] - 5.2) < 1e-9
     # 2021-08-31 起 H1 可见，TTM = 1.5+1.0+1.2+1.6 = 5.3
     assert abs(s.loc["2021-08-31"] - 5.3) < 1e-9
@@ -150,7 +150,7 @@ def test_pit_pe_roe_panels_shapes_and_pe_sign():
     # 所以 2021-04-29 连 2020 年报都看不到 → 只剩 3 个季度 → TTM 不可算 → PE 为 NaN。
     assert pd.isna(pe["600000"].loc["2021-04-29"]), "年报在 4/30 之前不该可见"
     # 2021-04-30 当天：年报与一季报**同时**可见，取最新（一季报）
-    # ⇒ TTM = 1.5+1.5+1.0+1.2 = 5.2
+    # => TTM = 1.5+1.5+1.0+1.2 = 5.2
     px = close["600000"].loc["2021-04-30"]
     assert abs(pe["600000"].loc["2021-04-30"] - px / 5.2) < 1e-6
     # 次一个可见日（2021-08-31 中报）之后 TTM 换成 1.5+1.0+1.2+1.6 = 5.3

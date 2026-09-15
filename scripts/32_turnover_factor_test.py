@@ -55,7 +55,7 @@ def load_panels(db: Path
                 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """老的 559 池 → (close, volume, turnover, 流通股本)。
 
-    [!]️ 该池有**严重幸存者偏差**（见 docs/2026-09-11-survivorship-bias.md），
+    [!] 该池有**严重幸存者偏差**（见 docs/2026-09-11-survivorship-bias.md），
     结果只能作同池相对比较；要看真实水平请用 `--universe pit`。
     """
     con = sqlite3.connect(str(db))

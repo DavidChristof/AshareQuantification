@@ -1,6 +1,6 @@
 """PyTorch Dataset 与「按时间顺序」切分工具。
 
-⚠️ 时间序列切分不能用 sklearn 的随机 train_test_split！
+[!] 时间序列切分不能用 sklearn 的随机 train_test_split！
     随机打乱会破坏时间依赖，且模型会"看到"未来数据（信息泄漏）。
 """
 from __future__ import annotations

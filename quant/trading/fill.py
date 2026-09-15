@@ -374,7 +374,7 @@ def assess_buy(symbol: str, *, quote: Mapping | None, cfg: FillConfig, cash: flo
         near = "一字涨停（卖一无挂单），排队买入成交概率极低" if ask_q <= 0 \
             else "涨停价附近，封单量大时排队难成交"
         reasons.append(f"涨停封板：现价 {price:.2f} = 涨停价 {limit_up:.2f}，{near}；"
-                       f"建议等开板或回落到 ¥{tick_round(limit_up * 0.98, 'buy'):.2f} 下方再看")
+                       f"建议等开板或回落到 ￥{tick_round(limit_up * 0.98, 'buy'):.2f} 下方再看")
         status = _worse(status, HARD)
         limit_locked = True
     elif limit_up and price >= limit_up * (1 - cfg.near_limit_pct / 100):
@@ -392,20 +392,20 @@ def assess_buy(symbol: str, *, quote: Mapping | None, cfg: FillConfig, cash: flo
         tol *= 2.0                        # 开盘跳空宽限
     if drift is not None:
         if drift > cfg.miss_tol_pct:
-            reasons.append(f"已错过建议价：现价较参考价 ¥{_num(ref):.2f} 已涨 {drift:.2f}%"
+            reasons.append(f"已错过建议价：现价较参考价 ￥{_num(ref):.2f} 已涨 {drift:.2f}%"
                            f"（> {cfg.miss_tol_pct:.1f}%），追价风险高 —— 等回落到 "
-                           f"¥{tick_round(_num(ref) * (1 + cfg.drift_tol_pct / 100), 'buy'):.2f} 附近再看")
+                           f"￥{tick_round(_num(ref) * (1 + cfg.drift_tol_pct / 100), 'buy'):.2f} 附近再看")
             if not limit_locked:                 # 已封板时结论以「难成交(封板)」为准
                 status = _worse(status, MISSED)
         elif drift > tol:
-            reasons.append(f"现价较参考价上浮 {drift:.2f}%，需按 ¥{suggested:.2f} 改价方能成交")
+            reasons.append(f"现价较参考价上浮 {drift:.2f}%，需按 ￥{suggested:.2f} 改价方能成交")
             status = _worse(status, HARD)
         elif drift < -cfg.miss_tol_pct:
             reasons.append(f"现价较参考价下跌 {abs(drift):.2f}%（急跌），暂缓买入（接飞刀）")
             if not limit_locked:
                 status = _worse(status, MISSED)
         elif drift < -tol:
-            reasons.append(f"现价较参考价下浮 {abs(drift):.2f}%，可等企稳再按 ¥{suggested:.2f} 委托")
+            reasons.append(f"现价较参考价下浮 {abs(drift):.2f}%，可等企稳再按 ￥{suggested:.2f} 委托")
             status = _worse(status, LIKELY)
 
     # 当日已触及区间
@@ -415,10 +415,10 @@ def assess_buy(symbol: str, *, quote: Mapping | None, cfg: FillConfig, cash: flo
         edge = high * (1 + cfg.touch_tol_pct / 100)
         if suggested <= edge:
             touched_flag = True
-            reasons.append(f"委托价 ¥{suggested:.2f} 落在今日区间 [{low:.2f}, {high:.2f}] 内，可成交")
+            reasons.append(f"委托价 ￥{suggested:.2f} 落在今日区间 [{low:.2f}, {high:.2f}] 内，可成交")
         else:
             touched_flag = False
-            reasons.append(f"委托价 ¥{suggested:.2f} 高于今日最高价 ¥{high:.2f}，"
+            reasons.append(f"委托价 ￥{suggested:.2f} 高于今日最高价 ￥{high:.2f}，"
                            "需价格上抬才可能成交")
             status = _worse(status, HARD)
     else:
@@ -444,9 +444,9 @@ def assess_buy(symbol: str, *, quote: Mapping | None, cfg: FillConfig, cash: flo
             status = _worse(status, BLOCKED)
         need = buy_fees(sh * (suggested or price), cfg)["cash_needed"]
         if need > _num(cash) + 1e-6:
-            reasons.append(f"资金不足：{sh:.0f} 股按 ¥{suggested:.2f} 需 ¥{need:.2f}"
-                           f"（含费 ¥{buy_fees(sh * suggested, cfg)['fee']:.2f}），"
-                           f"可用 ¥{_num(cash):.2f}")
+            reasons.append(f"资金不足：{sh:.0f} 股按 ￥{suggested:.2f} 需 ￥{need:.2f}"
+                           f"（含费 ￥{buy_fees(sh * suggested, cfg)['fee']:.2f}），"
+                           f"可用 ￥{_num(cash):.2f}")
             status = _worse(status, BLOCKED)
         if symbol.startswith("68") and sh < 200:
             warnings.append("科创板买入须 ≥200 股（本账户按 100 股整手记账，实盘请以券商为准）")
@@ -456,14 +456,14 @@ def assess_buy(symbol: str, *, quote: Mapping | None, cfg: FillConfig, cash: flo
         be = (breakeven_price(suggested, sh, cfg) / suggested - 1.0) * 100
         if be > cfg.max_breakeven_pct:
             rt = buy_fees(sh * suggested, cfg)["fee"] + sell_fees(sh * suggested, cfg)["fee"]
-            reasons.append(f"费用占比过高：本单往返费用约 ¥{rt:.2f}"
-                           f"（佣金最低 ¥{cfg.min_commission:.2f} 起），需涨 {be:.2f}% 才回本")
+            reasons.append(f"费用占比过高：本单往返费用约 ￥{rt:.2f}"
+                           f"（佣金最低 ￥{cfg.min_commission:.2f} 起），需涨 {be:.2f}% 才回本")
         if suggested * sh < cfg.min_order_amount:
-            reasons.append(f"单笔金额 ¥{suggested * sh:.0f} 低于 ¥{cfg.min_order_amount:.0f}，"
+            reasons.append(f"单笔金额 ￥{suggested * sh:.0f} 低于 ￥{cfg.min_order_amount:.0f}，"
                            "费用摊薄后不划算")
 
     if status == FILLABLE and not reasons:
-        reasons.append(f"现价 {price:.2f}，盘口有量，按 ¥{suggested:.2f} 委托可成交")
+        reasons.append(f"现价 {price:.2f}，盘口有量，按 ￥{suggested:.2f} 委托可成交")
     return _mk("buy", symbol, status, reasons, warnings, suggested, price, ref,
                limit_up, limit_down, sh, cfg, touched_flag, depth_ok)
 
@@ -534,9 +534,9 @@ def assess_sell(symbol: str, *, quote: Mapping | None, cfg: FillConfig,
     if ref and reason:
         drift = _drift(price, ref)
         if drift is not None and abs(drift) > cfg.drift_tol_pct:
-            reasons.append(f"{reason}触发价 ¥{_num(ref):.2f}，现价 ¥{price:.2f}"
+            reasons.append(f"{reason}触发价 ￥{_num(ref):.2f}，现价 ￥{price:.2f}"
                            f"（偏离 {drift:+.2f}%）—— 触发瞬间的价格已过去，"
-                           f"按 ¥{suggested:.2f} 委托或等反抽")
+                           f"按 ￥{suggested:.2f} 委托或等反抽")
             if not limit_locked:              # 已跌停封板时不降级为「已错过」
                 status = _worse(status, MISSED if abs(drift) > cfg.miss_tol_pct else HARD)
 
@@ -548,7 +548,7 @@ def assess_sell(symbol: str, *, quote: Mapping | None, cfg: FillConfig,
             touched_flag = True
         else:
             touched_flag = False
-            reasons.append(f"委托价 ¥{suggested:.2f} 低于今日最低价 ¥{low:.2f}，"
+            reasons.append(f"委托价 ￥{suggested:.2f} 低于今日最低价 ￥{low:.2f}，"
                            "需价格下探才可能成交")
             status = _worse(status, HARD)
     else:
@@ -565,8 +565,8 @@ def assess_sell(symbol: str, *, quote: Mapping | None, cfg: FillConfig,
 
     if status == FILLABLE and not reasons:
         net = sell_fees(sh * suggested, cfg)["net"] if sh > 0 else 0.0
-        reasons.append(f"现价 {price:.2f}，按 ¥{suggested:.2f}（买一价）卖出可成交，"
-                       f"净收入约 ¥{net:.2f}")
+        reasons.append(f"现价 {price:.2f}，按 ￥{suggested:.2f}（买一价）卖出可成交，"
+                       f"净收入约 ￥{net:.2f}")
     return _mk("sell", symbol, status, reasons, warnings, suggested, price, ref,
                limit_up, limit_down, sh, cfg, touched_flag, depth_ok,
                note=("含费真实盈亏需按实际成本核算" if cost is None else ""))

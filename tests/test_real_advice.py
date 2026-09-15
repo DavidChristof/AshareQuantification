@@ -1,4 +1,4 @@
-"""实盘建议引擎（¥3000：2 仓位 / 1 手优先 / 含费可负担）单元测试。
+"""实盘建议引擎（￥3000：2 仓位 / 1 手优先 / 含费可负担）单元测试。
 
 纯函数测试：无网络、无账本 —— `plan_real_portfolio` 结构上就无法下单。
 
@@ -34,9 +34,9 @@ def _row(code, price, score=90.0):
 
 def test_capacity_band_for_3000():
     cap = capacity_band(3000.0, REAL_CFG, FC)
-    # 2 仓位 × 100 股 → 每股上限 ≈ ¥14.2
+    # 2 仓位 × 100 股 → 每股上限 ≈ ￥14.2
     assert 14.0 < cap["price_ceiling"] <= 14.25, cap
-    # 价格下限由「回本涨幅 ≤1.5%」和「单笔 ≥ ¥500」共同决定 → 约 ¥6.5–7.5
+    # 价格下限由「回本涨幅 ≤1.5%」和「单笔 ≥ ￥500」共同决定 → 约 ￥6.5–7.5
     assert 6.0 < cap["price_floor"] < 7.5, cap
     assert cap["price_floor"] < cap["price_ceiling"]
     assert cap["per_slot"] == 1425.0 and cap["max_positions"] == 2
@@ -55,13 +55,13 @@ def test_slots_zero_when_two_positions_held():
 
 
 def test_one_lot_first_then_second_when_affordable():
-    # ¥7.2：2 手 = ¥1440 ≤ 单票上限 ¥1500 → 2 手
+    # ￥7.2：2 手 = ￥1440 ≤ 单票上限 ￥1500 → 2 手
     inp = AdviceInput(rows=[_row("600160", 7.2)], cash=3000.0, prices={"600160": 7.2},
                       prev_closes={"600160": 7.2}, quotes={"600160": _q(7.2)},
                       cfg=REAL_CFG, fill_cfg=FC)
     out = plan_real_portfolio(inp)
     assert len(out["buy"]) == 1 and out["buy"][0]["est_shares"] == 200.0
-    # ¥10：2 手 ¥2000 > 上限 → 只买 1 手
+    # ￥10：2 手 ￥2000 > 上限 → 只买 1 手
     inp2 = AdviceInput(rows=[_row("600160", 10.0)], cash=3000.0, prices={"600160": 10.0},
                        prev_closes={"600160": 10.0}, quotes={"600160": _q(10.0)},
                        cfg=REAL_CFG, fill_cfg=FC)
@@ -70,8 +70,8 @@ def test_one_lot_first_then_second_when_affordable():
 
 
 def test_above_price_ceiling_skipped():
-    # 已有 1 只持仓（现金 ¥1500 + 持仓 ¥1000 → 权益 ¥2500，单票上限 ¥1250）：
-    # ¥20 一手需 ~¥2005 > 上限 → 跳过（且因已持仓，不会触发「单只放宽」例外）
+    # 已有 1 只持仓（现金 ￥1500 + 持仓 ￥1000 → 权益 ￥2500，单票上限 ￥1250）：
+    # ￥20 一手需 ~￥2005 > 上限 → 跳过（且因已持仓，不会触发「单只放宽」例外）
     inp = AdviceInput(rows=[_row("600519", 20.0)], cash=1500.0,
                       prices={"600519": 20.0, "600160": 10.0},
                       positions=[{"symbol": "600160", "shares": 100,
@@ -84,7 +84,7 @@ def test_above_price_ceiling_skipped():
 
 
 def test_single_position_exception_when_nothing_else_affordable():
-    # 空仓 + 只有 ¥20 的票：2 仓位政策下配不齐，放宽到单只 90% 买 1 手（并注明例外）
+    # 空仓 + 只有 ￥20 的票：2 仓位政策下配不齐，放宽到单只 90% 买 1 手（并注明例外）
     inp = AdviceInput(rows=[_row("600519", 20.0)], cash=3000.0, prices={"600519": 20.0},
                       prev_closes={"600519": 20.0}, quotes={"600519": _q(20.0)},
                       cfg=REAL_CFG, fill_cfg=FC)
@@ -94,7 +94,7 @@ def test_single_position_exception_when_nothing_else_affordable():
 
 
 def test_uneconomic_low_price_skipped():
-    # ¥3 一手：往返费用占比 ≈3.4% > 1.5% → 不经济
+    # ￥3 一手：往返费用占比 ≈3.4% > 1.5% → 不经济
     inp = AdviceInput(rows=[_row("000001", 3.0)], cash=3000.0, prices={"000001": 3.0},
                       prev_closes={"000001": 3.0}, quotes={"000001": _q(3.0)},
                       cfg=REAL_CFG, fill_cfg=FC)
@@ -203,7 +203,7 @@ def test_market_gate_blocks_new_buys():
 
 def test_shipped_config_gate_filters_inefficient_orders():
     """仓库 config 的 max_breakeven_pct（2026-09-11 由 1.5 收紧到 1.2）：
-    ¥9.9 一手（名义 ¥990，费用≈1.06%）可过；¥7 一手（名义 ¥700，费用≈1.45%）被费用闸门滤掉。
+    ￥9.9 一手（名义 ￥990，费用≈1.06%）可过；￥7 一手（名义 ￥700，费用≈1.45%）被费用闸门滤掉。
     """
     from quant.config import load_config
     from quant.trading.fill import breakeven_pct

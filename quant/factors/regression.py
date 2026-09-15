@@ -13,8 +13,8 @@
    - 优点：允许系数随时间变化，t 统计量天然反映时变稳定性
 
 2. 面板 Pooling OLS（合并所有日期×股票）：
-   - 把所有观测合并成一个长表做一次 OLS，看整体拟合优度 R² 和系数显著性
-   - 优点：样本量大、给出 R²（因子集整体解释力）
+   - 把所有观测合并成一个长表做一次 OLS，看整体拟合优度 R^2 和系数显著性
+   - 优点：样本量大、给出 R^2（因子集整体解释力）
 
 注意：本模块与 IC 检验一样用「因子值(t) vs 未来收益(t+h)」评估预测力，
 是因子检验的学术标准做法（非回测交易）。
@@ -67,7 +67,7 @@ def drop_collinear(factor_panel: dict[str, pd.DataFrame],
 
 # ---------- OLS 基础 ----------
 def _ols(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float, float]:
-    """最小二乘回归（带截距）。返回 (betas, R², SSE)。"""
+    """最小二乘回归（带截距）。返回 (betas, R^2, SSE)。"""
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float).ravel()
     betas, *_ = np.linalg.lstsq(X, y, rcond=None)
@@ -88,7 +88,7 @@ def _normal_pvalue(t: float) -> float:
 # ---------- Fama-MacBeth ----------
 def _cross_sectional_fit(factor_panel: dict[str, pd.DataFrame], ret_panel: pd.DataFrame,
                          date, factor_names: list[str]) -> tuple[np.ndarray | None, float]:
-    """单日横截面回归：y(未来收益) ~ 各因子 + 截距。返回 (betas, R²) 或 (None, 0)。"""
+    """单日横截面回归：y(未来收益) ~ 各因子 + 截距。返回 (betas, R^2) 或 (None, 0)。"""
     cols = {"ret": ret_panel.loc[date]}
     for name in factor_names:
         if date in factor_panel[name].index:
@@ -128,7 +128,7 @@ def fama_macbeth(data: dict, horizon: int = 5,
     factor_names, dropped = drop_collinear(factor_panel, factor_names)
     ret_panel = forward_returns(close_panel, horizon)
 
-    # 第一步：逐截面日期回归，收集 β_t 序列 + R²_t 序列
+    # 第一步：逐截面日期回归，收集 β_t 序列 + R^2_t 序列
     beta_rows, r2_rows, dates = [], [], []
     for date in ret_panel.index:
         betas, r2 = _cross_sectional_fit(factor_panel, ret_panel, date, factor_names)
@@ -210,7 +210,7 @@ def pooled_ols(data: dict, horizon: int = 5,
     n, k = X.shape
     betas, r2, sse = _ols(X, y)
 
-    # 系数标准误：se(β) = sqrt(σ² · (X'X)^{-1})，用伪逆兜底秩亏
+    # 系数标准误：se(β) = sqrt(σ^2 · (X'X)^{-1})，用伪逆兜底秩亏
     dof = n - k
     sigma2 = sse / dof if dof > 0 else 0.0
     try:

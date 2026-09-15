@@ -17,7 +17,7 @@
     weight_f = clamp(base_f * (1 + 0.5*effect_f) * (1 + strength*pref_f), min, max)
     最后归一化到权重和为 1。
 
-⚠️ 说明：这是探索性功能。小样本（40 只）下相关性有噪声，
+[!] 说明：这是探索性功能。小样本（40 只）下相关性有噪声，
 已用温和的调整幅度 + 上下限约束控制过拟合风险。
 """
 from __future__ import annotations

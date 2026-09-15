@@ -4,7 +4,7 @@
 
 `docs/2026-09-11-pit-universe.md` 的结论是：此前所有回测的**绝对水平不可信**，因为
 559 池是「用今天的成分名单回填历史」。而线上选股有 60% 权重压在 PE/ROE 上，其历史
-时点值此前拿不到 ⇒ **线上策略从来没被严格回测过**。
+时点值此前拿不到 => **线上策略从来没被严格回测过**。
 
 前两步补齐了材料：PIT 无偏宇宙（`quant/data/universe_pit.py`）+ 时点 PE/ROE
 （`quant/data/fundamentals.py`，已在 `docs/2026-09-12-fundamentals-pit.md` 校验）。
@@ -26,9 +26,9 @@
 | `_score_tech` 4 因子归一 + 权重 | 同 | |
 | `fetch_market_regime` 沪深300 日线 | 同（`MarketRegime(20,20)`） | 用 `close<=d` 切片，无未来函数 |
 | `total = fund*0.6 + tech*0.4` | 同 | |
-| **`tech is None` → `total = fund_score`** | 同（变体 A） | ⚠️ 这是线上代码的**真实行为**，见下 |
+| **`tech is None` → `total = fund_score`** | 同（变体 A） | [!] 这是线上代码的**真实行为**，见下 |
 
-## ⚠️ 复刻中发现的一处线上选股缺陷（变体 A vs B）
+## [!] 复刻中发现的一处线上选股缺陷（变体 A vs B）
 
 ```python
 tech_score = _score_tech(ts, weights)
@@ -41,7 +41,7 @@ else:
 技术面只对**基本面 top 40** 计算，而排序是对**全部 ~80 只**做的。于是**排在 41~80 名的票
 （没算技术面）拿到 `total = fund_score`（0~100）**，而 top40 里的票被封顶为
 `0.6*fund + 0.4*tech <= 100`。举例：fund=83 的落选者得 83 分，而 top40 里一只
-fund=83/tech=30 的票只有 61.8 分 ⇒ **缺数据的票被系统性优待，技术面（40% 权重）大半被架空**。
+fund=83/tech=30 的票只有 61.8 分 => **缺数据的票被系统性优待，技术面（40% 权重）大半被架空**。
 
 变体 A 如实复刻该行为，变体 B 把缺失技术面按 0 处理（`total = fund*0.6`）以量化其代价。
 

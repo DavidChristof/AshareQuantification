@@ -95,7 +95,7 @@ class PaperBroker(Broker):
         self.stamp_tax = stamp_tax      # 印花税（卖出单边，A股 0.05%）
         self.lot_size = lot_size        # 整手限制：>1 时买入必须是其整数倍（A股 100 股）
         # 最低佣金/过户费：默认 0 → 与旧行为完全一致（既有账户/回测逐字节不变）；
-        # 实盘账户用真实口径（单笔最低 ¥5、过户费 0.001%）。
+        # 实盘账户用真实口径（单笔最低 ￥5、过户费 0.001%）。
         self.min_commission = float(min_commission or 0.0)
         self.transfer_fee = float(transfer_fee or 0.0)
         self._initial_capital = initial_capital
@@ -404,7 +404,7 @@ class PaperBroker(Broker):
     def equity_history(self) -> list[dict]:
         """净值点序列，按**时间先后**排序（同日：盘中点在先，日点在最后）。
 
-        ⚠️ 不能只写 `ORDER BY date`：date 列混存两种格式 ——
+        [!] 不能只写 `ORDER BY date`：date 列混存两种格式 ——
         `'YYYY-MM-DD'`（日点/收盘点）与 `'YYYY-MM-DD HH:00'`（盘中小时点）。
         字符串比较 `'2026-09-11' < '2026-09-11 09:00'`，会让**当日日点排到当日
         09:00 之前**，净值曲线上表现为「收盘点画在开盘点前面、同一天来回跳」。

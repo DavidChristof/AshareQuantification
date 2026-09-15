@@ -22,7 +22,7 @@ print(f"\n候选宇宙={args.universe} · 耗时 {time.time() - t0:.1f}s · 选�
 print(f"{'#':<3}{'代码':<8}{'名称':<10}{'综合':>7}{'基本面':>7}{'技术':>7}"
       f"{'动量20':>8}{'反转60':>8}{'波动':>7}{'PE':>6}{'ROE':>6}  池")
 for i, r in enumerate(rows, 1):
-    tag = "✓" if r["in_universe"] else "-"
+    tag = "OK" if r["in_universe"] else "-"
     print(f"{i:<3}{r['code']:<8}{r['name'][:9]:<10}{r['total_score']:>7.1f}"
           f"{r['fund_score']:>7.1f}{(r['tech_score'] or 0):>7.1f}"
           f"{(r['mom20'] or 0):>+8.2f}{(r['rev60'] or 0):>+8.2f}"

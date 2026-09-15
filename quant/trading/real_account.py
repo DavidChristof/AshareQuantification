@@ -9,7 +9,7 @@
     - `delete_trade()` / `rebuild_from_trades()`：误录修正 —— 删掉错误流水后**全量重放**，
       cash 与持仓从流水重新推导，永远自洽（也是坏数据的修复工具）。
 
-⚠️ 本模块**不会**、也无法自动下单：没有任何券商接口，只对人工回报的成交做记账。
+[!] 本模块**不会**、也无法自动下单：没有任何券商接口，只对人工回报的成交做记账。
 """
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ class RealBroker(PaperBroker):
         return [dict(zip(keys, r)) for r in rows]
 
     def sellable_shares(self, symbol: str, date: str) -> float:
-        """T+1：可卖股数 = 持仓 − 当日买入。"""
+        """T+1：可卖股数 = 持仓 - 当日买入。"""
         with self._connect() as conn:
             pos = conn.execute(
                 "SELECT shares FROM paper_positions WHERE symbol=?", (symbol,)).fetchone()

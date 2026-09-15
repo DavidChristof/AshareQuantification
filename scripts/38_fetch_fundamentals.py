@@ -4,7 +4,7 @@
 
 `docs/2026-09-11-pit-universe.md` 末尾指出的最大未解问题：
 **线上 `select_daily` 有 60% 权重是 PE/ROE，而它俩的历史时点值此前拿不到**
-⇒ 我们一直只能用「技术面 40% 的近似」回测，再拿结果推断线上策略，这一步不成立。
+=> 我们一直只能用「技术面 40% 的近似」回测，再拿结果推断线上策略，这一步不成立。
 
 已验证可行，按报告期的季度序列可拿到（含每股收益 / 净资产收益率 / 每股净资产）。
 **数据源踩坑记录（重要，省得再走一遍）**：
@@ -15,12 +15,12 @@
 | 新浪 `stock_financial_abstract` | 1 请求/只、返回已是数值，但限速到 2.5 req/s 仍在 ~100 只后被封（`JSONDecodeError`） |
 | **同花顺** `stock_financial_abstract_ths` | **主力源**：另一个 host、返回全历史；1.5s/只（≈0.67 req/s）实测 100/100 零失败 |
 
-⇒ 现为**同花顺优先、新浪回退**。新浪系的金融数据接口对本机限速非常敏感，别用高并发打。
+=> 现为**同花顺优先、新浪回退**。新浪系的金融数据接口对本机限速非常敏感，别用高并发打。
 
-⚠️ **两个必须处理的点**：
+[!] **两个必须处理的点**：
 1. **数值是「年内累计」的**（600519 2020：Q1 11.04 → H1 19.05 → Q3 28.54 → FY 39.42）。
    直接当季度值用会错。TTM 需要先**去累计**再滚动加总（见 `quant/data/fundamentals.py`）。
-2. **这是报告期，不是公告日** ⇒ 直接用会**偷看未来**（Q2 的数据 6/30 就有了，但 8 月底才公告）。
+2. **这是报告期，不是公告日** => 直接用会**偷看未来**（Q2 的数据 6/30 就有了，但 8 月底才公告）。
    时点构造必须加**披露滞后**（在 `fundamentals.py` 里统一处理，不在这层）。
 
 范围：默认只下 **PIT 宇宙成员**（`full_market.db` 的 `pit_members` 并集，约 2445 只），
@@ -148,7 +148,7 @@ def _num_ths(v):
 def _fetch_ths(code: str, start_year: str) -> list[tuple]:
     """同花顺「财务摘要-按报告期」→ 与新浪同结构的长表。
 
-    ⚠️ 为什么要它：新浪的 `stock_financial_abstract` / `stock_financial_analysis_indicator`
+    [!] 为什么要它：新浪的 `stock_financial_abstract` / `stock_financial_analysis_indicator`
     在约 100~800 次请求后会对本机**软封**（返回空表 / JSONDecodeError），
     即使限速到 2.5 req/s 也一样。同花顺是**另一个 host**，是主力源；新浪留作回退。
     """
@@ -185,7 +185,7 @@ def _fetch_one(code: str, start_year: str) -> list[tuple]:
 def _fetch_sina(code: str, start_year: str) -> list[tuple]:
     """新浪「财务摘要」→ [(symbol, report_date, eps_diluted, eps_weighted, roe, roe_weighted, bps)]。
 
-    ⚠️ 换源说明：原先用 `stock_financial_analysis_indicator`，但它**每只要打 ~8 个分页请求**，
+    [!] 换源说明：原先用 `stock_financial_analysis_indicator`，但它**每只要打 ~8 个分页请求**，
     实测 600 只里只成功 65 只（随后该 host 直接把所有人打成空表）。
     改用 `stock_financial_abstract`：**1 个请求/只**、返回已是数值、报告期作列，
     含 `基本每股收益 / 净资产收益率(ROE) / 每股净资产`，口径一致（年内累计）。

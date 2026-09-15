@@ -15,7 +15,7 @@
 - **TTM**：最近 4 个单季之和。
 - **披露滞后**：按**法定披露截止日**把报告期映射到"最早可见日"——
   Q1→04-30、H1→08-31、Q3→10-31、年报→次年 04-30。
-  用截止日（而非实际公告日）是**保守**做法：只会晚用、绝不会早用 ⇒ 结构上不可能有未来函数。
+  用截止日（而非实际公告日）是**保守**做法：只会晚用、绝不会早用 => 结构上不可能有未来函数。
 - **`asof(date)`**：取 `可见日 <= date` 的**最新**一期。**绝不**先 ffill 到每日再 shift。
 
 ## 用法
@@ -109,9 +109,9 @@ def ttm_panel(fin: pd.DataFrame, col: str, dates, symbols,
     - `window=4`（默认）→ TTM（滚动四个单季之和）
     - `window=1` → **最近可见的单期值**。线上 `_fetch_roe` 取的就是这个
       （`stock_financial_analysis_indicator` 的最后一期「净资产收益率」，
-      **是年内累计口径、不是 TTM**）⇒ 忠实复刻线上选股时必须用 `window=1`。
+      **是年内累计口径、不是 TTM**）=> 忠实复刻线上选股时必须用 `window=1`。
 
-    ⚠️ 对齐方式：对每个交易日 t，取 `avail_date <= t` 的**最新一期**，
+    [!] 对齐方式：对每个交易日 t，取 `avail_date <= t` 的**最新一期**，
     再取该期往前 `window` 期的和。绝不把整表先 ffill 到每日再 shift。
     """
     if fin.empty:
@@ -152,7 +152,7 @@ def pit_pe_roe_panels(fin: pd.DataFrame, close: pd.DataFrame,
     pe(t)  = close(t) / EPS_ttm(t)
     roe(t) = 最近可见的 TTM ROE（单季 ROE 滚动 4 期之和；A股口径下 ≈ 年化 ROE）
 
-    ⚠️ **`close` 必须传不复权价**（`universe_pit.load_raw_close`），不能传 qfq 前复权价。
+    [!] **`close` 必须传不复权价**（`universe_pit.load_raw_close`），不能传 qfq 前复权价。
 
     原因：EPS 是 as-reported 的（报告期当时的股本口径，未经追溯重述），而 **qfq 价
     已被"今天之后发生的所有送转与分红"折算过**。两者相除，历史 PE 系统性偏低，

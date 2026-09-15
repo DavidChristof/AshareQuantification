@@ -18,7 +18,7 @@ from quant.factors.regression import (               # noqa: E402
 
 
 def _synthetic(horizon=5, n_days=100, n_stocks=30, seed=1):
-    """构造已知线性关系的面板：未来收益 ≈ 0.5·f1 − 0.3·f2 + 噪声。
+    """构造已知线性关系的面板：未来收益 ≈ 0.5·f1 - 0.3·f2 + 噪声。
 
     返回 (f1_panel, f2_panel, close_panel, n_stocks)。
     """
@@ -100,7 +100,7 @@ def test_fama_macbeth_columns_and_pvalue():
 
 
 def test_pooled_ols_recovers_coefficients():
-    """Pooling 合并面板恢复系数 + R² 合理。"""
+    """Pooling 合并面板恢复系数 + R^2 合理。"""
     f1, f2, close, _ = _synthetic()
     with _patched(f1, f2, close):
         p = pooled_ols({}, horizon=5, factor_names=["f1", "f2"])

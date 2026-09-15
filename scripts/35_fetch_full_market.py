@@ -5,7 +5,7 @@
     **今天的**中证500/1000 成分名单回填 2020 年以来的历史，池内流通市值加权 +107.7%，
     而真实中证500 只有 +12.9%（超额 **+97.9pp**），且偏差正好挂在流动性轴上
     （2021 年冷门股平均 +124.7% vs 已活跃 +26.8%）。
-    ⇒ 要修，必须先有**不带未来信息**的候选全集，再按中证公开编制规则重建「时点宇宙」。
+    => 要修，必须先有**不带未来信息**的候选全集，再按中证公开编制规则重建「时点宇宙」。
 
 本脚本只负责**第 1 步：把全集数据拿到手**。重建规则见 `quant/data/universe_pit.py`，
 校验见 `scripts/36_validate_pit_universe.py`。
@@ -22,13 +22,13 @@
     full_daily(symbol,date,open,high,low,close,volume,amount,
                outstanding_share,turnover,float_mcap)
     - `close` 是**前复权**价（与项目其它库一致），**收益率必须用它**。
-    - `outstanding_share`/`turnover` 是**逐日时点值**（非当前快照回填）⇒ 无未来函数。
+    - `outstanding_share`/`turnover` 是**逐日时点值**（非当前快照回填）=> 无未来函数。
     - `float_mcap` = `amount / turnover` = 成交均价 × 流通股本。
-      [!]️ **不要用 `close × outstanding_share` 算市值**——close 是前复权价，
+      [!] **不要用 `close × outstanding_share` 算市值**——close 是前复权价，
       实测这样算市值偏高 **3%~11.5%**（分红越多的票偏得越狠）。已实测复权**不改变**
       volume/amount/turnover/outstanding_share（4/4 完全相等），所以一次请求就够。
 
-[!]️ 设计要点（别照抄 scripts/23）：
+[!] 设计要点（别照抄 scripts/23）：
     - **流式落库，内存恒定**：每只拉完立刻进缓冲、达阈值批量写库并丢弃 DataFrame。
       scripts/23 把所有 DataFrame 攒在 dict 里 + pickle 落盘，是内存炸弹
       （559 只的 pickle 就 49MB，5219 只 ≈ 460MB，解包后数倍；项目曾因内存不足崩过）。

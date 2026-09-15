@@ -59,7 +59,7 @@ def test_trade_date_zero_pads():
 
 
 def test_t1_check_must_use_same_date_as_recording():
-    """T+1 用日期字符串**精确匹配**当日买入 ⇒ 记账与校验必须用同一个日期来源。
+    """T+1 用日期字符串**精确匹配**当日买入 => 记账与校验必须用同一个日期来源。
 
     这是本事故里最容易漏的连带坑：只把「成交日期」改成日历日期、而 T+1 校验
     还在用行情数据日期，当天买入就会被判成可卖（T+1 静默失效）。
@@ -79,7 +79,7 @@ def test_t1_check_must_use_same_date_as_recording():
 def test_snapshot_equity_writes_the_date_given():
     """`snapshot_equity` 完全按传入日期落库（INSERT OR REPLACE）。
 
-    ⇒ 调用方给错日期就会**覆盖**那一天已有的点 —— 这正是 09-11 日点被今天
+    => 调用方给错日期就会**覆盖**那一天已有的点 —— 这正是 09-11 日点被今天
     账户状态覆盖的机制。日期必须由调用方保证正确。
     """
     tmp = _tmp_db()
@@ -100,7 +100,7 @@ def test_equity_history_orders_day_point_after_intraday():
     """同日：盘中点在前，**日点（收盘点）在最后**。
 
     `paper_equity.date` 混存 `'YYYY-MM-DD'`（日点）与 `'YYYY-MM-DD HH:00'`（盘中点），
-    字符串比较 `'2026-09-11' < '2026-09-11 09:00'` ⇒ 只写 `ORDER BY date` 会把
+    字符串比较 `'2026-09-11' < '2026-09-11 09:00'` => 只写 `ORDER BY date` 会把
     **当日日点排到当日 09:00 之前**，净值曲线上表现为「收盘点画在开盘点前面」。
     这里**故意先写日点再写盘中点**，确保排序不依赖写入顺序。
     """

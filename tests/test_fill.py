@@ -56,7 +56,7 @@ def test_limit_band():
 
 
 def test_fees_min_commission_floor_and_rate():
-    # 小额触发最低佣金 ¥5；大额按费率
+    # 小额触发最低佣金 ￥5；大额按费率
     f = buy_fees(1000.0, CFG)
     assert f["commission"] == 5.0
     assert f["fee"] == 5.0 + 1000.0 * 0.00001
@@ -80,10 +80,10 @@ def test_max_affordable_shares_never_overspends():
 
 
 def test_breakeven_math():
-    # ¥14 一手的往返费用约 0.8%
+    # ￥14 一手的往返费用约 0.8%
     be14 = breakeven_pct(14.0, 100, CFG)
     assert 0.006 < be14 < 0.010, be14
-    # ¥3 低价股费用占比高（≈3.4%）
+    # ￥3 低价股费用占比高（≈3.4%）
     be3 = breakeven_pct(3.0, 100, CFG)
     assert 0.030 < be3 < 0.040, be3
     p = breakeven_price(14.0, 100, CFG)

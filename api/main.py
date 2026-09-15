@@ -31,6 +31,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# GBK 控制台的**运行时兜底**（不是修复）。
+# 本文件里刻意保留了 🟢/⏸/🛑/⇓ 等**给浏览器渲染的 UI 文案**（JSON 的 text 字段，
+# 不是控制台输出；换成 ASCII 只会让看板变难看）。但它们若经 logger/异常路径落到
+# stdout/stderr，而控制台编码是 GBK，就会 UnicodeEncodeError。这里把不可编码的字符
+# 退化成 '?' —— 中文在 GBK 内不受影响，只兜住那几种符号。
+# 控制台程序（scripts/ tests/）不用这个兜底，那边是**真清干净**的，见
+# tests/test_gbk_output.py 与 docs/2026-09-15-gbk-console-output.md。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import pandas as pd                                                    # noqa: E402
 from fastapi import FastAPI, HTTPException                             # noqa: E402
 from fastapi.responses import FileResponse                              # noqa: E402
@@ -140,8 +153,8 @@ MANUAL_BROKER = PaperBroker(
     lot_size=int(cfg["manual"].get("lot_size", 100)),
 )
 
-# 实盘账户（本金 ¥3000 · 模型只给建议 · 人工在券商 App 下单后回来记账）。
-# ⚠️ 只有 POST /api/real/order 会写入它，且写入的是「人工回报的成交」；绝无券商下单接口。
+# 实盘账户（本金 ￥3000 · 模型只给建议 · 人工在券商 App 下单后回来记账）。
+# [!] 只有 POST /api/real/order 会写入它，且写入的是「人工回报的成交」；绝无券商下单接口。
 _REAL_CFG = cfg.get("real", {}) or {}
 REAL_BROKER = RealBroker(
     cfg.resolve(_REAL_CFG.get("db_path", "paper/real_account.db")),
@@ -334,7 +347,7 @@ def _auto_open_execute_worker():
             if marker.exists() \
                     and marker.read_text(encoding="utf-8").strip() == today.isoformat():
                 return                                    # 本日已自动执行过
-            # ⚠️ marker 只在**确认处理过**时才写。原来无条件写在 try 之外，
+            # [!] marker 只在**确认处理过**时才写。原来无条件写在 try 之外，
             #    导致调仓抛异常（什么都没执行）也会被标记为「本日已跑」→ 当日永久跳过。
             #    2026-09-14 实际事故即如此（NameError 被吞 + marker 照写）。
             handled = False
@@ -359,7 +372,7 @@ def _auto_open_execute_worker():
 
 
 # 「开盘自动组合调仓」线程同样在**文件末尾**启动（配置关闭时立即空转退出）。
-# ⚠️ 这个 worker 尤其不能提前启动：它的触发条件是「现在已过 09:31 且在 grace 窗口内」，
+# [!] 这个 worker 尤其不能提前启动：它的触发条件是「现在已过 09:31 且在 grace 窗口内」，
 #    若服务恰在 09:31~09:56 之间启动，它会在 import 途中立刻调用 portfolio_apply → NameError。
 
 
@@ -460,7 +473,7 @@ def _shadow_log(day, msg: str) -> None:
     """把一行信息写进当日 shadow 日志。
 
     本模块只 `getLogger(__name__)`、未配 handler，INFO 基本进不了服务 stdout
-    ⇒ 「在等数据 / 在等内存」这类状态必须落到 shadow 日志才看得见。
+    => 「在等数据 / 在等内存」这类状态必须落到 shadow 日志才看得见。
     """
     try:
         with (cfg.resolve("logs") / f"shadow_ab_{day}.log").open(
@@ -474,9 +487,9 @@ def _shadow_log(day, msg: str) -> None:
 def _pool_data_current(day) -> bool:
     """40 池（market.db）是否已推进到 day —— 「行情源发布当日日线了吗」的探针。
 
-    ⚠️ **不能拿 `_last_updated` 当探针**：它只是**本进程**「我更新过」的标记。
+    [!] **不能拿 `_last_updated` 当探针**：它只是**本进程**「我更新过」的标记。
     `_run_auto_update` 里 `if date == before: return`（数据本来就已推进时判定为
-    "已更新/休市"）**不会**置 `_last_updated` ⇒ 若数据已被**上一个进程**刷新过，
+    "已更新/休市"）**不会**置 `_last_updated` => 若数据已被**上一个进程**刷新过，
     新进程永远设不上它，预检将永远失败、流水线永远不跑（2026-09-14 实际踩到）。
     所以这里直接读**数据状态**，与进程内标记无关。
     """
@@ -556,7 +569,7 @@ def _shadow_ab_worker():
                 # 再校验大池库、不合格就 10 分钟后重跑」——从 run_time 到当日日线发布之间
                 # 会每 10 分钟全量重跑一次（559 次请求 + 约 7 分钟），纯属白跑，而且本项目
                 # 曾因高频请求被新浪软封（见 fetcher / scripts/38 的限速记录）。
-                # 40 池与大池同源，所以 40 池没推进 ⇒ 大池必然也拿不到今天的日线。
+                # 40 池与大池同源，所以 40 池没推进 => 大池必然也拿不到今天的日线。
                 if not _pool_data_current(today):
                     if datetime.now() >= retry_until:
                         logger.error("[shadow] 今日日线仍未发布（40 池未推进到 %s）且已过重试截止 "
@@ -1728,7 +1741,7 @@ def _portfolio_allocation(targets: list, target_set: set, held: set,
     pre_h = _pre_holiday_info()
     if pre_h.get("active"):
         pos_pct = min(pos_pct, pre_h["reduce_to_pct"])   # 长假前降仓（取更严）
-    # 大盘趋势闸门：指数跌破 MA20 → 当日不开新仓（实证：熔断+本闸门 年化 0.9%→7.4%、回撤 −32.5%→−24.1%）
+    # 大盘趋势闸门：指数跌破 MA20 → 当日不开新仓（实证：熔断+本闸门 年化 0.9%→7.4%、回撤 -32.5%→-24.1%）
     trend = _market_trend_gate()
     # 账户回撤熔断：触发期间总仓位上限降到 brake.position_pct（看"自己亏多少"）
     brake = brake or {}
@@ -1952,7 +1965,7 @@ def portfolio_apply(force_open_ref: bool = False):
             prices = {**prices, **refs}
     # 成交日期 = **日历日期**，不能取信号表最后一天。
     # 行情数据收盘后才刷新（auto_refresh.update_time 15:30），盘中/盘前信号表还停在
-    # 上一个交易日 ⇒ 会把今天的成交记成上周五，并让下面的 snapshot_equity 用今天的
+    # 上一个交易日 => 会把今天的成交记成上周五，并让下面的 snapshot_equity 用今天的
     # 账户状态覆盖上周五的收盘点（2026-09-14 实际事故，见 docs/2026-09-14-trade-date-fix.md）。
     # 本函数开头已要求 _in_trading_hours()，所以「今天」必然是交易日。
     today = trade_date()
@@ -1965,14 +1978,14 @@ def portfolio_apply(force_open_ref: bool = False):
     if market_weak.get("weak"):
         idx_pct = market_weak.get("index_pct")
         risk_notes.append(
-            f"⚠ 大盘弱势（沪深300/上证 {idx_pct}%，阈值 {market_weak.get('threshold')}%），"
+            f"[!] 大盘弱势（沪深300/上证 {idx_pct}%，阈值 {market_weak.get('threshold')}%），"
             f"买入仓位降至 "
             f"{cfg.get('portfolio_risk', {}).get('weak_position_pct', 0.5)*100:.0f}%")
     # 0b. 长假前降仓提示（目标仓位上限被收紧，规避跨长假跳空）
     pre_h = market_weak.get("pre_holiday") or {}
     if pre_h.get("active"):
         risk_notes.append(
-            f"⚠ 长假前：{pre_h.get('break_starts')} 起连续休市 {pre_h.get('days_off')} 天，"
+            f"[!] 长假前：{pre_h.get('break_starts')} 起连续休市 {pre_h.get('days_off')} 天，"
             f"买入仓位降至 {pre_h.get('reduce_to_pct', 0.5) * 100:.0f}%")
 
     # 1. 卖掉落出 topN 的持仓
@@ -2094,8 +2107,8 @@ def selection_run():
     return {"started": True, "message": "选股已启动，约 1-2 分钟后完成（可稍后刷新查看）"}
 
 
-# ============ 实盘炒股（¥3000 · 模型只给建议 · 人工在券商下单后回来记账） ============
-# ⚠️ 本段**没有任何券商下单接口**：GET 只读（positions/advice 会更新持仓最高价用于移动
+# ============ 实盘炒股（￥3000 · 模型只给建议 · 人工在券商下单后回来记账） ============
+# [!] 本段**没有任何券商下单接口**：GET 只读（positions/advice 会更新持仓最高价用于移动
 #    止损并对齐净值快照，属"读时写"，与手动盘同模式）；唯一写交易的是 POST /api/real/order，
 #    写入的是**人工回报的成交**。
 _REAL_QUOTE_TTL = 10.0                 # 新浪实时行情限速 → 10 秒缓存
@@ -2115,7 +2128,7 @@ def _fnum(v, default: float = 0.0) -> float:
 def _latest_data_date() -> str:
     """**行情数据覆盖到哪一天**（信号表里最后一个交易日）。
 
-    ⚠️ **不要拿它当「今天」用** —— 数据是收盘后才刷新的（`auto_refresh.update_time` 15:30），
+    [!] **不要拿它当「今天」用** —— 数据是收盘后才刷新的（`auto_refresh.update_time` 15:30），
     所以盘中/盘前这个值还停在**上一个交易日**。它只适用于「把净值日点对齐到交易日」
     这类**市场日期**场景；凡是记账、成交、T+1 判断，一律用 `trade_date()`。
 
@@ -2223,7 +2236,7 @@ def _market_trend_gate(force: bool = False) -> dict:
         from quant.realtime.indices import fetch_index_daily
         code = str(g.get("index", "sh000300"))
         df = fetch_index_daily(code)
-        # ⚠️ 只用 **今天之前** 已收盘的日线。日线接口盘中不含当天、收盘后含当天，
+        # [!] 只用 **今天之前** 已收盘的日线。日线接口盘中不含当天、收盘后含当天，
         # 直接取最后一根会让同一交易日在 09:31 与收盘后给出不同结论（实测 12.9% 相反），
         # 也会让看板显示的闸门口径 ≠ 当日实际约束交易的口径。见 market_trend.completed_closes。
         today = trade_date()
@@ -2374,7 +2387,7 @@ def _real_positions_payload(prices: dict, lines: dict | None = None) -> list[dic
 
 def _real_fees_info() -> dict:
     f = _real_fill_cfg()
-    one_lot = 1000.0                       # 以 ¥1000 一单估算往返费用占比
+    one_lot = 1000.0                       # 以 ￥1000 一单估算往返费用占比
     rt = fill_mod.buy_fees(one_lot, f)["fee"] + fill_mod.sell_fees(one_lot, f)["fee"]
     return {"commission": f.commission, "min_commission": f.min_commission,
             "stamp_tax": f.stamp_tax, "transfer_fee": f.transfer_fee,
@@ -2516,7 +2529,7 @@ def _real_advice_payload() -> dict:
 
 @app.get("/api/real/account")
 def real_account():
-    """实盘账户（¥3000）：资金 / 持仓数 / 仓位上限 / 费用口径 / 市场状态。"""
+    """实盘账户（￥3000）：资金 / 持仓数 / 仓位上限 / 费用口径 / 市场状态。"""
     return _real_account_payload()
 
 

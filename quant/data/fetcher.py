@@ -105,12 +105,12 @@ def fetch_daily_full(symbol: str, start_date: str, end_date: str,
     与 `fetch_daily` 的区别（**不改动 fetch_daily 本身**，那是线上路径）：
       1. 多返回两列：`outstanding_share`（流通股本）与 `turnover`（换手率）。
          经逐股核验，这两列是**逐日时点值**（会随增发/解禁变化），**不是当前快照回填**
-         ⇒ 历史回测**无未来函数**。turnover 恒等于 volume/outstanding_share。
+         => 历史回测**无未来函数**。turnover 恒等于 volume/outstanding_share。
       2. 默认 `adjust="qfq"`（与项目其它库一致）：**收益率必须用复权价**，否则分红除权
          那天会出现假跌。
       3. **复权不改变 volume/amount/turnover/outstanding_share**（已逐股实测 4/4 完全相等），
          所以一次请求即可同时满足"复权价算收益"与"不复权量算市值"两类需求。
-      4. ⚠️ **市值不要用 `close × outstanding_share` 算**——`close` 是前复权价，
+      4. [!] **市值不要用 `close × outstanding_share` 算**——`close` 是前复权价，
          用它算市值实测偏高 **3%~11.5%**（分红越多的票偏得越狠）。
          正确口径：**流通市值 = amount / turnover**（= 成交均价 × 流通股本，与复权无关）。
 

@@ -31,7 +31,7 @@ def main():
              commission=q["commission"], slippage=q["slippage"],
              stamp_tax=q.get("stamp_tax", 0.0005),
              lot_size=int(cfg["manual"].get("lot_size", 100)))),
-        ("real", "实盘(¥3000)", cfg.resolve(real.get("db_path", "paper/real_account.db")),
+        ("real", "实盘(￥3000)", cfg.resolve(real.get("db_path", "paper/real_account.db")),
          float(real.get("initial_capital", 3000.0)), dict(
              commission=float(real.get("commission", q["commission"])),
              slippage=float(real.get("slippage", 0.0)),

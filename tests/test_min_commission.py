@@ -48,7 +48,7 @@ def test_min_commission_floors():
     b = PaperBroker(tmp, initial_capital=100_000.0, commission=0.0003,
                     slippage=0.0, stamp_tax=0.0005, lot_size=100,
                     min_commission=5.0, transfer_fee=0.00001)
-    r = b.buy("600519", 100, 10.0, "2026-09-10")          # 万3 仅 ¥0.30 → 取 ¥5
+    r = b.buy("600519", 100, 10.0, "2026-09-10")          # 万3 仅 ￥0.30 → 取 ￥5
     assert r.success
     assert abs(r.fee - (5.0 + 1000.0 * 0.00001)) < 1e-9
     # 现金按「金额 + 实收费」扣减
@@ -56,11 +56,11 @@ def test_min_commission_floors():
     # 大额走费率而非最低佣金
     b2 = PaperBroker(_tmp_db(), initial_capital=1_000_000.0, commission=0.0003,
                      slippage=0.0, min_commission=5.0)
-    r2 = b2.buy("600519", 1000, 10.0, "2026-09-10")       # 万3 = ¥3.0 < 5 → 仍取 5
+    r2 = b2.buy("600519", 1000, 10.0, "2026-09-10")       # 万3 = ￥3.0 < 5 → 仍取 5
     assert abs(r2.fee - 5.0) < 1e-9
     b3 = PaperBroker(_tmp_db(), initial_capital=10_000_000.0, commission=0.0003,
                      slippage=0.0, min_commission=5.0)
-    r3 = b3.buy("600519", 100_000, 10.0, "2026-09-10")    # 万3 = ¥300 > 5
+    r3 = b3.buy("600519", 100_000, 10.0, "2026-09-10")    # 万3 = ￥300 > 5
     assert abs(r3.fee - 300.0) < 1e-9
     _rm(tmp)
 

@@ -38,7 +38,7 @@ from quant.data.universe_pit import (CSI1000, CSI500, HS300, PitRules,  # noqa: 
                                      build_mask, build_snapshots, save_snapshots)
 from quant.realtime.indices import fetch_index_daily                # noqa: E402
 
-# 真实指数代码 ↔ 重建档位
+# 真实指数代码 <-> 重建档位
 REAL = {HS300: "000300", CSI500: "000905", CSI1000: "000852"}
 BIAS_START = "2021-07-01"
 

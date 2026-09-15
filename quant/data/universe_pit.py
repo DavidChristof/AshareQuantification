@@ -5,7 +5,7 @@
 `docs/2026-09-11-survivorship-bias.md` 证实：老的 559 池是用**今天的**中证500/1000
 成分名单回填历史的，池内流通市值加权 +107.7% 而真实中证500 只有 +12.9%（超额 +97.9pp），
 且偏差**正好挂在流动性轴上**（2021 年冷门股平均 +124.7% vs 已活跃 +26.8%）。
-⇒ 回测要可信，宇宙必须是"**在那个时点可观察到的**"。
+=> 回测要可信，宇宙必须是"**在那个时点可观察到的**"。
 
 ## 编制规则（中证指数官网口径）
 
@@ -320,7 +320,7 @@ def build_mask(con: sqlite3.Connection, index_codes: Iterable[str] = (CSI500, CS
                ) -> pd.DataFrame:
     """date × symbol 的 bool 掩码：任一时点 t 取 `review_date <= t` 的**最新**快照。
 
-    [!]️ 必须是"往前取最新快照"，**不能**先 ffill 整库再 shift（那会在调仓日当天偷看未来）。
+    [!] 必须是"往前取最新快照"，**不能**先 ffill 整库再 shift（那会在调仓日当天偷看未来）。
     """
     codes = set(index_codes)
     snaps: dict[date, set[str]] = {}
@@ -391,7 +391,7 @@ def load_raw_close(con: sqlite3.Connection, dates: Sequence, symbols: Sequence[s
     有送转的票低到 **0.862**、比值 p5 = 0.235（失真 4 倍）。
     PE 是线上选股 60% 的权重 => 回测用 qfq 口径会得到错误的选股结果。
 
-    ⚠️ 对照：**线上选股不受影响**——`selector._fetch_pe` 取的是百度估值接口的
+    [!] 对照：**线上选股不受影响**——`selector._fetch_pe` 取的是百度估值接口的
     PE(TTM) 当日值，qfq 在「今天」无折算差。本函数只服务历史回测。
 
     Returns: date × symbol 的 float64 面板（volume=0 的停牌行 -> NaN）。
