@@ -217,9 +217,12 @@ auto_refresh:
     # 2026-09-14：可用仅 400MB（开着游戏）时 workers=2 也在 7 秒内崩。
     min_free_mb: 1200
     # scripts/26 的大池拉取并发。akshare 新浪日线每 worker 起一个 py_mini_racer(V8) 上下文，
-    # 内存占用高：服务在跑(约1GB)再叠加并发易触发 V8 FATAL(partition_address_space) 崩溃
-    # （2026-09-10 实测：可用内存仅 854MB 时 workers=4 秒崩、=1 正常）。故自动流水线取 2。
-    workers: 2
+    # 并发 >1 会触发 V8 FATAL(partition_address_space) 进程级崩溃，崩了就是 0 行白跑一轮。
+    # ⚠️ 2026-09-16 实测修正：**内存充足也照崩** —— 当时可用 3650MB（远高于 min_free_mb=1200），
+    #    workers=2 仍在 7 秒内崩（`logs/shadow_ab_2026-09-16.log` 有完整栈）。
+    #    昨天同样的脚本 `--workers 1` 跑完 559/559。⇒ **min_free_mb 挡不住这件事，
+    #    并发数才是关键**，故从 2 降到 1。（原注释把根因归给内存，是错的。）
+    workers: 1
     recent: 700           # scripts/27 每只取最近 N 交易日打分（控耗时）
 selection:
   auto: true        # 每日选股：收盘后随自动刷新运行（寻找大盘优质股）
