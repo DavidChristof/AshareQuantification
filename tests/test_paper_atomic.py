@@ -18,9 +18,12 @@
 **这条测试必须能复现原 bug**：把 `BEGIN IMMEDIATE` 改回 `BEGIN`（或在 SELECT 之后），
 `test_concurrent_sell_does_not_oversell` 就会失败。
 """
+import atexit
+import gc
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,20 +32,49 @@ from quant.trading.paper import PaperBroker            # noqa: E402
 
 _UID = [0]
 N_THREADS = 8
+_MINE: list[str] = []          # 本进程建过的临时库，退出时兜底清理
 
 
 def _tmp_db(tag="atomic"):
     _UID[0] += 1
-    return f"paper/_test_{tag}_{os.getpid()}_{_UID[0]}.db"
+    p = f"paper/_test_{tag}_{os.getpid()}_{_UID[0]}.db"
+    _MINE.append(p)
+    return p
 
 
 def _rm(*paths):
+    """删临时库（含 -journal/-wal/-shm）。尽力而为，失败就留给 atexit 兜底。
+
+    [!] 为什么删不干净：`sqlite3.connect` 的连接在 `with conn:` 退出时**只提交、不关闭**，
+    要等引用计数回收。回收晚一步，Windows 就还锁着文件、`os.remove` 抛 OSError。
+    （项目里 600+ 个 `paper/_test_*.db` 残留就是这么来的 —— 旧测试把 OSError 静默吞了。）
+    """
     for p in paths:
         for suf in ("", "-journal", "-wal", "-shm"):
             try:
                 os.remove(p + suf)
             except OSError:
                 pass
+
+
+def _sweep_at_exit():
+    """进程退出时兜底清理：此时所有连接都已析构，文件锁必然释放。"""
+    for _ in range(3):
+        gc.collect()
+        left = False
+        for p in _MINE:
+            for suf in ("", "-journal", "-wal", "-shm"):
+                if os.path.exists(p + suf):
+                    try:
+                        os.remove(p + suf)
+                    except OSError:
+                        left = True
+        if not left:
+            return
+        time.sleep(0.05)
+
+
+atexit.register(_sweep_at_exit)
 
 
 def _fresh(tag="atomic"):
