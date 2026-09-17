@@ -138,6 +138,11 @@ manual:
   max_order_shares: 10000
   enforce_trading_hours: true   # 闭市/休市禁止下单（仅交易日 9:30-11:30 / 13:00-15:00）
   lot_size: 100                # A股买入整手（100 股整数倍）
+  # 自动止盈止损巡检（2026-09-17 从两个 GET 接口搬进独立线程，见 docs/2026-09-17-duplicate-auto-sell.md）
+  # 原来它挂在 /api/manual/account 与 /api/manual/positions 上，看板一轮询就真下单
+  # ——触发频率秒级，把 sell() 的竞态放大成了必然（同一笔 400 股被卖 800 股）。
+  auto_stops: true             # 关掉则完全不自动止盈止损（只保留手工下单）
+  stop_check_interval_sec: 30  # 巡检间隔；只在交易时段真正执行
 # 实盘炒股账户（本金 ¥3000 · 模型只给「建议」· 人工在券商 App 下单后回来记账）。
 # ⚠️ 程序绝不自动下单、不接入任何券商 API（故无需程序化交易报备）；本段与上面两个账户完全隔离。
 real:

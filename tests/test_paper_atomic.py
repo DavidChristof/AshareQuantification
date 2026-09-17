@@ -151,6 +151,77 @@ def test_concurrent_sell_records_exactly_one_trade_row():
         _rm(tmp)
 
 
+def test_concurrent_buy_does_not_overdraw():
+    """**核心回归**：8 个线程同时买光同一笔现金 -> 只能成交到钱花完，不能透支。
+
+    与重复卖出同一类 TOCTOU：原来是事务外 `query_cash()` 校验、事务内 `BEGIN` 扣款。
+    """
+    tmp, b = _fresh("buy")
+    try:
+        cash0 = b.query_cash()
+        # 每次买 300 股 x 10 元 ≈ 3,001 元；8 个线程一起上，钱只够 ~33 次
+        n = 8
+        barrier = threading.Barrier(n)
+        results, errors = [], []
+
+        def worker():
+            try:
+                barrier.wait(timeout=10)
+                results.append(b.buy("000792", 300, 10.0, "2026-09-16"))
+            except Exception as exc:              # noqa: BLE001
+                errors.append(repr(exc))
+
+        ts = [threading.Thread(target=worker) for _ in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=20)
+
+        assert not errors, f"并发买入不应该抛异常: {errors}"
+        cash1 = b.query_cash()
+        assert cash1 > -1e-6, f"现金被买成负数({cash1:.2f}) —— 校验与扣款不在同一事务"
+        spent = cash0 - cash1
+        ok = [r for r in results if r.success]
+        assert abs(spent - sum(r.amount for r in ok)) < 1e-6, \
+            "扣掉的现金必须恰好等于成交金额之和（不多扣、不重复扣）"
+    finally:
+        _rm(tmp)
+
+
+def test_concurrent_buy_cannot_all_succeed():
+    """钱只够一次 -> 并发下也只能成交一次（不能都判「资金足够」）。"""
+    tmp = _tmp_db("buypoor")
+    _rm(tmp)
+    b = PaperBroker(tmp, initial_capital=4000.0,
+                    commission=0.0003, slippage=0.0002, stamp_tax=0.0005)
+    try:
+        n = 6
+        barrier = threading.Barrier(n)
+        results, errors = [], []
+
+        def worker():
+            try:
+                barrier.wait(timeout=10)
+                results.append(b.buy("000792", 300, 10.0, "2026-09-16"))   # ~3001 元
+            except Exception as exc:              # noqa: BLE001
+                errors.append(repr(exc))
+
+        ts = [threading.Thread(target=worker) for _ in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=20)
+
+        assert not errors, f"不应该抛异常: {errors}"
+        ok = [r for r in results if r.success]
+        assert len(ok) == 1, (
+            f"4000 元只够买一次(≈3001 元)，却成交了 {len(ok)} 次 —— "
+            f"并发买入透支了现金")
+        assert b.query_cash() > -1e-6
+    finally:
+        _rm(tmp)
+
+
 def test_oversell_is_still_rejected_sequentially():
     """顺序调用下「持仓不足」照旧生效（修事务没改变业务语义）。"""
     tmp, b = _fresh("seq")
@@ -180,6 +251,8 @@ def test_t1_rule_still_enforced():
 if __name__ == "__main__":
     tests = [test_concurrent_sell_does_not_oversell,
              test_concurrent_sell_records_exactly_one_trade_row,
+             test_concurrent_buy_does_not_overdraw,
+             test_concurrent_buy_cannot_all_succeed,
              test_oversell_is_still_rejected_sequentially,
              test_t1_rule_still_enforced]
     for fn in tests:

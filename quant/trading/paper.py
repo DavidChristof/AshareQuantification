@@ -234,13 +234,20 @@ class PaperBroker(Broker):
         fee = self._resolve_fee(fee_override, self._buy_fee(amount))
         total_cost = amount + fee
 
-        cash = self.query_cash()
-        if total_cost > cash + 1e-6:
-            return TradeResult(symbol, "buy", shares, buy_price, fee, total_cost,
-                               False, f"资金不足: 需 {total_cost:.2f} 可用 {cash:.2f}")
-
+        # [!] 查现金与扣款必须在**同一个写事务**里，且用 BEGIN IMMEDIATE 先拿写锁。
+        #     原来是在事务外 `query_cash()` 校验、再 `BEGIN` 扣款 —— 两个并发买入
+        #     都能读到同一笔现金、都判定「资金足够」，于是**透支**。
+        #     与 sell() 的重复卖出（2026-09-17 事故）是同一类 TOCTOU，一并堵死。
+        #     回归测试：tests/test_paper_atomic.py::test_concurrent_buy_does_not_overdraw
         with self._connect() as conn:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM paper_account WHERE key='cash'").fetchone()
+            cash = float(row[0]) if row and row[0] is not None else 0.0
+            if total_cost > cash + 1e-6:
+                conn.rollback()
+                return TradeResult(symbol, "buy", shares, buy_price, fee, total_cost,
+                                   False, f"资金不足: 需 {total_cost:.2f} 可用 {cash:.2f}")
             conn.execute("UPDATE paper_account SET value = value - ? WHERE key='cash'", (total_cost,))
             # 更新持仓（移动加权平均成本）
             pos = conn.execute(

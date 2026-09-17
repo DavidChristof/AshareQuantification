@@ -1047,7 +1047,7 @@ def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict,
     }
 
 
-def _apply_manual_stops(_live: dict | None = None) -> list:
+def _apply_manual_stops(_live: dict | None = None, force: bool = False) -> list:
     """手动盘止盈止损 —— **加锁入口**（实现见 `_apply_manual_stops_locked`）。
 
     ⚠️ 本函数会**真下单**，却挂在 `/api/manual/account` 与 `/api/manual/positions`
@@ -1056,7 +1056,13 @@ def _apply_manual_stops(_live: dict | None = None) -> list:
     凭空多出 9,898.02 元，总资产从 98,732 跳到 108,782。
     根因已在 `broker.sell()` 用 `BEGIN IMMEDIATE` 堵死（校验与扣款同一写事务）；
     这里的锁是**第二道防线**，顺带避免同一轮重复触发与重复写库。
+
+    [!] 只在**交易时段**执行。以前它挂在读接口上，任何时刻被轮询都会真下单 ——
+    2026-09-17 就是**盘前 09:23** 用昨收价卖掉了一笔。传 `force=True` 可绕过
+    （测试或手工排查用）。
     """
+    if not force and not _in_trading_hours():
+        return []
     with _manual_stops_lock:
         return _apply_manual_stops_locked(_live)
 
@@ -1163,10 +1169,42 @@ def _live_prices() -> dict:
     return prices
 
 
+def _manual_stop_worker():
+    """盘中周期性检查手动盘止盈止损 —— 替代原来「挂在读接口上的副作用」。
+
+    [!] 为什么必须独立成线程：`_apply_manual_stops()` 会**真下单**，而它原先挂在
+    `/api/manual/account` 与 `/api/manual/positions` 两个 GET 上，被看板轮询。
+    触发频率因此是**秒级** —— 任何竞态都会被放大成必然。2026-09-17 的重复卖出
+    （同一笔 400 股被卖 800 股、凭空多出 9,898 元）就是被这个放大器放出来的。
+
+    改成线程后：① 读接口回归「只读」；② 不再依赖「有没有人开着看板」；
+    ③ 节奏可控（默认 30 秒）；④ **只在交易时段跑** —— 盘前不再拿昨收价下单
+    （2026-09-17 那笔就是 09:23 盘前成交的）。
+    """
+    interval = int((cfg.get("manual", {}) or {}).get("stop_check_interval_sec", 30) or 30)
+    while True:
+        try:
+            time.sleep(max(interval, 5))
+            if not (cfg.get("manual", {}) or {}).get("auto_stops", True):
+                continue
+            if PREDICTOR is None or not SIGNALS:
+                continue                  # 模型/数据尚未加载完，别动
+            if not _in_trading_hours():
+                continue                  # 非交易时段不巡检（_apply_manual_stops 里亦有闸）
+            out = _apply_manual_stops(_live_prices())
+            if out:
+                logger.info("[stops] 自动止盈止损触发 %d 笔: %s",
+                            len(out), [x.get("symbol") for x in out])
+        except Exception:  # noqa: BLE001
+            logger.exception("[stops] 止盈止损巡检失败")
+
+
 @app.get("/api/manual/account")
 def manual_account():
     prices = _live_prices()          # 实时价优先（盘中总资产随行情同步）
-    _apply_manual_stops(prices)      # 止盈止损按最新价检查
+    # [!] 这里原来有一句 `_apply_manual_stops(prices)` —— **读接口里下单**。
+    #     看板一轮询就触发、频率秒级，把 sell() 的竞态放大成了必然（2026-09-17 重复卖出）。
+    #     止盈止损已挪到后台线程 `_manual_stop_worker`（2026-09-17）。
     _sync_manual_equity()            # 净值曲线对齐最新交易日（历史快照仍按日线）
     _hm = datetime.now().hour * 100 + datetime.now().minute
     # 当日收益只在“连续交易已开始(≥09:30)”后实时计；集合竞价/开盘前实时源给的是竞价撮合价 → 归零
@@ -1177,7 +1215,7 @@ def manual_account():
 @app.get("/api/manual/positions")
 def manual_positions():
     prices = _live_prices()          # 实时价优先（持仓现价/市值随行情同步）
-    _apply_manual_stops(prices)      # 查询前先检查止盈止损（自动平仓）
+    # 止盈止损已挪到后台线程 `_manual_stop_worker`（理由见 manual_account）
     _sync_manual_equity()            # 净值对齐最新交易日
     risk = _risk_config()
     vol_map = _build_vol_map(risk)
@@ -2218,6 +2256,45 @@ def _real_quotes(symbols) -> dict[str, dict]:
     return out
 
 
+def _close_on_date(symbols, date: str) -> dict[str, float]:
+    """指定交易日 `date` 的**收盘价**（多个库依次找）。
+
+    为什么需要它：写「日点」净值时必须用**那天**的收盘价，不能拿实时价凑 ——
+    「日期是 D、价格却是别的天」正是 2026-09-17 那次净值事故的根因
+    （见 `docs/2026-09-17-equity-date-mismatch.md`）。
+
+    查找顺序：market.db(40池) → large_pool.db(559) → full_market.db(全市场)。
+    找不到的 symbol **不会**出现在返回里 —— 由调用方决定是跳过还是用别的方式补。
+    """
+    want = [s for s in dict.fromkeys(symbols or []) if s]
+    if not want:
+        return {}
+    d = str(date)[:10]
+    out: dict[str, float] = {}
+    for db, table in (("market.db", "daily_bars"),
+                      ("large_pool.db", "large_daily"),
+                      ("full_market.db", "full_daily")):
+        todo = [s for s in want if s not in out]
+        if not todo:
+            break
+        path = cfg.resolve("data") / db
+        if not path.exists():
+            continue
+        try:
+            con = sqlite3.connect(str(path))
+            ph = ",".join("?" * len(todo))
+            for s, c in con.execute(
+                    f"SELECT symbol, close FROM {table} "
+                    f"WHERE date=? AND symbol IN ({ph})", (d, *todo)):
+                px = _fnum(c)
+                if px > 0:
+                    out[str(s)] = px
+            con.close()
+        except Exception as exc:  # noqa: BLE001 - 某个库缺失/表不存在不该中断
+            logger.debug("[close_on_date] %s 查询失败: %s", db, exc)
+    return out
+
+
 def _real_prices(symbols) -> dict[str, float]:
     """实盘用价格：实时报价优先 → SIGNALS 收盘兜底。"""
     out: dict[str, float] = {}
@@ -2431,6 +2508,14 @@ def _sync_real_equity():
     """实盘净值快照：盘中每小时记一个实时点，收盘后对齐最新交易日（与手动盘同口径）。
 
     只写 real_account.db。
+
+    [!] 原来这里有两处与手动盘**完全相同**的坑（2026-09-17 事故，见 docs/2026-09-17-equity-date-mismatch.md）：
+      ① 守卫 `str(hist[-1]["date"]) >= latest` 恒为真（`'D 15:00' > 'D'`）⇒ 日点从来没写进去过；
+      ② 日点用的是 `_real_prices()`（**实时价**）配上 `latest` 这个**交易日**当键
+         —— 日期与价格不同天。
+    只修 ① 会更糟（开始往曲线里写错值），所以必须连价格来源一起改：
+    日点改用 `_close_on_date(held, latest)`，即**那天真正的收盘价**；
+    拿不到某个持仓的当日收盘价就**宁可不写**，绝不拿别的价格凑。
     """
     try:
         hist = REAL_BROKER.equity_history()
@@ -2440,12 +2525,20 @@ def _sync_real_equity():
             if hist and str(hist[-1]["date"]).startswith(hour_key):
                 return
             REAL_BROKER.snapshot_equity(datetime.now().strftime("%Y-%m-%d %H:00"),
-                                        _real_prices(held))
+                                        _real_prices(held),
+                                        price_date=trade_date())
             return
         latest = _latest_data_date()          # 日点属于交易日，用市场日期
-        if hist and str(hist[-1]["date"]) >= latest:
+        point = daily_point_date(latest, REAL_BROKER.latest_trade_date())
+        if point is None:
             return
-        REAL_BROKER.snapshot_equity(latest, _real_prices(held))
+        closes = _close_on_date(held, latest)
+        missing = [s for s in held if s not in closes]
+        if missing:
+            logger.warning("[real] 缺 %s 在 %s 的收盘价，本次不写日点（不拿别的价格凑）",
+                           missing, latest)
+            return
+        REAL_BROKER.snapshot_equity(point, closes, price_date=latest)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[real] 净值快照失败: %s", exc)
 
@@ -2734,6 +2827,8 @@ def real_trade_delete(trade_id: int):
 threading.Thread(target=_scheduler, daemon=True).start()
 threading.Thread(target=_auto_open_execute_worker, daemon=True).start()
 threading.Thread(target=_shadow_ab_worker, daemon=True).start()
+# 手动盘止盈止损巡检（2026-09-17 从两个 GET 接口里搬出来的，见 _manual_stop_worker）
+threading.Thread(target=_manual_stop_worker, daemon=True).start()
 
 
 if __name__ == "__main__":
