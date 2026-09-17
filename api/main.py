@@ -67,7 +67,7 @@ from quant.timing.regime import MarketRegime                           # noqa: E
 from quant.timing.selector import explain as timing_explain            # noqa: E402
 from quant.timing.selector import select_weights                       # noqa: E402
 from quant.trading.paper import (PaperBroker, trade_date,             # noqa: E402
-                                 _valid_price as _valid_price)
+                                 daily_point_date, _valid_price as _valid_price)
 from quant.trading.real_account import RealBroker                      # noqa: E402
 from quant.trading import fill as fill_mod                             # noqa: E402
 from quant.trading.real_advice import AdviceInput, plan_real_portfolio  # noqa: E402
@@ -1123,16 +1123,27 @@ def _sync_manual_equity():
             hour_key = datetime.now().strftime("%Y-%m-%d %H")
             if hist and str(hist[-1]["date"]).startswith(hour_key):
                 return
-            MANUAL_BROKER.snapshot_equity(stamp, _live_prices())
+            MANUAL_BROKER.snapshot_equity(stamp, _live_prices(),
+                                          price_date=trade_date())
             return
         # 非交易时段：把日点对齐到**最新交易日**（「收盘点」属于交易日，不是日历上的「今天」）
         latest = _latest_data_date()
+        # 价格与日期**同源**：都取信号表的最后一行（`_latest_data_date()` 返回的正是该行日期）
         prices = {s: float(sig.iloc[-1]["close"]) for s, sig in SIGNALS.items() if not sig.empty}
         if not prices:
             return
-        if hist and str(hist[-1]["date"]) >= latest:
+        # [!] 这里原来有两处坑（2026-09-17 事故，见 docs/2026-09-17-equity-date-mismatch.md）：
+        #   ① 守卫 `hist[-1]["date"] >= latest` **恒为真**：equity_history() 把当日「日点」排在
+        #      该日最后，没有日点时最后一个是 'D 15:00'，而字符串比较 'D 15:00' > 'D'
+        #      => 这个分支永远 return，**日点从来没被正确写过**。
+        #   ② 于是曲线上唯一的「日点」来自盘中的 snapshot_equity(today, ...) —— 键是日历日 D、
+        #      价是信号表最后一天(D-1)的收盘 => 每天日点都比真实低一天，次日「当日收益」基线被压低。
+        #   现在：由纯函数 daily_point_date() 判定该不该写、写哪天，并把 price_date 传下去，
+        #   由 snapshot_equity 兜底校验「日期 == 价格所属交易日」。
+        point = daily_point_date(latest, MANUAL_BROKER.latest_trade_date())
+        if point is None:
             return
-        MANUAL_BROKER.snapshot_equity(latest, prices)
+        MANUAL_BROKER.snapshot_equity(point, prices, price_date=latest)
     except Exception:  # noqa: BLE001
         logger.exception("手动盘净值同步失败")
 
@@ -1318,9 +1329,11 @@ def manual_order(order: OrderRequest):
     if not result.success:
         raise HTTPException(400, result.message)
 
-    # 成交后按最新价快照净值
-    latest_prices = {s: float(t["close"].iloc[-1]) for s, t in SIGNALS.items() if not t.empty}
-    MANUAL_BROKER.snapshot_equity(today, latest_prices)
+    # 成交后记净值点：交给 _sync_manual_equity() ——
+    # [!] 原来这里写的是 `snapshot_equity(today, SIGNALS收盘价)`：键是**日历日 D**、
+    #     价是**信号表最后一天(D-1)的收盘**，两者不同天 => 日点被按前一天的价格写成，
+    #     次日「当日收益」的基线凭空低一天。2026-09-17 事故。
+    _sync_manual_equity()
 
     return {
         "success": True,
@@ -2064,9 +2077,9 @@ def portfolio_apply(force_open_ref: bool = False):
             executed.append({"symbol": a["symbol"], "name": a["name"],
                              "side": "buy", "error": "资金不足一手(100股)"})
 
-    # 快照净值
-    latest = {s: float(sig["close"].iloc[-1]) for s, sig in SIGNALS.items() if not sig.empty}
-    MANUAL_BROKER.snapshot_equity(today, latest)
+    # 快照净值：交给 _sync_manual_equity()（理由同 manual_order：
+    # 原来用「日历日 + 信号表最后一天(D-1)的收盘」写日点，日期与价格不同天）
+    _sync_manual_equity()
     return {"executed": executed, "notes": risk_notes,
             "market_weak": market_weak,
             "account": MANUAL_BROKER.account_summary()}

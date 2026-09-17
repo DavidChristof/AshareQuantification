@@ -31,6 +31,45 @@ def _valid_price(price) -> bool:
     except (TypeError, ValueError):
         return False
 
+
+def daily_point_date(latest_data_date: str,
+                     last_trade_date: str | None) -> str | None:
+    """「日点」该不该写、写在哪一天 —— 纯函数，便于测试。
+
+    ## 两个必须同时成立的条件（各对应一次真实事故）
+
+    1. **日期必须等于价格所属交易日**。2026-09-17 事故：盘中调仓写日点时
+       「键 = 日历日 D，价 = 信号表最后一天(D-1)的收盘」=> 每天的日点都被按
+       **前一天**的价格写成；而 `prev_close_equity`（当日收益的基线）正是取这个点，
+       于是**次日的「当日收益」凭空多算了前一天的涨跌**
+       （09-16 那天差 169 元，工业富联跌了却显示赚了）。
+    2. **账户状态不能跑到 latest 之后**。最后一笔成交晚于 `latest` 说明今天已经成交过，
+       此时用 `latest` 的收盘价写点，会把今天的成交算到上一个交易日的点上
+       —— 即 2026-09-14 那个事故（09-11 的收盘点被写成卖出后的状态）。
+
+    [!] 条件 2 **同时**覆盖了「服务停了一周后重启」这种情形：若账户在 `latest` 之后
+    还有成交，`ltd` 必然晚于 `latest`，直接拦掉；若这段时间账户根本没动过，
+    那当前账户状态**就是** `latest` 那天收盘时的状态，重写一遍是幂等的、正确的。
+    （我一开始还加了个 `earlier_point_exists` 条件想防这件事 —— 结果它几乎恒为真，
+      会把**每次正常的日点写入**都挡掉，属于自伤，已删。教训：守卫条件要拿真实
+      时序走一遍，别凭想象加。）
+
+    Args:
+        latest_data_date: 行情数据覆盖到的最后交易日（= 价格所属日）。
+        last_trade_date: 账户最后一笔成交的日期。
+
+    Returns:
+        要写的日期（= `latest_data_date`），或 None 表示这次不写。
+    """
+    if not latest_data_date:
+        return None
+    key = str(latest_data_date)[:10]
+    ltd = str(last_trade_date)[:10] if last_trade_date else ""
+    if ltd and ltd > key:          # 账户已经走到最新交易日之后了 -> 回写会张冠李戴
+        return None
+    return key
+
+
 def trade_date(d: date | None = None) -> str:
     """成交/记账/净值点用的「今天」——**日历日期**，不是行情数据的最后一天。
 
@@ -389,8 +428,30 @@ class PaperBroker(Broker):
                 "UPDATE paper_account SET value=? WHERE key='initial_capital'", (init,))
         logger.info("纸面账户已重置，初始资金 %.2f", init)
 
-    def snapshot_equity(self, date: str, latest_prices: dict[str, float]) -> float:
-        """按最新收盘价计算总资产并写入净值快照，返回 equity。"""
+    def latest_trade_date(self) -> str | None:
+        """最后一笔成交的日期（「账户状态」走到哪一天了）。"""
+        with self._connect() as conn:
+            r = conn.execute(
+                "SELECT MAX(substr(date,1,10)) FROM paper_trades").fetchone()
+        return r[0] if r and r[0] else None
+
+    def snapshot_equity(self, date: str, latest_prices: dict[str, float],
+                        price_date: str | None = None) -> float:
+        """按最新收盘价计算总资产并写入净值快照，返回 equity。
+
+        Args:
+            date: 这个净值点属于**哪个交易日**。
+            latest_prices: {symbol: 价格}。
+            price_date: **这些价格所属的交易日**。传入时会与 `date` 校验 ——
+                「日期是 D、价格却是 D-1 的」正是 2026-09-17 事故的根因
+                （09:31 自动调仓用日历日当键、用信号表最后一天(D-1)的收盘当价，
+                 于是每天的日点都被按前一天的价格写成，次日「当日收益」的基线
+                 被凭空压低一天）。这里直接拒绝写入，别再默默写进去。
+        """
+        if price_date is not None and str(price_date)[:10] != str(date)[:10]:
+            raise ValueError(
+                f"净值点日期({date}) 与价格所属交易日({price_date}) 不是同一天 —— "
+                f"拒绝写入（会把 {price_date} 的行情算到 {date} 的点上）")
         cash = self.query_cash()
         market_value = 0.0
         for pos in self.query_positions():
