@@ -248,6 +248,11 @@ SIGNALS = _signal_tables()
 _update_lock = threading.Lock()
 _last_updated = None          # 上次自动更新的时间
 
+# 手动盘止盈止损的串行锁（2026-09-17 加）。
+# 该函数会**真下单**，却挂在 /api/manual/account 与 /api/manual/positions 两个 GET 上，
+# 被看板并发轮询 —— 两个并发调用各自读到同一笔持仓、各卖一次，同一持仓被卖两次。
+_manual_stops_lock = threading.Lock()
+
 
 def _run_auto_update():
     """执行一次完整自动更新：拉数据 → 重算信号 → 自动纸面调仓。"""
@@ -1043,6 +1048,20 @@ def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict,
 
 
 def _apply_manual_stops(_live: dict | None = None) -> list:
+    """手动盘止盈止损 —— **加锁入口**（实现见 `_apply_manual_stops_locked`）。
+
+    ⚠️ 本函数会**真下单**，却挂在 `/api/manual/account` 与 `/api/manual/positions`
+    两个 GET 上、被看板并发轮询。2026-09-17 事故：两个并发调用各自读到同一笔持仓
+    （400 股）、都判定「持仓足够」、各卖一次 → 同一持仓被卖 800 股、现金贷记两次，
+    凭空多出 9,898.02 元，总资产从 98,732 跳到 108,782。
+    根因已在 `broker.sell()` 用 `BEGIN IMMEDIATE` 堵死（校验与扣款同一写事务）；
+    这里的锁是**第二道防线**，顺带避免同一轮重复触发与重复写库。
+    """
+    with _manual_stops_lock:
+        return _apply_manual_stops_locked(_live)
+
+
+def _apply_manual_stops_locked(_live: dict | None = None) -> list:
     """手动盘止盈止损（2026-09-08 拆分口径）：
 
     - 止盈（+ 盘中锁盈，保守）：用**实时价**，强势日冲到止盈线即落袋，不等收盘回落；

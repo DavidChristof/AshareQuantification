@@ -234,32 +234,36 @@ class PaperBroker(Broker):
         if not _valid_price(price):
             return TradeResult(symbol, "sell", 0, price, 0, 0, False,
                                f"卖出价无效（{price!r}），已拒单")
-        with self._connect() as conn:
-            pos = conn.execute(
-                "SELECT shares, avg_cost FROM paper_positions WHERE symbol=?", (symbol,)).fetchone()
-            if pos is None or float(pos[0]) < shares - 1e-6:
-                return TradeResult(symbol, "sell", shares, price, 0, 0, False, "持仓不足")
-            # T+1 规则：今日买入的份额当日不可卖出
-            today_buy = float(conn.execute(
-                "SELECT COALESCE(SUM(shares),0) FROM paper_trades "
-                "WHERE date=? AND symbol=? AND side='buy'",
-                (date, symbol)).fetchone()[0])
-            if shares > (float(pos[0]) - today_buy) + 1e-6:
-                return TradeResult(symbol, "sell", shares, price, 0, 0, False,
-                                   f"T+1：今日已买入 {today_buy:.0f} 股，当日不能卖出")
         sell_price = price * (1 - self.slippage)     # 滑点压低卖价
         proceeds = shares * sell_price
         # 佣金(≥最低佣金) + 印花税(单边) + 过户费
         fee = self._resolve_fee(fee_override, self._sell_fee(proceeds))
         net = proceeds - fee
 
+        # [!] 校验持仓与扣款必须在**同一个写事务**里，且用 BEGIN IMMEDIATE 立刻拿写锁。
+        #    2026-09-17 事故：原来是「一个连接 SELECT 校验 → 另开连接 BEGIN 更新」，
+        #    两个并发调用都能读到 400 股、都判「持仓足够」，于是同一笔持仓被卖两次、
+        #    现金被贷记两次 —— 凭空多出 9,898.02 元。典型 TOCTOU。
+        #    BEGIN IMMEDIATE 后，第二个调用会在写锁上等待（sqlite3 默认 timeout=5s），
+        #    拿到锁时读到的已是更新后的持仓 -> 正确返回「持仓不足」。
+        #    回归测试：tests/test_paper_atomic.py::test_concurrent_sell_does_not_oversell
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             pos = conn.execute(
                 "SELECT shares, avg_cost FROM paper_positions WHERE symbol=?", (symbol,)).fetchone()
             if pos is None or float(pos[0]) < shares - 1e-6:
+                conn.rollback()
                 return TradeResult(symbol, "sell", shares, sell_price, fee, proceeds,
                                    False, "持仓不足")
-            conn.execute("BEGIN")
+            # T+1 规则：今日买入的份额当日不可卖出
+            today_buy = float(conn.execute(
+                "SELECT COALESCE(SUM(shares),0) FROM paper_trades "
+                "WHERE date=? AND symbol=? AND side='buy'",
+                (date, symbol)).fetchone()[0])
+            if shares > (float(pos[0]) - today_buy) + 1e-6:
+                conn.rollback()
+                return TradeResult(symbol, "sell", shares, sell_price, fee, proceeds,
+                                   False, f"T+1：今日已买入 {today_buy:.0f} 股，当日不能卖出")
             conn.execute("UPDATE paper_account SET value = value + ? WHERE key='cash'", (net,))
             remain = float(pos[0]) - shares
             if remain < 1e-6:
