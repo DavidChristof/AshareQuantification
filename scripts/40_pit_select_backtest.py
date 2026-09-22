@@ -296,6 +296,22 @@ def tech_scores_at(d, tech, codes, weights, mode="clamp", flip=()):
     return out
 
 
+def ranked_rows(funded, ts_map, mode="B"):
+    """由 funded + 技术面分算**完整排序**的 [(code, total)]（降序）。
+
+    抽出来是为了两处共用、不各抄一份：`select_at`（只要 topN）与**多空检验**
+    （还需要底部的票 —— top 减 bottom 是市场中性的，方差比只做多小一个量级，
+    同样样本功效更高）。
+    """
+    rows = []
+    for c, fs, _pes, _roes in funded:
+        ts = ts_map.get(c)
+        total = (fs * 0.6 if mode == "B" else fs) if ts is None else fs * 0.6 + ts * 0.4
+        rows.append((c, total))
+    rows.sort(key=lambda x: -x[1])
+    return rows
+
+
 def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
               tech_mode="clamp", tech_flip=(), keep=None, buffer=0,
               basic_topk=None):
@@ -337,15 +353,7 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
     # A/B：技术面只对基本面 top TECH_TOPK 计算（与线上一致）
     ts_map = tech_scores_at(d, tech, [r[0] for r in funded[:TECH_TOPK]], weights,
                             tech_mode, tech_flip)
-    rows = []
-    for c, fs, _pes, _roes in funded:
-        ts = ts_map.get(c)
-        if ts is None:
-            total = fs * 0.6 if mode == "B" else fs
-        else:
-            total = fs * 0.6 + ts * 0.4
-        rows.append((c, total))
-    rows.sort(key=lambda x: -x[1])
+    rows = ranked_rows(funded, ts_map, mode)
     ranked = [c for c, _ in rows]
     n_keep = 0
     if keep and buffer:
@@ -1259,6 +1267,72 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
             print(f"{'':<6}{x + ' 减 ' + y:<10}{'':>9}{'':>8}{'':>8}"
                   f"{float(d2.mean()) * 100:>11.3f}{tv2:>7.2f}   {note}")
         print()
+
+    # ---- 多空检验：市场中性的高功效检验 ----
+    print()
+    print("=" * 96)
+    print("多空检验（top 减 bottom）：**市场中性的高功效检验**")
+    print("  为什么：只做多 topN 被市场 beta 淹没（se 约 0.18%/期）；")
+    print("        top 减 bottom 把 beta 消掉，方差小一个数量级 => 同样 5 年样本功效高得多。")
+    print("  [!] 这**不是可交易的策略**（A 股散户难以做空）—— 它回答的是「**信号是不是真的**」。")
+    print("=" * 96)
+    out["long_short"] = {}
+    print(f"{'口径':<20}{'N':>4}{'多空/期':>10}{'t':>7}{'年化(毛)':>10}"
+          f"{'2023+t':>9}{'胜率':>8}")
+    print("-" * 76)
+    for mode, lab in (("A", "A 真分数(含缺陷)"), ("B", "B 真分数"),
+                      ("F", "F 只基本面"), ("G", "G 只技术面")):
+        for n in (12, 25):
+            gaps = []
+            for d in list(dates[::REBAL])[:-1]:
+                i = dates.get_loc(d)
+                if i + REBAL >= len(dates):
+                    break
+                d2 = dates[i + REBAL]
+                funded, _nf = candidates_at(d, close, amount, pe, roe)
+                if len(funded) < 2 * n:
+                    continue
+                wgt = regime_by_date.get(d, DEFAULT_TECH_WEIGHTS)
+                if mode == "F":
+                    rows = sorted(funded, key=lambda x: -x[1])
+                    rows = [(r[0], r[1]) for r in rows]
+                elif mode == "G":
+                    ts_all = tech_scores_at(d, tech, [r[0] for r in funded], wgt,
+                                            "clamp", ())
+                    rows = sorted(ts_all.items(), key=lambda x: -x[1])
+                else:
+                    ts_map = tech_scores_at(d, tech, [r[0] for r in funded[:TECH_TOPK]],
+                                            wgt, "clamp", ())
+                    rows = ranked_rows(funded, ts_map, mode)
+                if len(rows) < 2 * n:
+                    continue
+                longs = [c for c, _ in rows[:n]]
+                shorts = [c for c, _ in rows[-n:]]
+                lo = (close.loc[d2, longs] / close.loc[d, longs] - 1).dropna()
+                sh = (close.loc[d2, shorts] / close.loc[d, shorts] - 1).dropna()
+                if len(lo) < max(3, n // 2) or len(sh) < max(3, n // 2):
+                    continue
+                gaps.append((d2, float(lo.mean()) - float(sh.mean())))
+            if len(gaps) < 20:
+                continue
+            a = np.asarray([v for _, v in gaps], dtype=float)
+            se = float(a.std(ddof=1)) / np.sqrt(len(a))
+            tv = float(a.mean() / se) if se else 0.0
+            per_yr = (1 + float(a.mean())) ** (252 / REBAL) - 1
+            g23 = np.asarray([v for dd, v in gaps
+                              if str(dd)[:10] >= "2023-01-01"], dtype=float)
+            t23 = (float(g23.mean() / (g23.std(ddof=1) / np.sqrt(len(g23))))
+                   if len(g23) > 2 and g23.std() else 0.0)
+            win = float((a > 0).mean())
+            out["long_short"][f"{mode}_{n}"] = {
+                "gap_pct": round(float(a.mean()) * 100, 3), "t": round(tv, 2),
+                "annual_pct": round(float(per_yr) * 100, 1),
+                "t_2023": round(t23, 2), "win_rate": round(win, 3), "n": int(len(a))}
+            print(f"{lab:<20}{n:>4}{float(a.mean()) * 100:>10.3f}{tv:>7.2f}"
+                  f"{float(per_yr) * 100:>10.1f}{t23:>9.2f}{win:>8.1%}")
+    print()
+    print("[!] 判据：**|t| > 2 才算信号是真的**。年化(毛) 是 top-N 做多、bottom-N 做空的理论值，")
+    print("    **未扣成本**（多空两腿都要换手，代价约为只做多的 2 倍），且 A 股难以做空。")
 
     # ---- 成本与换手：旧口径高估了多少？降换手值多少？----
     print()
