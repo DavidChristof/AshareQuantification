@@ -925,14 +925,32 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
             print(f"{v:<16}{n:>6}{m['total']:>10.1f}{float(a.mean()) * 100:>11.3f}"
                   f"{float(dd.mean()) * 100:>11.3f}{t:>7.2f}")
 
-    # ---- 改造实验：按 §6.6 的方向改 mom/trd，**判定标准事先写死** ----
+    # ---- 改造实验：按 §6.7 的方向改 mom/trd，**判定标准事先写死** ----
+    from scipy.stats import norm as _norm
+
+    rank_tech = _norm_panels(tech, "rank")
+    drop_mt = {"mom": 0, "trd": 0, "vol": 50, "rev": 50}
+    treatments = [
+        ("T1 反转 mom+trd(clamp)", {"tech_flip": ("mom", "trd")}),
+        ("T2 去掉 mom+trd(clamp)", {"tech_w": drop_mt}),
+        ("T3 rank+去掉 mom+trd", {"tech_use": rank_tech, "tech_mode": "raw",
+                                  "tech_w": drop_mt}),
+        ("T4 rank+反转 mom+trd", {"tech_use": rank_tech, "tech_mode": "raw",
+                                  "tech_flip": ("mom", "trd")}),
+    ]
+    # [!] 每加一个处理组，门槛必须跟着抬高 —— 否则就是「多试几个直到有一个显著」。
+    n_tests = 2 * len(treatments)
+    t_bar = float(_norm.ppf(1 - 0.025 / n_tests))
+
     print()
     print("=" * 96)
     print("改造实验：mom/trd 反转 or 去掉 —— 判定标准**事先声明**，不是跑完再挑")
     print("  对照 = B（当前权重 25/15/30/30，修掉缺陷，clamp）")
+    print(f"  本次 {len(treatments)} 个处理 x 2 个检验 = {n_tests} 个 "
+          f"=> Bonferroni 阈值 |t| > {t_bar:.2f}")
     print("  通过需**同时**满足：")
-    print("    (1) 处理 vs 对照 配对 t > +2.5   [Bonferroni: 2 处理 x 2 检验 = 4 => |t|>2.5]")
-    print("    (2) 处理 vs D（同门槛随机 12） 配对 t > +2.5")
+    print(f"    (1) 处理 vs 对照 配对 t > +{t_bar:.2f}")
+    print(f"    (2) 处理 vs D（同门槛随机 12） 配对 t > +{t_bar:.2f}")
     print("    (3) 2023+ 子区间与全期**同号**")
     print("  任一不满足 => **不碰 selector.py**")
     print("=" * 96)
@@ -952,14 +970,12 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
     _cd, _dd1, a_d0 = run("D", close, amount, pe, roe, tech, regime_by_date, topn, dates)
     s_d = pd.Series(dict(a_d0)).sort_index()
 
-    out["treatment"] = {"criterion": {"vs_ctrl_t_gt": 2.5, "vs_D_t_gt": 2.5,
+    out["treatment"] = {"criterion": {"n_tests": n_tests, "t_bar": round(t_bar, 3),
                                       "needs_2023_same_sign": True}}
-    print(f"{'处理组':<18}{'总收益':>9}{'年化':>8}{'Sharpe':>8}{'vs对照':>9}{'t':>7}"
+    print(f"{'处理组':<22}{'总收益':>9}{'年化':>8}{'Sharpe':>8}{'vs对照':>9}{'t':>7}"
           f"{'2023+t':>9}{'vs D':>9}{'t':>7}   判定")
-    print("-" * 96)
-    for lab, kw in (("T1 反转 mom+trd", {"tech_flip": ("mom", "trd")}),
-                    ("T2 去掉 mom+trd", {"tech_w": {"mom": 0, "trd": 0,
-                                                    "vol": 50, "rev": 50}})):
+    print("-" * 100)
+    for lab, kw in treatments:
         c, _d, al = run("B", close, amount, pe, roe, tech, regime_by_date, topn,
                         dates, **kw)
         m = metrics(c)
@@ -970,13 +986,13 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
         d_c, t_c, n_c = _paired(s, s_ctrl)
         _d23, t_23, _n23 = _paired(s, s_ctrl, since="2023-01-01")
         d_d, t_d, _nd = _paired(s, s_d)
-        ok = (t_c is not None and t_c > 2.5 and t_d is not None and t_d > 2.5
+        ok = (t_c is not None and t_c > t_bar and t_d is not None and t_d > t_bar
               and t_23 is not None and (t_23 > 0) == (t_c > 0))
         out["treatment"][lab] = {
             "total": m["total"], "annual": m["annual"], "sharpe": m["sharpe"],
             "vs_ctrl_pct": d_c, "vs_ctrl_t": t_c, "vs_ctrl_2023_t": t_23,
             "vs_D_pct": d_d, "vs_D_t": t_d, "passed": bool(ok), "n": n_c}
-        print(f"{lab:<18}{m['total']:>9.1f}{m['annual']:>8.2f}{m['sharpe']:>8.2f}"
+        print(f"{lab:<22}{m['total']:>9.1f}{m['annual']:>8.2f}{m['sharpe']:>8.2f}"
               f"{(d_c or 0):>9.3f}{(t_c or 0):>7.2f}{(t_23 or 0):>9.2f}"
               f"{(d_d or 0):>9.3f}{(t_d or 0):>7.2f}   {'通过' if ok else '未通过'}")
     print()
