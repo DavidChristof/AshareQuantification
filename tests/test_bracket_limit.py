@@ -21,9 +21,15 @@ from quant.trading.rules import limit_pct
 _TMP_UID = [0]
 
 
+# 每次**运行**唯一的后缀。只用 pid 会被操作系统**复用** -> 撞上 paper/ 下的残留同名库
+# -> PaperBroker 打开到有历史状态的旧库 -> 测试间歇性失败（2026-09-22 实测）。
+# 用 os.urandom 而不是 time，是为了不给每个测试文件再加一个 import（它们都已 import os）。
+_RUN_TAG = os.urandom(4).hex()
+
+
 def _tmp_db():
     _TMP_UID[0] += 1
-    return f"paper/_test_bl_{os.getpid()}_{_TMP_UID[0]}.db"
+    return f"paper/_test_bl_{os.getpid()}_{_RUN_TAG}_{_TMP_UID[0]}.db"
 
 
 def _broker(tmp):

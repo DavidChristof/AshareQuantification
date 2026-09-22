@@ -27,11 +27,15 @@ from quant.data.universe_pit import (CSI1000, CSI500, HS300, PitRules,  # noqa: 
 _UID = [0]
 
 
+# 每次**运行**唯一的后缀。只用 pid 会被操作系统复用 -> 撞上残留同名库 -> 打开到旧状态。
+_RUN_TAG = os.urandom(4).hex()
+
+
 def _tmp_db() -> Path:
     _UID[0] += 1
     d = Path(__file__).resolve().parents[1] / "paper"
     d.mkdir(exist_ok=True)
-    return d / f"_test_pit_{os.getpid()}_{_UID[0]}.db"
+    return d / f"_test_pit_{os.getpid()}_{_RUN_TAG}_{_UID[0]}.db"
 
 
 def _rm(p: Path):

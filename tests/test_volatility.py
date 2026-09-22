@@ -94,9 +94,14 @@ import itertools
 _TMP_UID = itertools.count()
 
 
+# 每次**运行**唯一的后缀。只用 pid 会被操作系统复用 -> 撞上 paper/ 下的残留同名库
+# -> PaperBroker 打开到有历史状态的旧库 -> 测试间歇性失败（2026-09-22 实测）。
+_RUN_TAG = os.urandom(4).hex()
+
+
 def _tmp_db():
-    """为每个测试生成唯一 db 文件名（避免 id(object()) 复用导致测试间文件冲突）。"""
-    return f"paper/_test_vol_{os.getpid()}_{next(_TMP_UID)}.db"
+    """为每个测试生成唯一 db 文件名（避免 id(object()) / pid 复用导致文件冲突）。"""
+    return f"paper/_test_vol_{os.getpid()}_{_RUN_TAG}_{next(_TMP_UID)}.db"
 
 
 def test_apply_stop_rules_dynamic():

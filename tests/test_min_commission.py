@@ -7,6 +7,7 @@
 """
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,18 +15,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from quant.trading.paper import PaperBroker
 
 _TMP_UID = [0]
+# 本次进程的唯一标识。**只用 pid 会被复用** —— 上一轮残留的 paper/_test_fee_<pid>_1.db
+# 会被新进程当成自己的库打开，于是 query_cash() 不是初值，测试间歇性失败
+# （2026-09-22 实测：单跑 5/5 通过、放进全量套件里偶发失败）。
+# 加一个时间戳把这条路堵死。
+_RUN_TAG = f"{os.getpid()}_{time.time_ns() % 10_000_000}"
 
 
 def _tmp_db():
     _TMP_UID[0] += 1
-    return f"paper/_test_fee_{os.getpid()}_{_TMP_UID[0]}.db"
+    return f"paper/_test_fee_{_RUN_TAG}_{_TMP_UID[0]}.db"
 
 
 def _rm(tmp):
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
+    """删主库**与三个边车文件**（-journal/-wal/-shm）。
+
+    [!] 这个函数**实际上删不掉**，是已知的：调用它时测试里的 broker 变量还活着，
+    连接还开着，**Windows 会锁住文件** -> `os.remove` 抛 `PermissionError`（WinError 32）
+    -> 被下面的 `except OSError: pass` **静默吞掉**。实测：`del b` + `gc.collect()` 之后
+    就能删（2026-09-22 验证）。所以 paper/ 下会持续攒残留（当时 1481 个）。
+
+    **这不会让测试出错**（因为 `_tmp_db()` 的名字带本进程唯一标识，撞不上旧文件），
+    但文件会越积越多。要真正清理，得在每个测试里 `del b` 之后再调 `_rm`，
+    或者改成 `atexit` 统一清 —— 那是另一件事，本次没做。
+    """
+    for suf in ("", "-journal", "-wal", "-shm"):
+        try:
+            os.remove(tmp + suf)
+        except OSError:
+            pass
 
 
 def test_default_matches_legacy_formula_exactly():

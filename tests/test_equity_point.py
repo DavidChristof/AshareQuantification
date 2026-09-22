@@ -32,9 +32,14 @@ from quant.trading.paper import PaperBroker, daily_point_date     # noqa: E402
 _UID = [0]
 
 
+# 每次**运行**唯一的后缀。只用 pid 会被操作系统复用 -> 撞上 paper/ 下的残留同名库
+# -> PaperBroker 打开到有历史状态的旧库 -> 测试间歇性失败（2026-09-22 实测）。
+_RUN_TAG = os.urandom(4).hex()
+
+
 def _tmp_db(tag="eq"):
     _UID[0] += 1
-    return f"paper/_test_{tag}_{os.getpid()}_{_UID[0]}.db"
+    return f"paper/_test_{tag}_{os.getpid()}_{_RUN_TAG}_{_UID[0]}.db"
 
 
 def _fresh(tag="eq"):

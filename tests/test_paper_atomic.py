@@ -35,9 +35,14 @@ N_THREADS = 8
 _MINE: list[str] = []          # 本进程建过的临时库，退出时兜底清理
 
 
+# 每次**运行**唯一的后缀。只用 pid 会被操作系统复用 -> 撞上 paper/ 下的残留同名库
+# -> PaperBroker 打开到有历史状态的旧库 -> 测试间歇性失败（2026-09-22 实测）。
+_RUN_TAG = os.urandom(4).hex()
+
+
 def _tmp_db(tag="atomic"):
     _UID[0] += 1
-    p = f"paper/_test_{tag}_{os.getpid()}_{_UID[0]}.db"
+    p = f"paper/_test_{tag}_{os.getpid()}_{_RUN_TAG}_{_UID[0]}.db"
     _MINE.append(p)
     return p
 
