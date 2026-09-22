@@ -1211,6 +1211,55 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
     print("[!] 现实约束（回测里看不到）：放宽 K 会让**线上每次要抓的 PE/ROE 数量**按比例增加。")
     print("    线上 BASIC_TOPK 原本就是「省数据抓取」的截断，不是假设 —— 所以通过也不等于可以直接上。")
 
+    # ---- topN 扫描：截面效应在更大的组合里会不会浮出来？----
+    print()
+    print("=" * 96)
+    print("topN 扫描：把组合从 12 只放大，那些截面效应会浮出来吗？")
+    print("  动机（§10.6）：截面效应都在 0.26~0.36%/期，而 12 只组合的逐期 se 约 0.18~0.20%/期，")
+    print("        t 天生卡在 1.3~2.0。加大 N 会**同时**降低 se（约 1/sqrt(N)）与稀释效应量，")
+    print("        净效果是经验问题 —— 所以直接测，不靠推。")
+    print("  读法：若 `F-D66`（基本面排序）或 `D66-D`（集合效应）的 |t| 随 N 上升 => 是检验太弱；")
+    print("        若停在原地 => 是效应本身不够大。")
+    print("=" * 96)
+    out["topn_power"] = {}
+    print(f"{'topN':<6}{'臂':<10}{'总收益':>9}{'年化':>8}{'Sharpe':>8}"
+          f"{'逐期alpha':>11}{'t':>7}")
+    print("-" * 78)
+    for tn in (12, 25, 50):
+        ser2 = {}
+        for v, lab in (("D", "D"), ("D66", "D66"), ("F", "F 基本面"),
+                       ("B", "B 真分数")):
+            c, _dd, al = run(v, close, amount, pe, roe, tech, regime_by_date, tn, dates,
+                             cost_mode="turnover")
+            mm = metrics(c)
+            if not mm:
+                continue
+            mm.pop("_ser", None)
+            ser2[v] = pd.Series(dict(al)).sort_index()
+            a = np.asarray([x for _, x in al], dtype=float)
+            tv = (float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+                  if len(a) > 2 and a.std() else 0.0)
+            out["topn_power"][f"{v}_{tn}"] = {
+                "total": mm["total"], "annual": mm["annual"], "sharpe": mm["sharpe"],
+                "alpha_mean_pct": round(float(a.mean()) * 100, 3),
+                "alpha_t": round(tv, 2)}
+            print(f"{tn:<6}{lab:<10}{mm['total']:>9.1f}{mm['annual']:>8.2f}"
+                  f"{mm['sharpe']:>8.2f}{float(a.mean()) * 100:>11.3f}{tv:>7.2f}")
+        for x, y, note in (("F", "D66", "基本面排序"), ("D66", "D", "集合效应")):
+            if x not in ser2 or y not in ser2:
+                continue
+            s2 = pd.concat([ser2[x].rename("x"), ser2[y].rename("y")], axis=1,
+                           sort=False).dropna()
+            if len(s2) < 10:
+                continue
+            d2 = s2["x"] - s2["y"]
+            tv2 = float(d2.mean() / (d2.std(ddof=1) / np.sqrt(len(d2)))) if d2.std() else 0.0
+            out["topn_power"][f"pair_{x}_{y}_{tn}"] = {
+                "diff_pct": round(float(d2.mean()) * 100, 3), "t": round(tv2, 2)}
+            print(f"{'':<6}{x + ' 减 ' + y:<10}{'':>9}{'':>8}{'':>8}"
+                  f"{float(d2.mean()) * 100:>11.3f}{tv2:>7.2f}   {note}")
+        print()
+
     # ---- 成本与换手：旧口径高估了多少？降换手值多少？----
     print()
     print("=" * 96)
