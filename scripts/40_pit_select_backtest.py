@@ -187,13 +187,15 @@ def score_stock(pe, roe):
     return round(p + r, 1)
 
 
-def score_tech(mom, trd, vol, rev, w, mode="clamp"):
+def score_tech(mom, trd, vol, rev, w, mode="clamp", flip=()):
     """与 selector._score_tech 同式。
 
     mode="clamp"（默认 = 线上原式）：把每个因子压到 [0,1] 后再加权，末尾 round 到 0.1。
     mode="raw"（**仅供归因**，不改线上）：不压、不 round —— 保留因子的连续排序信息。
+    flip：要**反向**的因子名集合（如 {"mom","trd"}）。翻转用 `1 - x` 而不是负权重 ——
+          这样分数仍在同一尺度上，只有方向变，不改各分量的相对幅度。
 
-    [!] 为什么要这个开关：clamp 会让大量候选并列在 1.0，而 `sorted` 是稳定的 =>
+    [!] 为什么要 mode 这个开关：clamp 会让大量候选并列在 1.0，而 `sorted` 是稳定的 =>
     并列组内的顺序由插入顺序（= fund_score 降序）决定，**因子不参与排序**。
     实测 trd/mom 有 ~84%/81% 的候选并列在满分，其 top-12 **100% 取自并列组**。
     """
@@ -201,6 +203,10 @@ def score_tech(mom, trd, vol, rev, w, mode="clamp"):
     t = (trd + 0.05) / 0.10
     v = 1.0 - vol / 0.03
     r = (rev + 0.20) / 0.30
+    m = 1.0 - m if "mom" in flip else m
+    t = 1.0 - t if "trd" in flip else t
+    v = 1.0 - v if "vol" in flip else v
+    r = 1.0 - r if "rev" in flip else r
     if mode == "clamp":
         m = max(0.0, min(1.0, m))
         t = max(0.0, min(1.0, t))
@@ -260,8 +266,8 @@ def candidates_at(d, close, amount, pe, roe):
     return funded, len(liq)
 
 
-def tech_scores_at(d, tech, codes, weights, mode="clamp"):
-    """给定代码，算技术面分；数据不足（vol20 为 NaN）跳过。mode 见 score_tech。"""
+def tech_scores_at(d, tech, codes, weights, mode="clamp", flip=()):
+    """给定代码，算技术面分；数据不足（vol20 为 NaN）跳过。mode/flip 见 score_tech。"""
     mom, trd, vol, rev = tech
     out = {}
     for c in codes:
@@ -269,17 +275,18 @@ def tech_scores_at(d, tech, codes, weights, mode="clamp"):
         if not np.isfinite(v):
             continue
         out[c] = score_tech(mom.at[d, c], trd.at[d, c], float(v), rev.at[d, c],
-                            weights, mode)
+                            weights, mode, flip)
     return out
 
 
 def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
-              tech_mode="clamp"):
+              tech_mode="clamp", tech_flip=()):
     """按 `mode` 产出该日 top-N。
 
     mode: A 忠实复刻 / B 修正 tech 缺失 / F 只用基本面 / G 只用技术面
           P 只用 PE 分 / R 只用 ROE 分（归因用，仿 G 走全 80 只候选）
     tech_mode: clamp（线上原式）/ raw（不 clamp，保序）—— 见 score_tech。
+    tech_flip: 要反向的因子集合 —— 见 score_tech。
     """
     topn = topn or TOPN
     funded, n_liq = candidates_at(d, close, amount, pe, roe)
@@ -287,7 +294,8 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
         return [], {}
 
     if mode == "G":                     # 技术面单因子：对全部 80 只候选算技术面
-        ts_map = tech_scores_at(d, tech, [r[0] for r in funded], weights, tech_mode)
+        ts_map = tech_scores_at(d, tech, [r[0] for r in funded], weights,
+                                tech_mode, tech_flip)
         if not ts_map:
             return [], {}
         rows = sorted(ts_map.items(), key=lambda x: -x[1])
@@ -306,7 +314,7 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
 
     # A/B：技术面只对基本面 top TECH_TOPK 计算（与线上一致）
     ts_map = tech_scores_at(d, tech, [r[0] for r in funded[:TECH_TOPK]], weights,
-                            tech_mode)
+                            tech_mode, tech_flip)
     rows = []
     for c, fs, _pes, _roes in funded:
         ts = ts_map.get(c)
@@ -338,10 +346,10 @@ FUND_HALF_MODE = {"P_pe": "P", "R_roe": "R"}
 
 
 def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
-        tech_use=None, tech_mode="clamp"):
-    """tech_use/tech_mode：**归因专用**的替换面板与打分模式（默认 = 原行为，A-H 不受影响）。
+        tech_use=None, tech_mode="clamp", tech_flip=(), tech_w=None):
+    """tech_use/tech_mode/tech_flip/tech_w：**归因与改造实验专用**（默认 = 原行为，A-H 不受影响）。
 
-    这样「同一套变体、换一种归一化」不需要新增变体名：传不同的 (tech_use, tech_mode) 即可。
+    这样「同一套变体、换一种归一化/换一组权重/反转某些因子」不需要新增变体名。
     """
     tech_use = tech if tech_use is None else tech_use
     sel_dates = list(dates[::REBAL])
@@ -383,21 +391,23 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
             picks = list(close.loc[d].dropna().index)
         elif variant in TECH_ONLY_WEIGHTS:                   # 单技术因子（G 分支 + 单位权重）
             picks, diag = select_at(d, close, amount, pe, roe, tech_use,
-                                    TECH_ONLY_WEIGHTS[variant], "G", topn, tech_mode)
+                                    TECH_ONLY_WEIGHTS[variant], "G", topn,
+                                    tech_mode, tech_flip)
             if diag:
                 diags.append({**diag, "date": d})
         elif variant in FUND_HALF_MODE:                      # 只按 PE 分 / 只按 ROE 分
             picks, diag = select_at(d, close, amount, pe, roe, tech_use,
                                     DEFAULT_TECH_WEIGHTS, FUND_HALF_MODE[variant], topn,
-                                    tech_mode)
+                                    tech_mode, tech_flip)
             if diag:
                 diags.append({**diag, "date": d})
         else:
             mode = variant if variant in ("A", "B", "F", "G") else "B"
-            w = (DEFAULT_TECH_WEIGHTS if variant == "C"
-                 else regime_by_date.get(d, DEFAULT_TECH_WEIGHTS))
+            w = (tech_w if tech_w is not None else
+                 (DEFAULT_TECH_WEIGHTS if variant == "C"
+                  else regime_by_date.get(d, DEFAULT_TECH_WEIGHTS)))
             picks, diag = select_at(d, close, amount, pe, roe, tech_use, w, mode, topn,
-                                    tech_mode)
+                                    tech_mode, tech_flip)
             if diag:
                 diags.append({**diag, "date": d})
         if len(picks) < max(1, topn // 2):
@@ -914,6 +924,63 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
                 "vs_D_pct": round(float(dd.mean()) * 100, 3), "vs_D_t": round(t, 2)}
             print(f"{v:<16}{n:>6}{m['total']:>10.1f}{float(a.mean()) * 100:>11.3f}"
                   f"{float(dd.mean()) * 100:>11.3f}{t:>7.2f}")
+
+    # ---- 改造实验：按 §6.6 的方向改 mom/trd，**判定标准事先写死** ----
+    print()
+    print("=" * 96)
+    print("改造实验：mom/trd 反转 or 去掉 —— 判定标准**事先声明**，不是跑完再挑")
+    print("  对照 = B（当前权重 25/15/30/30，修掉缺陷，clamp）")
+    print("  通过需**同时**满足：")
+    print("    (1) 处理 vs 对照 配对 t > +2.5   [Bonferroni: 2 处理 x 2 检验 = 4 => |t|>2.5]")
+    print("    (2) 处理 vs D（同门槛随机 12） 配对 t > +2.5")
+    print("    (3) 2023+ 子区间与全期**同号**")
+    print("  任一不满足 => **不碰 selector.py**")
+    print("=" * 96)
+
+    def _paired(x: pd.Series, y: pd.Series, since=None):
+        s = pd.concat([x.rename("x"), y.rename("y")], axis=1, sort=False).dropna()
+        if since:
+            s = s[s.index >= pd.Timestamp(since)]
+        if len(s) < 10:
+            return None, None, 0
+        dd = s["x"] - s["y"]
+        t = float(dd.mean() / (dd.std(ddof=1) / np.sqrt(len(dd)))) if dd.std() else 0.0
+        return round(float(dd.mean()) * 100, 3), round(t, 2), len(dd)
+
+    _cc, _dd0, a_ctrl = run("B", close, amount, pe, roe, tech, regime_by_date, topn, dates)
+    s_ctrl = pd.Series(dict(a_ctrl)).sort_index()
+    _cd, _dd1, a_d0 = run("D", close, amount, pe, roe, tech, regime_by_date, topn, dates)
+    s_d = pd.Series(dict(a_d0)).sort_index()
+
+    out["treatment"] = {"criterion": {"vs_ctrl_t_gt": 2.5, "vs_D_t_gt": 2.5,
+                                      "needs_2023_same_sign": True}}
+    print(f"{'处理组':<18}{'总收益':>9}{'年化':>8}{'Sharpe':>8}{'vs对照':>9}{'t':>7}"
+          f"{'2023+t':>9}{'vs D':>9}{'t':>7}   判定")
+    print("-" * 96)
+    for lab, kw in (("T1 反转 mom+trd", {"tech_flip": ("mom", "trd")}),
+                    ("T2 去掉 mom+trd", {"tech_w": {"mom": 0, "trd": 0,
+                                                    "vol": 50, "rev": 50}})):
+        c, _d, al = run("B", close, amount, pe, roe, tech, regime_by_date, topn,
+                        dates, **kw)
+        m = metrics(c)
+        if not m:
+            continue
+        m.pop("_ser", None)
+        s = pd.Series(dict(al)).sort_index()
+        d_c, t_c, n_c = _paired(s, s_ctrl)
+        _d23, t_23, _n23 = _paired(s, s_ctrl, since="2023-01-01")
+        d_d, t_d, _nd = _paired(s, s_d)
+        ok = (t_c is not None and t_c > 2.5 and t_d is not None and t_d > 2.5
+              and t_23 is not None and (t_23 > 0) == (t_c > 0))
+        out["treatment"][lab] = {
+            "total": m["total"], "annual": m["annual"], "sharpe": m["sharpe"],
+            "vs_ctrl_pct": d_c, "vs_ctrl_t": t_c, "vs_ctrl_2023_t": t_23,
+            "vs_D_pct": d_d, "vs_D_t": t_d, "passed": bool(ok), "n": n_c}
+        print(f"{lab:<18}{m['total']:>9.1f}{m['annual']:>8.2f}{m['sharpe']:>8.2f}"
+              f"{(d_c or 0):>9.3f}{(t_c or 0):>7.2f}{(t_23 or 0):>9.2f}"
+              f"{(d_d or 0):>9.3f}{(t_d or 0):>7.2f}   {'通过' if ok else '未通过'}")
+    print()
+    print("[!] 判定标准在跑之前就写死了。未通过 => 不碰 selector.py、不改线上权重。")
 
     print()
     print("[!] A 与 B 要一起看：A 保留「排名 41~80 的票 total=fund_score 未减半」这个缺陷，")
