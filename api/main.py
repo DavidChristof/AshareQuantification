@@ -384,10 +384,20 @@ def _auto_open_execute_worker():
 # ============ 收盘后：自动维护 600 池 + 影子 A/B（scripts 26→27→28） ============
 # 替代“等 Claude 17:17 定时跑”：只要服务在 15:45 前后挂着就自动跑，比原来提前 ~1.5h，
 # 且不依赖 Claude 会话是否开着。Claude 的 17:17 定时保留为兜底 + STABLE 提醒。
+# (脚本名, 参数模板, 单步超时秒)
 _SHADOW_STEPS = [
-    ("26_refresh_largepool.py", "--workers {workers}"),
-    ("27_shadow_ab.py", "--recent {recent}"),
-    ("28_shadow_check.py", ""),
+    # 26→28 先跑：它们有**时间窗口**上的讲究（源发布时刻、retry_until、当天出 STABLE/NOT_YET 判定）。
+    ("26_refresh_largepool.py", "--workers {workers}", 3600),
+    ("27_shadow_ab.py", "--recent {recent}", 3600),
+    ("28_shadow_check.py", "", 3600),
+    # 35 **放最后**：它是 PIT 无偏宇宙的数据底座（此前没接入任何定时任务 => 库一度冻结在
+    # 2026-09-11，所有 PIT 结论 36/37/40/43 都停在那个日期）。放最后是因为它**很慢** ——
+    # 实测 workers=1 时 5218 只约 **2 小时**，若放前面会把 26→28 整体推迟两小时，
+    # 而 26→28 有窗口讲究、35 没有（晚两小时跑完毫无影响）。
+    # [!] 它走 akshare（每次调用新建 V8 上下文，workers>1 必崩 => 配死 workers:1），
+    #     且它的单步超时必须放宽到 3h，否则会被 1h 超时**截断在半途**，
+    #     留下「一部分票已推进、一部分没推进」的不一致库。
+    ("35_fetch_full_market.py", "--refresh --workers {fm_workers} --min-gap {fm_gap}", 10800),
 ]
 
 
@@ -404,21 +414,61 @@ def _shadow_ab_pipeline(sab: dict) -> None:
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}   # 强制子进程 UTF-8，日志不乱码
     workers = str(sab.get("workers", 4))
     recent = str(sab.get("recent", 700))
+    # ---- scripts/35（全市场增量）的独立开关与更严的内存闸门 ----
+    # 为什么单独设：35 走 akshare，每次调用新建一个 V8(py_mini_racer) 上下文，而它的
+    # docstring 明确建议「跑之前先停掉 8001 服务」。这里是在服务运行时跑，所以：
+    #   ① 内存闸门调得比 min_free_mb(1200) 更严（默认 2500）—— 不够就**跳过本步**，
+    #      26→28 照跑（35 与它们无依赖）；
+    #   ② 即便崩了也只是子进程崩（V8 FATAL 是进程级），服务与流水线都不受影响。
+    # 要整体关掉：config `auto_refresh.shadow_ab.full_market.enabled: false`。
+    fm = sab.get("full_market") or {}
+    fm_enabled = bool(fm.get("enabled", True))
+    fm_workers = str(fm.get("workers", 1))
+    fm_gap = str(fm.get("min_gap", 0.4))
+    fm_min_mb = float(fm.get("min_free_mb", 2500) or 0)
+    # 只在指定星期几跑（默认周五）。workers=1 时 5218 只约 35 分钟，每天跑太重；
+    # 而 --refresh 每股是追加「其最后日期之后的所有行」，所以每周一次拿到的数据是完整的。
+    fm_days = {int(x) for x in str(fm.get("weekdays", "4")).replace("，", ",").split(",")
+               if x.strip().isdigit()}
     with logf.open("a", encoding="utf-8") as fh:
-        for name, args_tpl in _SHADOW_STEPS:
+        for name, args_tpl, step_timeout in _SHADOW_STEPS:
+            if name.startswith("35_"):
+                if not fm_enabled:
+                    logger.info("[shadow] 跳过 35：full_market.enabled=false")
+                    fh.write("[跳过] 35：full_market.enabled=false\n")
+                    fh.flush()
+                    continue
+                if fm_days and datetime.now().weekday() not in fm_days:
+                    logger.info("[shadow] 跳过 35：今天星期%d 不在 full_market.weekdays=%s 内",
+                                datetime.now().weekday(), sorted(fm_days))
+                    fh.write(f"[跳过] 35：非指定星期（weekdays={sorted(fm_days)}）\n")
+                    fh.flush()
+                    continue
+                free_mb = _free_mem_mb()
+                if free_mb < fm_min_mb:
+                    logger.warning("[shadow] 跳过 35：可用内存仅 %.0fMB（< %.0fMB）。"
+                                   "35 走 akshare、每次调用新建 V8 上下文，内存紧张时正是"
+                                   "V8 FATAL 的场景。本步跳过不影响 26→28",
+                                   free_mb, fm_min_mb)
+                    fh.write(f"[跳过] 35：可用内存 {free_mb:.0f}MB < {fm_min_mb:.0f}MB\n")
+                    fh.flush()
+                    continue
             argv = [sys.executable, "-u", str(repo / "scripts" / name)]
             if args_tpl:
-                argv += args_tpl.format(workers=workers, recent=recent).split()
+                argv += args_tpl.format(workers=workers, recent=recent,
+                                        fm_workers=fm_workers, fm_gap=fm_gap).split()
             fh.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {name} =====\n")
             fh.flush()
             logger.info("[shadow] 启动 %s ...", name)
             try:
                 r = subprocess.run(argv, cwd=str(repo), env=env,
                                    capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace", timeout=3600)
+                                   encoding="utf-8", errors="replace",
+                                   timeout=step_timeout)
             except subprocess.TimeoutExpired:
-                logger.error("[shadow] %s 超时(>1h)，中止本日流水线", name)
-                fh.write("[超时>1h]\n")
+                logger.error("[shadow] %s 超时(>%.0fh)，中止本日流水线", name,
+                             step_timeout / 3600)
+                fh.write(f"[超时>{step_timeout / 3600:.0f}h]\n")
                 break
             except Exception as exc:  # noqa: BLE001
                 # 例如 argv 组装错误：写进 shadow 日志（服务 stdout 未必含 api 模块日志）
