@@ -598,6 +598,48 @@ def factor_ic_subset(close, amount, pe, roe, tech, dates):
                                   _factor_panels(pe, roe, tech))
 
 
+def factor_layer_profile(close, amount, pe, roe, tech, dates, layers=5):
+    """在 funded 集内按因子**分层**，画每层的前向收益 —— 直接检验「非单调」。
+
+    为什么必须看这个：低波/反转在 funded 集上的 IC 显著为正（+0.055 / +0.062），
+    但按它**正确排序**的 top-12 打不过随机（低波甚至显著更差 −0.736, t=−2.19）。
+    IC 是全截面的**平均**排序信息，**不保证头部那一段也单调** —— 本函数把每层画出来。
+
+    返回 {因子: [每期的各层「相对 funded 均值」的超额]}；层序 = 因子值**从小到大**，
+    所以**最后一层就是选票会取的那一端**。
+    """
+    panels = _factor_panels(pe, roe, tech)
+    prof = {k: [] for k in panels}
+    sel = list(dates[::REBAL])
+    for d in sel[:-1]:
+        i = dates.get_loc(d)
+        if i + REBAL >= len(dates):
+            break
+        d2 = dates[i + REBAL]
+        fwd = (close.loc[d2] / close.loc[d] - 1).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(fwd) < 30:
+            continue
+        funded, _n = candidates_at(d, close, amount, pe, roe)
+        if not funded:
+            continue
+        r_sub = fwd.reindex([r[0] for r in funded]).dropna()
+        if len(r_sub) < layers * 4:
+            continue
+        base = float(r_sub.mean())
+        for k, p in panels.items():
+            if d not in p.index:
+                continue
+            f = p.loc[d].reindex(r_sub.index).dropna()
+            b = f.index.intersection(r_sub.index)
+            if len(b) < layers * 4:
+                continue
+            order = f[b].sort_values(ascending=True).index     # 因子值 低 -> 高
+            rr = r_sub[order].to_numpy(dtype=float)
+            groups = np.array_split(np.arange(len(rr)), layers)
+            prof[k].append([float(rr[g].mean()) - base for g in groups])
+    return prof
+
+
 def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
     """跑两层归因，写 results/factor_attribution.json（**不碰** pit_select_backtest.json）。"""
     from scipy.stats import norm
@@ -756,6 +798,39 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
                 "vs_D_pct": round(float(dd.mean()) * 100, 3), "vs_D_t": round(t, 2)}
             print(f"{v:<16}{name:<12}{mm['total']:>10.1f}{float(a.mean()) * 100:>11.3f}"
                   f"{float(dd.mean()) * 100:>10.3f}{t:>7.2f}")
+
+    # ---- 分层收益曲线：IC 显著为正，但**头部那一层**抬起来了吗？----
+    from scipy.stats import spearmanr
+    LAYERS = 5
+    prof = factor_layer_profile(close, amount, pe, roe, tech, dates, LAYERS)
+    out["layer_profile"] = {}
+    print()
+    print("=" * 96)
+    print(f"分层收益曲线（funded 集内按因子分 {LAYERS} 层，每层相对 funded 均值的超额 %）")
+    print("  层序 = 因子值**从小到大**；**最后一层就是选票会取的那一端**")
+    print("  IC 显著为正、但最后一层不抬 => **非单调**：信息在中段，头部没有")
+    print("=" * 96)
+    hdr = "".join(f"{'层' + str(j + 1):>9}" for j in range(LAYERS))
+    print(f"{'因子':<18}{hdr}{'头-底':>9}{'t':>7}{'层序相关':>10}")
+    print("-" * 96)
+    for k, lab in FACTOR_LABELS.items():
+        if k not in prof or not prof[k]:
+            continue
+        arr = np.asarray(prof[k], dtype=float)          # (n_period, layers)
+        mean_layer = arr.mean(axis=0) * 100
+        d_tb = arr[:, -1] - arr[:, 0]
+        se = float(d_tb.std(ddof=1)) / np.sqrt(len(d_tb)) if len(d_tb) > 2 else 0.0
+        t_tb = float(d_tb.mean()) / se if se else 0.0
+        mono, _ = spearmanr(np.arange(1, LAYERS + 1), mean_layer)
+        out["layer_profile"][k] = {
+            "layers_pct": [round(float(x), 3) for x in mean_layer],
+            "top_minus_bottom_pct": round(float(d_tb.mean()) * 100, 3),
+            "top_minus_bottom_t": round(t_tb, 2),
+            "layer_order_spearman": round(float(mono), 3) if np.isfinite(mono) else None,
+            "n_periods": int(len(arr))}
+        cells = "".join(f"{x:>9.3f}" for x in mean_layer)
+        print(f"{lab:<18}{cells}{float(d_tb.mean()) * 100:>9.3f}{t_tb:>7.2f}"
+              f"{mono:>10.2f}")
 
     # ---- 第 2 层：单因子消融回测（对照 = D，同流动性门槛的随机 12 只）----
     print()
