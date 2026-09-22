@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import socket
 import sqlite3
 import sys
@@ -70,6 +71,15 @@ from quant.data.fetcher import fetch_daily_full                     # noqa: E402
 socket.setdefaulttimeout(25)
 
 _FLUSH_ROWS = 20000         # 累积多少行提交一次（行 + 状态同事务）
+# ---- 健壮性（2026-09-22 首次实跑挂死后加）----
+# 实测：workers=1（V8 逼的，>1 必崩）时，**一只票的 HTTP 挂住就拖死整个循环** ——
+# `fetch_daily_full` 走 akshare/新浪、**没有超时**；而原来只在攒够 _FLUSH_ROWS 才提交，
+# 于是一挂就**全丢**（当晚卡 105 分钟、杀掉时 0 行入库）。
+# 两条对策：① 定期 flush，保住已完成的工作；② 无进展看门狗，果断放弃挂住的那几只。
+_WATCHDOG_POLL = 15         # 看门狗轮询间隔（秒）
+_STALL_SEC = int(os.environ.get("QUANT_35_STALL_SEC", "240"))   # 无进展多少秒判定挂死
+#                          （正常每只约 1s；可用环境变量覆盖，便于测试/运维调参）
+_FLUSH_SEC = 120            # 定期 flush 间隔（秒）
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS full_daily (
@@ -257,11 +267,39 @@ def main():
     t0 = time.time()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+    last_prog = time.time()          # 上次「有 future 完成」的时刻
+    last_flush = time.time()
+    stalled = False
+    logs_dir = Path(cfg.resolve("logs"))
+    ex = ThreadPoolExecutor(max_workers=args.workers)
+    try:
         futs = {ex.submit(_one, c): c for c in todo}
         pending = set(futs)
         while pending:
-            done_set, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+            done_set, pending = wait(pending, timeout=_WATCHDOG_POLL,
+                                     return_when=FIRST_COMPLETED)
+            now_t = time.time()
+            if done_set:
+                last_prog = now_t
+            elif now_t - last_prog > _STALL_SEC:
+                # [!] 无进展看门狗（2026-09-22 加）。正常每只约 1 秒，连续 _STALL_SEC 秒
+                # 一只都没完成 => 几乎肯定是**某只票的请求挂住**。注意脚本开头虽有
+                # `socket.setdefaulttimeout(25)`，但 2026-09-22 实测**没兜住**
+                # （工具链很可能以 timeout=None 建连，显式 None 即阻塞模式、全局默认不生效），
+                # 当晚因此卡了 105 分钟且 0 行入库。
+                # 这里果断放弃剩余，**把已抓到的落库**。
+                stuck = sorted(futs[f] for f in pending)
+                stalled = True
+                print(f"[35] 看门狗：{_STALL_SEC} 秒无任何进展，放弃剩余 {len(stuck)} 只"
+                      f"（已抓到的会落库，下次重跑会自动重试这些）。", flush=True)
+                print(f"[35] 放弃清单（前 10）: {stuck[:10]}", flush=True)
+                try:
+                    logs_dir.mkdir(parents=True, exist_ok=True)
+                    (logs_dir / "full_market_stalled.txt").write_text(
+                        "\n".join(stuck), encoding="utf-8")
+                except OSError:
+                    pass
+                break
             for fut in done_set:
                 code, df, err = fut.result()
                 done += 1
@@ -280,15 +318,33 @@ def main():
                     d1 = str(df["date"].iloc[-1])[:10]
                     state_buf.append((code, "ok", len(df), d0, d1, now, None))
                     del df
-                if len(rows_buf) >= _FLUSH_ROWS:
-                    _flush(con, rows_buf, state_buf)
                 if done % 100 == 0:
                     el = time.time() - t0
                     eta = el / done * (len(todo) - done) / 60
                     print(f"  {done}/{len(todo)}  成功 {ok}  新增 {fresh}  "
                           f"失败 {len(failures)}  空 {len(empty)}  "
                           f"用时 {el / 60:.1f}min  剩余约 {eta:.0f}min", flush=True)
-    _flush(con, rows_buf, state_buf)
+            # 定期 flush：别像原来那样攒够 _FLUSH_ROWS(20000) 才提交 —— 一挂就全丢
+            if now_t - last_flush > _FLUSH_SEC or len(rows_buf) >= _FLUSH_ROWS:
+                _flush(con, rows_buf, state_buf)
+                last_flush = now_t
+    finally:
+        # wait=False：不等待那个卡住的线程（等它会一直挂）
+        ex.shutdown(wait=False, cancel_futures=True)
+    _flush(con, rows_buf, state_buf)                 # 落库（含看门狗放弃前已抓到的）
+
+    if stalled:
+        # [!] 数据已安全落库，但 ThreadPoolExecutor 的 worker 线程在 Python 3.9+ 是
+        # **非 daemon** 的，解释器退出时会 join 它们 —— 那个卡住的线程会让进程**永不退出**
+        # （2026-09-22 当晚就是这样：库无进展、进程还活着，只能强杀）。
+        # 这里直接 _exit，跳过线程 join。这是"我该保存的都保存了，不等僵尸线程"的标准做法。
+        print("[35] 数据已落库；因仍有线程卡在网络请求上，直接退出进程（不等它 join）。",
+              flush=True)
+        try:
+            con.close()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
 
     logs = Path(cfg.resolve("logs"))
     logs.mkdir(parents=True, exist_ok=True)
