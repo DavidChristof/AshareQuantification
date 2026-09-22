@@ -96,6 +96,19 @@ TOPN = 12
 RANDOM_SEED = 42
 N_SEEDS = 20        # 随机基准取多少个种子平均（单种子噪声太大，曾把 t 值从 -0.5 抖到 -4）
 
+# 一次**完整往返**的费用（占成交额），按纸面/手动账户的费用口径（config: commission 0.0003 /
+# stamp_tax 0.0005 / slippage 0.0002，均无最低佣金）：
+#     买入  佣金 0.03% + 滑点 0.02%                 = 0.05%
+#     卖出  佣金 0.03% + 印花税 0.05% + 滑点 0.02%   = 0.10%
+#     合计                                           = 0.15%
+# [!] 由此可知 `COST = 0.16%` **等价于「每期 100% 全额换手」的一次往返**。
+# 而实测实际换手只有约 61%（每期换掉 7.4/12 只）=> 旧的 COST 口径**高估**了约 1.7 倍。
+# 「按换手计费」模式用 ROUND_TRIP x 实际换手，才是自洽的。
+ROUND_TRIP = 0.0015
+
+# 实盘 3000 元账户口径（5 元最低佣金主导）：往返约 = 10/名义额 + 0.112%。仅作参照，未用于回测。
+REAL_MIN_COMMISSION = 5.0
+
 
 def _pivot(df, col, fdtype="float32"):
     p = df.pivot_table(index="date", columns="symbol", values=col).sort_index()
@@ -280,13 +293,17 @@ def tech_scores_at(d, tech, codes, weights, mode="clamp", flip=()):
 
 
 def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
-              tech_mode="clamp", tech_flip=()):
+              tech_mode="clamp", tech_flip=(), keep=None, buffer=0):
     """按 `mode` 产出该日 top-N。
 
     mode: A 忠实复刻 / B 修正 tech 缺失 / F 只用基本面 / G 只用技术面
           P 只用 PE 分 / R 只用 ROE 分（归因用，仿 G 走全 80 只候选）
     tech_mode: clamp（线上原式）/ raw（不 clamp，保序）—— 见 score_tech。
     tech_flip: 要反向的因子集合 —— 见 score_tech。
+    keep/buffer: **持有缓冲区**（降换手用）。`keep` = 上一期持有的票；
+        掉出前 `topn + buffer` 名的才卖，还在缓冲区内的继续持有（保持分数序），
+        空缺用缓冲区里按分最高的新票补足。buffer=0 时行为与原先完全一致。
+        线上手动/实盘路径**没有**这个机制（只在「今天 top-12 里还有它」时才留）。
     """
     topn = topn or TOPN
     funded, n_liq = candidates_at(d, close, amount, pe, roe)
@@ -324,9 +341,20 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
             total = fs * 0.6 + ts * 0.4
         rows.append((c, total))
     rows.sort(key=lambda x: -x[1])
+    ranked = [c for c, _ in rows]
+    n_keep = 0
+    if keep and buffer:
+        band = ranked[:topn + buffer]                  # 缓冲区：前 topn+buffer 名
+        kept = [c for c in band if c in keep]          # 其中仍持有的 -> 继续持有（保持分数序）
+        fresh = [c for c in band if c not in keep]     # 其余按分补足
+        n_keep = len(kept)
+        picks = kept + fresh[:max(0, topn - len(kept))]
+    else:
+        picks = ranked[:topn]
     diag = {"funded": len(funded), "tech": len(ts_map), "liq": n_liq,
-            "picked_from_top40": sum(1 for c, _ in rows[:topn] if c in ts_map)}
-    return [c for c, _ in rows[:topn]], diag
+            "picked_from_top40": sum(1 for c in picks if c in ts_map),
+            "kept": n_keep}
+    return picks, diag
 
 
 # ============================================================
@@ -346,20 +374,29 @@ FUND_HALF_MODE = {"P_pe": "P", "R_roe": "R"}
 
 
 def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
-        tech_use=None, tech_mode="clamp", tech_flip=(), tech_w=None):
+        tech_use=None, tech_mode="clamp", tech_flip=(), tech_w=None,
+        rebal=REBAL, cost_mode="flat", buffer=0, stats=None):
     """tech_use/tech_mode/tech_flip/tech_w：**归因与改造实验专用**（默认 = 原行为，A-H 不受影响）。
 
-    这样「同一套变体、换一种归一化/换一组权重/反转某些因子」不需要新增变体名。
+    rebal     : 调仓间隔（默认 REBAL=5）。原先写死，现可扫频。
+    cost_mode : "flat"（原行为，每期固定 COST）| "turnover"（**按实际换手计费**：
+                fee = 换手率 x ROUND_TRIP）。原口径等价于假设每期 100% 全额换手，
+                而实测只有约 61% => 旧口径高估成本。
+    buffer    : 持有缓冲区宽度（见 select_at）。0 = 原行为（掉出 topN 即卖）。
+    stats     : 可选 dict；会填入 "turnover"（逐期换手率）与 "n_periods"。
     """
     tech_use = tech if tech_use is None else tech_use
-    sel_dates = list(dates[::REBAL])
+    sel_dates = list(dates[::rebal])
     nav, curve = 1.0, []
     diags, alphas = [], []
+    cur: set = set()                      # 持仓台账（原先没有 —— 无法算换手）
+    if stats is not None:
+        stats.setdefault("turnover", [])
     for d in sel_dates[:-1]:
         i = dates.get_loc(d)
-        if i + REBAL >= len(dates):
+        if i + rebal >= len(dates):
             break
-        d2 = dates[i + REBAL]
+        d2 = dates[i + rebal]
 
         if variant in ("D", "H"):                           # 随机基准（多种子取平均）
             # D 从「通过 1 亿流动性门槛」的集合抽；H 从全宇宙抽（隔离门槛本身的影响）
@@ -392,13 +429,13 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
         elif variant in TECH_ONLY_WEIGHTS:                   # 单技术因子（G 分支 + 单位权重）
             picks, diag = select_at(d, close, amount, pe, roe, tech_use,
                                     TECH_ONLY_WEIGHTS[variant], "G", topn,
-                                    tech_mode, tech_flip)
+                                    tech_mode, tech_flip, cur, buffer)
             if diag:
                 diags.append({**diag, "date": d})
         elif variant in FUND_HALF_MODE:                      # 只按 PE 分 / 只按 ROE 分
             picks, diag = select_at(d, close, amount, pe, roe, tech_use,
                                     DEFAULT_TECH_WEIGHTS, FUND_HALF_MODE[variant], topn,
-                                    tech_mode, tech_flip)
+                                    tech_mode, tech_flip, cur, buffer)
             if diag:
                 diags.append({**diag, "date": d})
         else:
@@ -407,7 +444,7 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
                  (DEFAULT_TECH_WEIGHTS if variant == "C"
                   else regime_by_date.get(d, DEFAULT_TECH_WEIGHTS)))
             picks, diag = select_at(d, close, amount, pe, roe, tech_use, w, mode, topn,
-                                    tech_mode, tech_flip)
+                                    tech_mode, tech_flip, cur, buffer)
             if diag:
                 diags.append({**diag, "date": d})
         if len(picks) < max(1, topn // 2):
@@ -418,12 +455,20 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
         seg = (p1 / p0 - 1).replace([np.inf, -np.inf], np.nan).dropna()
         if not len(seg):
             continue
-        r = float(seg.mean()) - (COST if variant != "E" else 0.0)
+        # 换手率 = 这一期**新买进**的比例（等权下即需要重新建仓的仓位占比）
+        turn = (len(set(picks) - cur) / len(picks)) if cur else 1.0
+        if stats is not None:
+            stats["turnover"].append(turn)
+        fee = (turn * ROUND_TRIP) if cost_mode == "turnover" else COST
+        r = float(seg.mean()) - (fee if variant != "E" else 0.0)
         nav *= (1 + r)
+        cur = set(picks)
         curve.append((d2, nav))
         uni_r = _uni_ret(close, d, d2)
         if not np.isnan(uni_r):
             alphas.append((d2, r - uni_r))
+    if stats is not None:
+        stats["n_periods"] = len(stats["turnover"])
     return curve, diags, alphas
 
 
@@ -433,7 +478,7 @@ def _uni_ret(close, d, d2):
     return float(uni.mean()) if len(uni) else np.nan
 
 
-def metrics(curve):
+def metrics(curve, rebal=REBAL):
     if not curve:
         return {}
     ser = pd.Series(dict(curve))
@@ -443,7 +488,7 @@ def metrics(curve):
     return {"total": round(tot * 100, 1),
             "annual": round(((1 + tot) ** (1 / yrs) - 1) * 100, 2) if yrs > 0 else 0.0,
             "maxdd": round(float((ser / ser.cummax() - 1).min()) * 100, 1),
-            "sharpe": round(float(per.mean() / per.std() * np.sqrt(252 / REBAL)), 2)
+            "sharpe": round(float(per.mean() / per.std() * np.sqrt(252 / rebal)), 2)
             if per.std() else 0.0,
             "_ser": ser}
 
@@ -997,6 +1042,81 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
               f"{(d_d or 0):>9.3f}{(t_d or 0):>7.2f}   {'通过' if ok else '未通过'}")
     print()
     print("[!] 判定标准在跑之前就写死了。未通过 => 不碰 selector.py、不改线上权重。")
+
+    # ---- 成本与换手：旧口径高估了多少？降换手值多少？----
+    print()
+    print("=" * 96)
+    print("成本与换手：旧口径 COST=0.16%/期 **假设了 100% 全额换手**，实际换手多少？降换手值多少？")
+    print(f"  自洽口径：一次完整往返 ROUND_TRIP = {ROUND_TRIP:.4%}"
+          "（买 佣金0.03+滑点0.02 / 卖 佣金0.03+印花0.05+滑点0.02，纸面账户费率）")
+    print("  按换手计费：fee = **实际换手率** x ROUND_TRIP")
+    print("=" * 96)
+    out["turnover"] = {"round_trip": ROUND_TRIP, "rebal_sweep": {}, "buffer": {}}
+
+    def _one(rb, buf, mode):
+        st: dict = {}
+        c, _d, _a = run("B", close, amount, pe, roe, tech, regime_by_date, topn, dates,
+                        rebal=rb, cost_mode=mode, buffer=buf, stats=st)
+        mm = metrics(c, rb)
+        to = float(np.mean(st.get("turnover") or [0.0]))
+        mm.pop("_ser", None)
+        return mm, to, len(st.get("turnover") or [])
+
+    print()
+    print("① 调仓间隔（缓冲=0）：拉长周期能省多少？")
+    print(f"  {'间隔':<8}{'期数':>6}{'平均换手':>10}{'旧口径总收益':>15}{'按换手计费':>13}")
+    print("  " + "-" * 62)
+    for rb in (5, 10, 20):
+        mf, to, n = _one(rb, 0, "flat")
+        mt, _, _ = _one(rb, 0, "turnover")
+        out["turnover"]["rebal_sweep"][str(rb)] = {
+            "n": n, "turnover": round(to, 4), "flat_total": mf["total"],
+            "turn_total": mt["total"]}
+        print(f"  {rb:>2} 日{'':<3}{n:>6}{to:>10.1%}{mf['total']:>14.1f}%{mt['total']:>12.1f}%")
+
+    print()
+    print("② 持有缓冲区（间隔=5）：掉出前 topN+buffer 名才卖 —— 不牺牲信号新鲜度的降换手")
+    print(f"  {'缓冲':<8}{'期数':>6}{'平均换手':>10}{'旧口径总收益':>15}{'按换手计费':>13}")
+    print("  " + "-" * 62)
+    for buf in (0, 6, 12, 24):
+        mf, to, n = _one(5, buf, "flat")
+        mt, _, _ = _one(5, buf, "turnover")
+        out["turnover"]["buffer"][str(buf)] = {
+            "n": n, "turnover": round(to, 4), "flat_total": mf["total"],
+            "turn_total": mt["total"]}
+        print(f"  {buf:>4} 只{'':<2}{n:>6}{to:>10.1%}{mf['total']:>14.1f}%{mt['total']:>12.1f}%")
+
+    print()
+    print("[!] 两列之差 = **成本口径**的影响（旧口径高估多少）；同行内跨 buffer/间隔 = 该杠杆的效果。")
+    print("[!] 缓冲区的代价：它会**多持有已经掉出榜单的票**，改变的是信号暴露而不只是成本 ——")
+    print("    所以 buffer 变大时收益若更差，不能只读成「成本没省下来」。")
+
+    # ---- 配对检验：5 日 vs 20 日 ----
+    # 两种频率的**期数不同**（252 vs 63），不能逐期配对。做法：把 5 日策略在
+    # **每个 20 日区块**上的复合收益，与 20 日策略在同一区块的收益配对 —— 20 = 4x5，
+    # 所以 20 日的调仓日必然是 5 日调仓日的子集，两者的区块边界天然对齐。
+    print()
+    print("配对检验 5 日 vs 20 日（按**共同的 20 日区块**配对，消除期数差异）:")
+    st5b, st20b = {}, {}
+    c5, _x1, _y1 = run("B", close, amount, pe, roe, tech, regime_by_date, topn, dates,
+                       rebal=5, cost_mode="turnover", stats=st5b)
+    c20, _x2, _y2 = run("B", close, amount, pe, roe, tech, regime_by_date, topn, dates,
+                        rebal=20, cost_mode="turnover", stats=st20b)
+    s5, s20 = pd.Series(dict(c5)), pd.Series(dict(c20))
+    common = [t for t in s20.index if t in s5.index]
+    diffs = [(s5[b] / s5[a] - 1) - (s20[b] / s20[a] - 1)
+             for a, b in zip(common[:-1], common[1:])]
+    if len(diffs) >= 10:
+        arr = np.asarray(diffs, dtype=float)
+        se = float(arr.std(ddof=1)) / np.sqrt(len(arr))
+        tv = float(arr.mean()) / se if se else 0.0
+        out["turnover"]["pair_5_vs_20"] = {
+            "n_blocks": int(len(arr)), "diff_pct": round(float(arr.mean()) * 100, 3),
+            "t": round(tv, 2)}
+        print(f"  区块数 {len(arr)}   逐区块差均值 {arr.mean() * 100:+.3f}%   t = {tv:+.2f}")
+        print("  负 = 5 日更差。**|t|>2 才能说「拉长周期确实更好」**；否则点估计好看也不算数。")
+    else:
+        print(f"  共同区块只有 {len(diffs)} 个，无法配对。")
 
     print()
     print("[!] A 与 B 要一起看：A 保留「排名 41~80 的票 total=fund_score 未减半」这个缺陷，")
