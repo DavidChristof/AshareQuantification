@@ -187,13 +187,45 @@ def score_stock(pe, roe):
     return round(p + r, 1)
 
 
-def score_tech(mom, trd, vol, rev, w):
-    """与 selector._score_tech 同式。"""
-    m = max(0.0, min(1.0, (mom + 0.05) / 0.25))
-    t = max(0.0, min(1.0, (trd + 0.05) / 0.10))
-    v = max(0.0, min(1.0, 1.0 - vol / 0.03))
-    r = max(0.0, min(1.0, (rev + 0.20) / 0.30))
-    return round(m * w["mom"] + t * w["trd"] + v * w["vol"] + r * w["rev"], 1)
+def score_tech(mom, trd, vol, rev, w, mode="clamp"):
+    """与 selector._score_tech 同式。
+
+    mode="clamp"（默认 = 线上原式）：把每个因子压到 [0,1] 后再加权，末尾 round 到 0.1。
+    mode="raw"（**仅供归因**，不改线上）：不压、不 round —— 保留因子的连续排序信息。
+
+    [!] 为什么要这个开关：clamp 会让大量候选并列在 1.0，而 `sorted` 是稳定的 =>
+    并列组内的顺序由插入顺序（= fund_score 降序）决定，**因子不参与排序**。
+    实测 trd/mom 有 ~84%/81% 的候选并列在满分，其 top-12 **100% 取自并列组**。
+    """
+    m = (mom + 0.05) / 0.25
+    t = (trd + 0.05) / 0.10
+    v = 1.0 - vol / 0.03
+    r = (rev + 0.20) / 0.30
+    if mode == "clamp":
+        m = max(0.0, min(1.0, m))
+        t = max(0.0, min(1.0, t))
+        v = max(0.0, min(1.0, v))
+        r = max(0.0, min(1.0, r))
+    val = m * w["mom"] + t * w["trd"] + v * w["vol"] + r * w["rev"]
+    return round(val, 1) if mode == "clamp" else val
+
+
+def _norm_panels(tech, how):
+    """四个原始技术面板 -> 归一化到可比尺度的面板。
+
+    how: clamp（线上原式，会并列）/ raw（不裁，保序，但尾部可能被离群值主导）
+         / rank（**截面百分位**：严格保序、有界、且不会有并列）
+    """
+    mom, trd, vol, rev = tech
+    m, t = (mom + 0.05) / 0.25, (trd + 0.05) / 0.10
+    v, r = 1.0 - vol / 0.03, (rev + 0.20) / 0.30
+    if how == "clamp":
+        return tuple(x.clip(0.0, 1.0) for x in (m, t, v, r))
+    if how == "raw":
+        return (m, t, v, r)
+    if how == "rank":
+        return tuple(x.rank(axis=1, pct=True) for x in (m, t, v, r))
+    raise ValueError(f"未知的归一化方式: {how}")
 
 
 # ============================================================
@@ -228,23 +260,26 @@ def candidates_at(d, close, amount, pe, roe):
     return funded, len(liq)
 
 
-def tech_scores_at(d, tech, codes, weights):
-    """给定代码，算技术面分；数据不足（vol20 为 NaN）跳过。"""
+def tech_scores_at(d, tech, codes, weights, mode="clamp"):
+    """给定代码，算技术面分；数据不足（vol20 为 NaN）跳过。mode 见 score_tech。"""
     mom, trd, vol, rev = tech
     out = {}
     for c in codes:
         v = vol.at[d, c]
         if not np.isfinite(v):
             continue
-        out[c] = score_tech(mom.at[d, c], trd.at[d, c], float(v), rev.at[d, c], weights)
+        out[c] = score_tech(mom.at[d, c], trd.at[d, c], float(v), rev.at[d, c],
+                            weights, mode)
     return out
 
 
-def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None):
+def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
+              tech_mode="clamp"):
     """按 `mode` 产出该日 top-N。
 
     mode: A 忠实复刻 / B 修正 tech 缺失 / F 只用基本面 / G 只用技术面
           P 只用 PE 分 / R 只用 ROE 分（归因用，仿 G 走全 80 只候选）
+    tech_mode: clamp（线上原式）/ raw（不 clamp，保序）—— 见 score_tech。
     """
     topn = topn or TOPN
     funded, n_liq = candidates_at(d, close, amount, pe, roe)
@@ -252,7 +287,7 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None):
         return [], {}
 
     if mode == "G":                     # 技术面单因子：对全部 80 只候选算技术面
-        ts_map = tech_scores_at(d, tech, [r[0] for r in funded], weights)
+        ts_map = tech_scores_at(d, tech, [r[0] for r in funded], weights, tech_mode)
         if not ts_map:
             return [], {}
         rows = sorted(ts_map.items(), key=lambda x: -x[1])
@@ -270,7 +305,8 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None):
                                              "tech": 0, "liq": n_liq}
 
     # A/B：技术面只对基本面 top TECH_TOPK 计算（与线上一致）
-    ts_map = tech_scores_at(d, tech, [r[0] for r in funded[:TECH_TOPK]], weights)
+    ts_map = tech_scores_at(d, tech, [r[0] for r in funded[:TECH_TOPK]], weights,
+                            tech_mode)
     rows = []
     for c, fs, _pes, _roes in funded:
         ts = ts_map.get(c)
@@ -301,7 +337,13 @@ TECH_ONLY_WEIGHTS = {
 FUND_HALF_MODE = {"P_pe": "P", "R_roe": "R"}
 
 
-def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates):
+def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
+        tech_use=None, tech_mode="clamp"):
+    """tech_use/tech_mode：**归因专用**的替换面板与打分模式（默认 = 原行为，A-H 不受影响）。
+
+    这样「同一套变体、换一种归一化」不需要新增变体名：传不同的 (tech_use, tech_mode) 即可。
+    """
+    tech_use = tech if tech_use is None else tech_use
     sel_dates = list(dates[::REBAL])
     nav, curve = 1.0, []
     diags, alphas = [], []
@@ -340,20 +382,22 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates):
         if variant == "E":                                  # 全宇宙等权
             picks = list(close.loc[d].dropna().index)
         elif variant in TECH_ONLY_WEIGHTS:                   # 单技术因子（G 分支 + 单位权重）
-            picks, diag = select_at(d, close, amount, pe, roe, tech,
-                                    TECH_ONLY_WEIGHTS[variant], "G", topn)
+            picks, diag = select_at(d, close, amount, pe, roe, tech_use,
+                                    TECH_ONLY_WEIGHTS[variant], "G", topn, tech_mode)
             if diag:
                 diags.append({**diag, "date": d})
         elif variant in FUND_HALF_MODE:                      # 只按 PE 分 / 只按 ROE 分
-            picks, diag = select_at(d, close, amount, pe, roe, tech,
-                                    DEFAULT_TECH_WEIGHTS, FUND_HALF_MODE[variant], topn)
+            picks, diag = select_at(d, close, amount, pe, roe, tech_use,
+                                    DEFAULT_TECH_WEIGHTS, FUND_HALF_MODE[variant], topn,
+                                    tech_mode)
             if diag:
                 diags.append({**diag, "date": d})
         else:
             mode = variant if variant in ("A", "B", "F", "G") else "B"
             w = (DEFAULT_TECH_WEIGHTS if variant == "C"
                  else regime_by_date.get(d, DEFAULT_TECH_WEIGHTS))
-            picks, diag = select_at(d, close, amount, pe, roe, tech, w, mode, topn)
+            picks, diag = select_at(d, close, amount, pe, roe, tech_use, w, mode, topn,
+                                    tech_mode)
             if diag:
                 diags.append({**diag, "date": d})
         if len(picks) < max(1, topn // 2):
@@ -645,6 +689,73 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
             verdict = "clamp 后仍在"
         print(f"{lab:<20}{raw['mean_pct']:>12.4f}{raw['t']:>7.2f}"
               f"{cl['mean_pct']:>11.4f}{cl['t']:>7.2f}   {verdict}")
+
+    # ---- 修法验证：把排序从 clamp 换成**保序**的归一化，技术面是否开始起作用？----
+    print()
+    print("=" * 96)
+    print("修法验证：排序改用**保序**的归一化，技术面是否开始起作用？")
+    print("  关键读数 = B_norm 减 F（F = 只用基本面）。线上 clamp 下这个差是 +0.020 (t=0.18)")
+    print("  若去 clamp 后它显著偏离 0 => 技术面开始参与排序（且能看出方向是好是坏）")
+    print("=" * 96)
+    cF, _dF, aF = run("F", close, amount, pe, roe, tech, regime_by_date, topn, dates)
+    sF = pd.Series(dict(aF)).sort_index()
+    out["norm_fix"] = {}
+    print(f"{'归一化':<26}{'B 总收益':>10}{'B 年化':>9}{'B alpha':>10}{'B t':>7}"
+          f"{'B 减 F':>10}{'t':>7}")
+    print("-" * 96)
+    for name, lab, how, tmode in (("clamp", "线上原式(会并列)", None, "clamp"),
+                                  ("raw", "不裁(保序)", "raw", "raw"),
+                                  ("rank", "截面百分位(保序、无并列)", "rank", "raw")):
+        tu = None if how is None else _norm_panels(tech, how)
+        cB, _dB, aB = run("B", close, amount, pe, roe, tech, regime_by_date, topn, dates,
+                          tech_use=tu, tech_mode=tmode)
+        mB = metrics(cB)
+        if not mB:
+            continue
+        mB.pop("_ser", None)
+        a = np.asarray([x for _, x in aB], dtype=float)
+        a_t = (float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+               if len(a) > 2 and a.std() else 0.0)
+        s = pd.concat([pd.Series(dict(aB)).sort_index().rename("x"), sF.rename("y")],
+                      axis=1, sort=False).dropna()
+        dd = s["x"] - s["y"]
+        t = float(dd.mean() / (dd.std(ddof=1) / np.sqrt(len(dd)))) if dd.std() else 0.0
+        out["norm_fix"][name] = {"B_total": mB["total"], "B_annual": mB["annual"],
+                                 "B_sharpe": mB["sharpe"],
+                                 "B_alpha_mean_pct": round(float(a.mean()) * 100, 3),
+                                 "B_alpha_t": round(a_t, 2),
+                                 "B_minus_F_pct": round(float(dd.mean()) * 100, 3),
+                                 "B_minus_F_t": round(t, 2)}
+        print(f"{lab:<26}{mB['total']:>10.1f}{mB['annual']:>9.2f}"
+              f"{float(a.mean()) * 100:>10.3f}{a_t:>7.2f}{float(dd.mean()) * 100:>10.3f}{t:>7.2f}")
+
+    # ---- 单因子臂在两种归一化下 vs D ----
+    print()
+    print("单因子臂 vs D（同 topN 配对）：换归一化后能不能与随机区分开？")
+    print(f"{'臂':<16}{'归一化':<12}{'总收益':>10}{'逐期alpha':>11}{'vs D':>10}{'t':>7}")
+    print("-" * 66)
+    cD, _dD, aD = run("D", close, amount, pe, roe, tech, regime_by_date, topn, dates)
+    sD = pd.Series(dict(aD)).sort_index()
+    out["arms_norm"] = {}
+    for v in ("M_vol", "M_rev", "M_mom"):
+        for name, how, tmode in (("clamp", None, "clamp"), ("rank", "rank", "raw")):
+            tu = None if how is None else _norm_panels(tech, how)
+            curve, _d2, alphas = run(v, close, amount, pe, roe, tech, regime_by_date,
+                                     topn, dates, tech_use=tu, tech_mode=tmode)
+            mm = metrics(curve)
+            if not mm:
+                continue
+            mm.pop("_ser", None)
+            a = np.asarray([x for _, x in alphas], dtype=float)
+            s = pd.concat([pd.Series(dict(alphas)).sort_index().rename("x"), sD.rename("y")],
+                          axis=1, sort=False).dropna()
+            dd = s["x"] - s["y"]
+            t = float(dd.mean() / (dd.std(ddof=1) / np.sqrt(len(dd)))) if dd.std() else 0.0
+            out["arms_norm"][f"{v}_{name}"] = {
+                "total": mm["total"], "alpha_mean_pct": round(float(a.mean()) * 100, 3),
+                "vs_D_pct": round(float(dd.mean()) * 100, 3), "vs_D_t": round(t, 2)}
+            print(f"{v:<16}{name:<12}{mm['total']:>10.1f}{float(a.mean()) * 100:>11.3f}"
+                  f"{float(dd.mean()) * 100:>10.3f}{t:>7.2f}")
 
     # ---- 第 2 层：单因子消融回测（对照 = D，同流动性门槛的随机 12 只）----
     print()
