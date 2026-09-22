@@ -488,6 +488,72 @@ def factor_quantile_table(close, pe, roe, tech, dates):
     return spread, excess, ic
 
 
+def _clamped_panels(tech):
+    """`score_tech` 里**归一化 + clamp 之后**的四个面板（单位权重下就是该子因子的分）。
+
+    [!] 为什么要单独看它：第 1 层的 IC 用的是**原始因子**，而实际选票用的是
+    **clamp 之后的分**。`score_tech` 把每个因子 clamp 到 [0,1]：
+
+        v = clamp(1 - vol/0.03)        vol <= 0      -> 全部满分 1.0（并列）
+        m = clamp((mom + 0.05)/0.25)   mom >= 0.20   -> 全部满分 1.0（并列）
+        t = clamp((trd + 0.05)/0.10)   trd >= 0.05   -> 全部满分 1.0（并列）
+        r = clamp((rev + 0.20)/0.30)   rev >= 0.10   -> 全部满分 1.0（并列）
+
+    而 top-12 恰恰取自尾部 —— 若尾部被压成并列，从并列里挑 12 只等于**随机挑**。
+    这能同时解释「IC 显著为正却打不过随机」和「动量的 IC 为负、组合显著更差」。
+    """
+    mom, trd, vol, rev = tech
+    return {
+        "mom": ((mom + 0.05) / 0.25).clip(0.0, 1.0),
+        "trd": ((trd + 0.05) / 0.10).clip(0.0, 1.0),
+        "vol": (1.0 - vol / 0.03).clip(0.0, 1.0),
+        "rev": ((rev + 0.20) / 0.30).clip(0.0, 1.0),
+    }
+
+
+def _funded_ic_from_panels(close, amount, pe, roe, dates, panels):
+    """在**预筛后的 funded 集**上算给定面板的逐期 IC。"""
+    from scipy.stats import spearmanr
+    out = {k: [] for k in panels}
+    sel = list(dates[::REBAL])
+    for d in sel[:-1]:
+        i = dates.get_loc(d)
+        if i + REBAL >= len(dates):
+            break
+        d2 = dates[i + REBAL]
+        fwd = (close.loc[d2] / close.loc[d] - 1).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(fwd) < 30:
+            continue
+        funded, _n = candidates_at(d, close, amount, pe, roe)
+        if not funded:
+            continue
+        r_sub = fwd.reindex([r[0] for r in funded]).dropna()
+        if len(r_sub) < 20:
+            continue
+        for k, p in panels.items():
+            if d not in p.index:
+                continue
+            f = p.loc[d].reindex(r_sub.index).dropna()
+            b = f.index.intersection(r_sub.index)
+            if len(b) < 20:
+                continue
+            ff = f[b].to_numpy(dtype=float)
+            rr = r_sub[b].to_numpy(dtype=float)
+            ok = np.isfinite(ff) & np.isfinite(rr)
+            if ok.sum() < 20:
+                continue
+            rho, _ = spearmanr(ff[ok], rr[ok])
+            if np.isfinite(rho):
+                out[k].append((d2, float(rho)))
+    return out
+
+
+def factor_ic_subset(close, amount, pe, roe, tech, dates):
+    """在**预筛后的 funded 集**上算**原始因子**的逐期 IC（逻辑见 `_funded_ic_from_panels`）。"""
+    return _funded_ic_from_panels(close, amount, pe, roe, dates,
+                                  _factor_panels(pe, roe, tech))
+
+
 def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
     """跑两层归因，写 results/factor_attribution.json（**不碰** pit_select_backtest.json）。"""
     from scipy.stats import norm
@@ -517,6 +583,68 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
               f"{(ex['mean_pct'] or 0):>10.3f}{ex['t'] or 0:>6.2f}{mark(ex['t'])}  "
               f"{(icv['mean_pct'] or 0):>8.4f}{icv['t'] or 0:>6.2f}{mark(icv['t'])}  "
               f"{(sp23['t'] or 0):>10.2f}")
+
+    # ---- 分辨 (a)/(b)：把 IC 改在**预筛后的候选集**上重算 ----
+    sub_ic = factor_ic_subset(close, amount, pe, roe, tech, dates)
+    out["funded_ic"] = {}
+    print()
+    print("=" * 96)
+    print("分辨：把 IC 改在**预筛后的 funded 集**上重算（第 1 层的 IC 是在全宇宙上算的）")
+    print("  判据：全宇宙显著、funded 上塌掉 => 信息被**预筛**砍掉；")
+    print("        funded 上仍显著且同号 => 问题在**切点**（top-12 太极端）")
+    print("=" * 96)
+    print(f"{'因子':<20}{'全宇宙IC':>10}{'t':>7}{'fundedIC':>10}{'t':>7}{'n':>6}   判定")
+    print("-" * 96)
+    n_funded_cut = 0
+    for k, lab in FACTOR_LABELS.items():
+        full = out["quantile"][k]["ic"]
+        sub = _tstat(sub_ic[k], pct=False)
+        out["funded_ic"][k] = sub
+        ft, st = full["t"], sub["t"]
+        if ft is None or st is None:
+            verdict = "-"
+        elif abs(ft) > thr and abs(st) < 2.0:
+            verdict = "塌掉 -> 预筛砍掉了信息"
+            n_funded_cut += 1
+        elif abs(ft) > thr and abs(st) > 2.0 and full["mean_pct"] * sub["mean_pct"] > 0:
+            verdict = "仍成立 -> 问题在切点"
+        elif abs(ft) < 2.0 and abs(st) < 2.0:
+            verdict = "两边都测不出"
+        else:
+            verdict = "符号翻转/边缘"
+        print(f"{lab:<20}{full['mean_pct']:>10.4f}{ft or 0:>7.2f}"
+              f"{sub['mean_pct']:>10.4f}{st or 0:>7.2f}{sub['n']:>6}   {verdict}")
+    out["verdict_counts"] = {"prefilter_killed": n_funded_cut}
+
+    # ---- 关键一步：原始因子 IC  vs  **clamp 之后的分数**的 IC ----
+    # 选票用的是 clamp 后的分，不是原始因子。若 clamp 把尾部压成并列，
+    # 从尾部挑 top-12 就等于在并列里随机挑 —— 这能解释「原始因子 IC 显著为正、
+    # 组合却打不过随机」，也能解释「动量的 IC 为负、组合显著更差」。
+    clamp_ic = _funded_ic_from_panels(close, amount, pe, roe, dates, _clamped_panels(tech))
+    out["clamped_ic"] = {}
+    print()
+    print("=" * 96)
+    print("关键：选票用的是 clamp 之后的**分**，不是原始因子 —— 两者的 IC 差多少？")
+    print("  score_tech 把每个因子压到 [0,1]，尾部会**并列**（如 vol<=0 一律满分 1.0）")
+    print("=" * 96)
+    print(f"{'因子':<20}{'原始因子IC':>12}{'t':>7}{'clamp后IC':>11}{'t':>7}   判定")
+    print("-" * 96)
+    for k, lab in FACTOR_LABELS.items():
+        if k not in clamp_ic:
+            continue
+        raw = out["funded_ic"][k]
+        cl = _tstat(clamp_ic[k], pct=False)
+        out["clamped_ic"][k] = cl
+        if raw["t"] is None or cl["t"] is None:
+            verdict = "-"
+        elif abs(raw["t"]) > 2.0 and abs(cl["t"]) < 2.0:
+            verdict = "clamp 把信息压平了 <== 就是这个"
+        elif raw["t"] * cl["t"] < 0:
+            verdict = "符号被 clamp 翻转"
+        else:
+            verdict = "clamp 后仍在"
+        print(f"{lab:<20}{raw['mean_pct']:>12.4f}{raw['t']:>7.2f}"
+              f"{cl['mean_pct']:>11.4f}{cl['t']:>7.2f}   {verdict}")
 
     # ---- 第 2 层：单因子消融回测（对照 = D，同流动性门槛的随机 12 只）----
     print()
@@ -570,6 +698,36 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
         out["pair_vs_D"][v] = {"diff_pct": round(float(dd.mean()) * 100, 3),
                                "t": round(t, 2), "n": int(len(dd))}
         print(f"{lab + ' 减 D':<30}{float(dd.mean()) * 100:>12.3f}{t:>8.2f}")
+
+    # ---- topN 扫描：直接测「切点太极端」这个解释 ----
+    print()
+    print("=" * 96)
+    print("topN 扫描：若「切点太极端」成立，放宽 topN 应让因子臂追平或超过随机")
+    print("=" * 96)
+    print(f"{'臂':<16}{'topN':>6}{'总收益':>10}{'逐期alpha':>11}{'vs D 同N':>11}{'t':>7}")
+    print("-" * 96)
+    out["topn_sweep"] = {}
+    for n in (12, 20, 30):
+        cD, _dD, aD = run("D", close, amount, pe, roe, tech, regime_by_date, n, dates)
+        sD = pd.Series(dict(aD)).sort_index()
+        for v in ("M_vol", "M_rev", "M_mom"):
+            curve, _d2, alphas = run(v, close, amount, pe, roe, tech,
+                                     regime_by_date, n, dates)
+            m = metrics(curve)
+            if not m:
+                continue
+            m.pop("_ser", None)
+            a = np.asarray([x for _, x in alphas], dtype=float)
+            s = pd.concat([pd.Series(dict(alphas)).sort_index().rename("x"),
+                           sD.rename("y")], axis=1, sort=False).dropna()
+            dd = s["x"] - s["y"]
+            t = float(dd.mean() / (dd.std(ddof=1) / np.sqrt(len(dd)))) if dd.std() else 0.0
+            out["topn_sweep"][f"{v}_{n}"] = {
+                "total": m["total"], "annual": m["annual"], "sharpe": m["sharpe"],
+                "alpha_mean_pct": round(float(a.mean()) * 100, 3),
+                "vs_D_pct": round(float(dd.mean()) * 100, 3), "vs_D_t": round(t, 2)}
+            print(f"{v:<16}{n:>6}{m['total']:>10.1f}{float(a.mean()) * 100:>11.3f}"
+                  f"{float(dd.mean()) * 100:>11.3f}{t:>7.2f}")
 
     print()
     print("[!] A 与 B 要一起看：A 保留「排名 41~80 的票 total=fund_score 未减半」这个缺陷，")
