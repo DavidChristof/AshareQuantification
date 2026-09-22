@@ -418,9 +418,72 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
                     rs.append(float(seg.mean()))
             if not rs:
                 continue
-            r = float(np.mean(rs)) - COST
+            r = float(np.mean(rs)) - (ROUND_TRIP if cost_mode == "turnover" else COST)
             nav *= (1 + r)
             curve.append((d2, nav))
+            if not np.isnan(uni_r):
+                alphas.append((d2, r - uni_r))
+            continue
+        if variant == "D80":
+            # 与 D 相同，但候选集收窄到**按成交额取 top-80**（即 candidates_at 的第 2 层），
+            # **不要求** PE/ROE 可得。于是 `D80 减 D` 只量「限制到最活跃的 80 只」这一步的效应，
+            # `D66 减 D80` 只量「要求 PE/ROE 可得 + PE>=1」这一步的效应。
+            liq = amount.loc[d]
+            liq = liq[liq >= MIN_AMOUNT].dropna()
+            if len(liq) < topn:
+                continue
+            cand = list(liq.nlargest(BASIC_TOPK).index)
+            cand = [c for c in cand
+                    if np.isfinite(close.at[d, c]) and np.isfinite(close.at[d2, c])]
+            if len(cand) < topn:
+                continue
+            arr = np.array(cand)
+            rs = []
+            for k in range(N_SEEDS):
+                rng = np.random.default_rng(RANDOM_SEED + i * 1000 + k)
+                sub = rng.choice(arr, size=topn, replace=False)
+                seg = (close.loc[d2, sub] / close.loc[d, sub] - 1).dropna()
+                if len(seg):
+                    rs.append(float(seg.mean()))
+            if not rs:
+                continue
+            r = float(np.mean(rs)) - (ROUND_TRIP if cost_mode == "turnover" else COST)
+            nav *= (1 + r)
+            curve.append((d2, nav))
+            if stats is not None:
+                stats["turnover"].append(1.0)
+            uni_r = _uni_ret(close, d, d2)
+            if not np.isnan(uni_r):
+                alphas.append((d2, r - uni_r))
+            continue
+        if variant == "D66":
+            # [!] 为什么需要这个对照：原来的 D 是从 **1e8 流动性集合**里随机抽 12 只，
+            # 而 F/G 等是从 **funded 集**（过流动性 + PE/ROE 可得，约 66 只）里按分挑的。
+            # 于是 `F 减 D` 把两件事混在一起：**funded 这个集合本身**的好坏，
+            # 与**集合内部**打分的排序能力。D66 从同一个 funded 集里随机抽，
+            # 于是 `F 减 D66` 只量**排序能力**，`D66 减 D` 只量**集合效应**。
+            funded, _nf = candidates_at(d, close, amount, pe, roe)
+            cand = [r[0] for r in funded
+                    if np.isfinite(close.at[d, r[0]]) and np.isfinite(close.at[d2, r[0]])]
+            if len(cand) < topn:
+                continue
+            arr = np.array(cand)
+            rs = []
+            for k in range(N_SEEDS):
+                rng = np.random.default_rng(RANDOM_SEED + i * 1000 + k)
+                sub = rng.choice(arr, size=topn, replace=False)
+                seg = (close.loc[d2, sub] / close.loc[d, sub] - 1).dropna()
+                if len(seg):
+                    rs.append(float(seg.mean()))
+            if not rs:
+                continue
+            fee66 = ROUND_TRIP if cost_mode == "turnover" else COST
+            r = float(np.mean(rs)) - fee66
+            nav *= (1 + r)
+            curve.append((d2, nav))
+            if stats is not None:
+                stats["turnover"].append(1.0)              # 全换手（随机抽，每期全换）
+            uni_r = _uni_ret(close, d, d2)
             if not np.isnan(uni_r):
                 alphas.append((d2, r - uni_r))
             continue
@@ -969,6 +1032,60 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
                 "vs_D_pct": round(float(dd.mean()) * 100, 3), "vs_D_t": round(t, 2)}
             print(f"{v:<16}{n:>6}{m['total']:>10.1f}{float(a.mean()) * 100:>11.3f}"
                   f"{float(dd.mean()) * 100:>11.3f}{t:>7.2f}")
+
+    # ---- 拆开「集合效应」与「排序效应」----
+    print()
+    print("=" * 96)
+    print("基本面到底有没有用：把「funded 集合本身」与「集合内部的排序能力」拆开")
+    print("  D   = 从 1e8 流动性集合随机抽 12                （**宽集合**）")
+    print("  D66 = 从 funded 集（过流动性 + PE/ROE 可得）随机抽 12  （**同一集合**对照）")
+    print("  F   = funded 集里按 fund_score 取 top12；G = 按技术面取 top12")
+    print("  => `F 减 D66` 只量**排序能力**；`D66 减 D` 只量**集合效应**（成本口径：按换手）")
+    print("=" * 96)
+    deco: dict = {}
+    print(f"{'臂':<28}{'总收益':>9}{'年化':>8}{'Sharpe':>8}{'逐期alpha':>11}{'t':>7}")
+    print("-" * 84)
+    for v, lab in (("D", "D 随机(1e8 流动性集合)"), ("D80", "D80 随机(成交额 top80)"),
+                   ("D66", "D66 随机(funded 集)"),
+                   ("F", "F 基本面 top12"), ("G", "G 技术面 top12"),
+                   ("B", "B 真分数(0.6/0.4)")):
+        c, _d, al = run(v, close, amount, pe, roe, tech, regime_by_date, topn, dates,
+                        cost_mode="turnover")
+        mm = metrics(c)
+        if not mm:
+            continue
+        mm.pop("_ser", None)
+        deco[v] = pd.Series(dict(al)).sort_index()
+        a = np.asarray([x for _, x in al], dtype=float)
+        tv = (float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+              if len(a) > 2 and a.std() else 0.0)
+        out.setdefault("decomp", {})[v] = {
+            "total": mm["total"], "annual": mm["annual"], "sharpe": mm["sharpe"],
+            "alpha_mean_pct": round(float(a.mean()) * 100, 3), "alpha_t": round(tv, 2)}
+        print(f"{lab:<28}{mm['total']:>9.1f}{mm['annual']:>8.2f}{mm['sharpe']:>8.2f}"
+              f"{float(a.mean()) * 100:>11.3f}{tv:>7.2f}")
+    print()
+    print("分解（配对，同一天）:")
+    for x, y, note in (("F", "D66", "fund_score 的**排序能力**"),
+                       ("D80", "D", "**限制到成交额 top80** 这一步的效应"),
+                       ("D66", "D80", "**要求 PE/ROE 可得** 这一步的效应"),
+                       ("D66", "D", "funded 集合本身的效应（上面两步合计）"),
+                       ("F", "D", "两者合计（= 旧的 F 减 D）"),
+                       ("G", "D66", "技术面的排序能力"),
+                       ("B", "D66", "真分数的排序能力")):
+        if x not in deco or y not in deco:
+            continue
+        s = pd.concat([deco[x].rename("x"), deco[y].rename("y")], axis=1,
+                      sort=False).dropna()
+        if len(s) < 10:
+            continue
+        dd = s["x"] - s["y"]
+        tv = float(dd.mean() / (dd.std(ddof=1) / np.sqrt(len(dd)))) if dd.std() else 0.0
+        out.setdefault("decomp_pair", {})[f"{x}_{y}"] = {
+            "diff_pct": round(float(dd.mean()) * 100, 3), "t": round(tv, 2), "n": int(len(dd))}
+        print(f"  {x + ' 减 ' + y:<12}{float(dd.mean()) * 100:>9.3f}%  t={tv:>6.2f}   {note}")
+    print()
+    print("[!] (F-D66) 与 (D66-D) 应大致合成 (F-D)；若明显不等，说明配对样本不同，读时要小心。")
 
     # ---- 改造实验：按 §6.7 的方向改 mom/trd，**判定标准事先写死** ----
     from scipy.stats import norm as _norm
