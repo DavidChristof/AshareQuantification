@@ -38,6 +38,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
                     stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
+# pit500 抽样种子 —— **固定**，保证「抽了哪 600 只」可复现、可审计。
+# 改动它会换一批票，等于换了实验样本；除非有理由，不要动。
+_PIT_SAMPLE_SEED = 20260922
+
 
 def _trim_recent(data: dict, recent: int) -> dict:
     """每只只保留最近 N 个交易日（recent<=0 表示全部）——控 make_samples 内存。"""
@@ -46,12 +50,70 @@ def _trim_recent(data: dict, recent: int) -> dict:
     return {c: df.tail(recent) for c, df in data.items()}
 
 
-def _load_training_data(cfg, universe: str, recent: int) -> dict:
-    """按 universe 载入训练截面：
-        base  现池 40（market.db，原行为）
-        large 现池40 ∪ data/large_pool.db 全量（约 600 池，阶段实验产物）
+def _load_pit500(cfg, n_names: int = 0) -> dict:
+    """PIT 中证500 层的**并集**（约 1048 只）—— 无幸存者偏差的训练截面。
+
+    为什么**不**走 load_all()：那会先把「现池 40」装进来，而现池 40 是**今天**的名单，
+    等于往无偏池里混进一小撮幸存票。这里起点就是空 dict。
+
+    为什么用**并集**而不是「只按当日成分」：`make_samples` 没有 per-date 掩码接口，
+    而**并集本身就消除了幸存者偏差** —— 它包含**后来被调出指数**的票，那正是偏差的来源。
+    掩码只影响标签中位数与横截面构成，不影响无偏性，不值得为此改共享模块。
+
+    n_names > 0 时按**固定种子**抽样那么多个。抽样仍无偏（从无偏集合里随机抽），
+    且能顺带消掉「只数不同」这个混淆 —— 见下面的内存说明。
+
+    局限（见 docs/2026-09-11-pit-universe.md）：与真实中证500 重合度仅 76.6%，
+    它是「**无未来函数的同区间宇宙**」，不是真实指数的复制品。
     """
     import sqlite3
+    db_path = Path(cfg.resolve("data")) / "full_market.db"
+    if not db_path.exists():
+        raise SystemExit("缺少 data/full_market.db —— 请先运行 scripts/35_fetch_full_market.py")
+    # 只读打开：full_market.db 是冻结的行情库。绝不能被建表/写入
+    # （paper 那次事故就是「打开」会 CREATE TABLE，把账户表建进了行情库）。
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    syms = [r[0] for r in con.execute(
+        "SELECT DISTINCT symbol FROM pit_members WHERE index_code='csi500'").fetchall()]
+    if not syms:
+        con.close()
+        raise SystemExit("pit_members 里没有 csi500 —— 请先运行 "
+                         "scripts/36_validate_pit_universe.py")
+    total = len(syms)
+    if n_names and n_names < total:
+        # [!] 为什么要抽样：训练内存大头（因子面板 + make_samples 的 X）随
+        # 「**只数 x 天数**」走 —— 全量 1048 只 @ recent500 实测要 ~9.8 GB，
+        # 而本机只有 15.6 GB、常驻占用后剩 4~6 GB，装不下。
+        # 抽到与对照池（599 只）同规模：内存可跑，且两组只数匹配，判据更干净。
+        import random
+        syms = sorted(random.Random(_PIT_SAMPLE_SEED).sample(sorted(syms), n_names))
+        logger.info("universe=pit500：从 %d 只中抽样 %d 只（seed=%d，可复现）",
+                    total, len(syms), _PIT_SAMPLE_SEED)
+    data = {}
+    for code in syms:
+        rows = con.execute(
+            "SELECT date, open, high, low, close, volume, amount FROM full_daily "
+            "WHERE symbol=? ORDER BY date", (code,)).fetchall()
+        if not rows:
+            continue
+        df = pd.DataFrame(rows, columns=["date", "open", "high", "low",
+                                         "close", "volume", "amount"])
+        df["date"] = pd.to_datetime(df["date"])
+        data[code] = df
+    con.close()
+    logger.info("universe=pit500：PIT 中证500 并集 %d 只（无幸存者偏差）", len(data))
+    return data
+
+
+def _load_training_data(cfg, universe: str, recent: int, pit_names: int = 0) -> dict:
+    """按 universe 载入训练截面：
+        base   现池 40（market.db，原行为）
+        large  现池40 ∪ data/large_pool.db 全量（约 600 池，阶段实验产物）
+        pit500 PIT 中证500 层（无幸存者偏差，见 _load_pit500；pit_names>0 则固定种子抽样）
+    """
+    import sqlite3
+    if universe == "pit500":
+        return _trim_recent(_load_pit500(cfg, pit_names), recent)
     data = load_all(cfg)
     if universe == "large":
         db_path = Path(cfg.resolve("data")) / "large_pool.db"
@@ -70,6 +132,48 @@ def _load_training_data(cfg, universe: str, recent: int) -> dict:
         con.close()
         logger.info("universe=large：现池 %d + 大池 → %d 只", 40, len(data))
     return _trim_recent(data, recent)
+
+
+# ============================================================
+# 内存闸门
+# ============================================================
+# 每「行」的峰值内存系数（MB/行）—— **实测标定**，不是推导出来的。
+#
+# 标定点（2026-09-22）：universe=large（599 只）x recent500 = 297,195 行，
+# 实测训练进程工作集 **4,690 MB**，即 16.2 KB/行。取 15% 余量后为 18.6 KB/行。
+#
+# 为什么不按「样本数 x X 大小」估：真正的大头是 `build_enhanced_features` 物化的
+# Alpha101/挖掘因子面板，它随「**只数 x 天数**」增长（就是行数），**不是**随样本数。
+# 我第一版按 X x 1.3 估，对同一个标定点只给出 2,096 MB —— **低估 2.2 倍**，
+# 于是闸门形同虚设（那次幸好撞上的是冒烟，不是全量；否则跑到一半 OOM，白等十几分钟）。
+_MB_PER_ROW = 0.0162 * 1.15
+
+
+def _free_mem_mb() -> float:
+    """当前可用物理内存（MB）。"""
+    import ctypes
+
+    class _MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    m = _MS()
+    m.dwLength = ctypes.sizeof(_MS)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return m.ullAvailPhys / 1048576.0
+
+
+def _estimate_peak_mb(data: dict) -> float:
+    """估训练峰值内存（MB）—— 按**行数**（只数 x 天数）线性外推，系数实测标定。
+
+    见上面 `_MB_PER_ROW`：内存大头是因子面板，随「只数 x 天数」增长，不是随样本数。
+    """
+    return sum(len(df) for df in data.values()) * _MB_PER_ROW
 
 
 def _panel_rankic(prob_panel: pd.DataFrame, ret_panel: pd.DataFrame,
@@ -107,13 +211,28 @@ def main():
     parser.add_argument("--fetch", action="store_true", help="先拉最新日线再训练")
     parser.add_argument("--quick", action="store_true", help="冒烟：缩短训练快速验证流水线")
     parser.add_argument("--members", default=None, help="覆盖集成成员，逗号分隔 lstm,transformer,gbm")
-    parser.add_argument("--universe", default="base", choices=["base", "large"],
-                        help="训练截面：base=现池40 | large=现池40∪600大池(需 large_pool.db)")
+    parser.add_argument("--universe", default="base", choices=["base", "large", "pit500"],
+                        help="训练截面：base=现池40 | large=现池40∪600大池(需 large_pool.db) | "
+                             "pit500=PIT中证500层(无幸存者偏差，需 full_market.db，**必须配 --tag**)")
     parser.add_argument("--tag", default=None,
                         help="保存到 results/model_v2_<tag>（不覆盖/不备份线上 model_v2）")
     parser.add_argument("--recent", type=int, default=0,
                         help="每只只取最近 N 个交易日(0=全部)。large 全历史内存≈5.7GB，建议 900~1100")
+    parser.add_argument("--pit-names", type=int, default=600,
+                        help="universe=pit500 时固定种子抽样多少只（0=全部 1048 只）。"
+                             "默认 600：与对照池同规模、内存可跑；"
+                             "全量 1048@recent500 实测要 ~9.8GB，本机 15.6GB 装不下")
+    parser.add_argument("--allow-tight", action="store_true",
+                        help="内存预估不足时只警告、不中断（默认直接拒绝：宁可不跑，也别撞 OOM）")
     args = parser.parse_args()
+
+    # [!] 安全闸：pit500 必须显式给 --tag。
+    # 下面的 tag 推导是 `args.tag or ("large" if universe=="large" else None)`，
+    # 而 tag=None 会走「**替换并备份线上 results/model_v2**」那条分支 ——
+    # 绝不能因为加了个新池子就把线上模型覆盖掉（本项目约定：模型切换只提醒、绝不自动做）。
+    if args.universe == "pit500" and not args.tag:
+        raise SystemExit("--universe pit500 必须同时指定 --tag（例如 --tag pit500），"
+                         "否则会覆盖线上 results/model_v2。")
 
     cfg = load_config()
     mv2 = cfg.get("model_v2", {})
@@ -139,7 +258,25 @@ def main():
     logger.info("模型 v2 集成训练：%s", members)
     logger.info("=" * 64)
 
-    data = _load_training_data(cfg, args.universe, args.recent)
+    data = _load_training_data(cfg, args.universe, args.recent, args.pit_names)
+
+    # ---- 内存前置检查：宁可不跑，也别撞 OOM ----
+    # make_samples 会把整个池子的窗口一次性物化，撞上去就是 MemoryError（或把系统拖垮）。
+    # 估不准没关系，只要方向保守：估高一点，宁可让你关个程序，也不要在跑到一半时炸掉。
+    need_mb = _estimate_peak_mb(data)
+    free_mb = _free_mem_mb()
+    logger.info("内存闸门：%d 只 / 峰值预估 %.0f MB / 当前可用 %.0f MB",
+                len(data), need_mb, free_mb)
+    if free_mb < need_mb:
+        if not args.allow_tight:
+            raise SystemExit(
+                f"可用内存不足：预估需要约 {need_mb:.0f} MB，当前只有 {free_mb:.0f} MB。\n"
+                f"  请关掉占内存的程序（浏览器/游戏/多余的编辑器窗口）后重试；\n"
+                f"  或减小 --recent（当前 {args.recent or '全部'}）/ --pit-names；\n"
+                f"  确认能跑也可以显式加 --allow-tight（风险自担）。")
+        logger.warning("内存预估 %.0f MB > 可用 %.0f MB —— 已指定 --allow-tight，继续训练",
+                       need_mb, free_mb)
+
     # 输出目录：--tag 或 universe=large 时另存（不碰线上 model_v2）；否则替换并备份旧版
     live_dir = cfg.resolve(mv2.get("dir", "results/model_v2"))
     tag = args.tag or ("large" if args.universe == "large" else None)
