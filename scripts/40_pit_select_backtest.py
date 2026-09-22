@@ -250,19 +250,23 @@ def _norm_panels(tech, how):
 # ============================================================
 # 单日选股（复刻 select_daily）
 # ============================================================
-def candidates_at(d, close, amount, pe, roe):
-    """复刻第 1~2 层 + 基本面：流动性 >=1e8 -> top80 -> PE/ROE 打分。
+def candidates_at(d, close, amount, pe, roe, basic_topk=None):
+    """复刻第 1~2 层 + 基本面：流动性 >=1e8 -> 按成交额 top{K} -> PE/ROE 打分。
 
     返回 (funded, n_liq)；funded = [(code, fund_score, pe_score, roe_score)] 已按 fund_score 降序。
 
     [!] 为什么多返回 pe_score/roe_score：归因要回答「PE 和 ROE 谁在赚」，
     而线上把两者熔成一个 fund_score，拆不开。多返回两个数不改变任何排序行为。
+
+    basic_topk: 候选池宽度。默认 = 线上 BASIC_TOPK=80。放宽它用于检验
+        「按成交额取最活跃的 80 只」这一步的代价（实测该步每期 -0.362%，t=-2.01）。
     """
+    k = BASIC_TOPK if basic_topk is None else int(basic_topk)
     cl, amt = close.loc[d], amount.loc[d]
     liq = amt[amt >= MIN_AMOUNT].dropna()
     if len(liq) == 0:
         return [], 0
-    liq_rank = list(liq.nlargest(BASIC_TOPK).index)
+    liq_rank = list(liq.nlargest(k if k > 0 else len(liq)).index)
 
     # PE/ROE 缺失或 PE<MIN_PE -> 整只剔除（线上 fetch_fundamental 返回 None）
     ped, roed = pe.loc[d], roe.loc[d]
@@ -293,7 +297,8 @@ def tech_scores_at(d, tech, codes, weights, mode="clamp", flip=()):
 
 
 def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
-              tech_mode="clamp", tech_flip=(), keep=None, buffer=0):
+              tech_mode="clamp", tech_flip=(), keep=None, buffer=0,
+              basic_topk=None):
     """按 `mode` 产出该日 top-N。
 
     mode: A 忠实复刻 / B 修正 tech 缺失 / F 只用基本面 / G 只用技术面
@@ -306,7 +311,7 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None,
         线上手动/实盘路径**没有**这个机制（只在「今天 top-12 里还有它」时才留）。
     """
     topn = topn or TOPN
-    funded, n_liq = candidates_at(d, close, amount, pe, roe)
+    funded, n_liq = candidates_at(d, close, amount, pe, roe, basic_topk)
     if not funded:
         return [], {}
 
@@ -375,7 +380,7 @@ FUND_HALF_MODE = {"P_pe": "P", "R_roe": "R"}
 
 def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
         tech_use=None, tech_mode="clamp", tech_flip=(), tech_w=None,
-        rebal=REBAL, cost_mode="flat", buffer=0, stats=None):
+        rebal=REBAL, cost_mode="flat", buffer=0, stats=None, basic_topk=None):
     """tech_use/tech_mode/tech_flip/tech_w：**归因与改造实验专用**（默认 = 原行为，A-H 不受影响）。
 
     rebal     : 调仓间隔（默认 REBAL=5）。原先写死，现可扫频。
@@ -492,13 +497,13 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
         elif variant in TECH_ONLY_WEIGHTS:                   # 单技术因子（G 分支 + 单位权重）
             picks, diag = select_at(d, close, amount, pe, roe, tech_use,
                                     TECH_ONLY_WEIGHTS[variant], "G", topn,
-                                    tech_mode, tech_flip, cur, buffer)
+                                    tech_mode, tech_flip, cur, buffer, basic_topk)
             if diag:
                 diags.append({**diag, "date": d})
         elif variant in FUND_HALF_MODE:                      # 只按 PE 分 / 只按 ROE 分
             picks, diag = select_at(d, close, amount, pe, roe, tech_use,
                                     DEFAULT_TECH_WEIGHTS, FUND_HALF_MODE[variant], topn,
-                                    tech_mode, tech_flip, cur, buffer)
+                                    tech_mode, tech_flip, cur, buffer, basic_topk)
             if diag:
                 diags.append({**diag, "date": d})
         else:
@@ -507,7 +512,7 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates,
                  (DEFAULT_TECH_WEIGHTS if variant == "C"
                   else regime_by_date.get(d, DEFAULT_TECH_WEIGHTS)))
             picks, diag = select_at(d, close, amount, pe, roe, tech_use, w, mode, topn,
-                                    tech_mode, tech_flip, cur, buffer)
+                                    tech_mode, tech_flip, cur, buffer, basic_topk)
             if diag:
                 diags.append({**diag, "date": d})
         if len(picks) < max(1, topn // 2):
@@ -1159,6 +1164,52 @@ def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
               f"{(d_d or 0):>9.3f}{(t_d or 0):>7.2f}   {'通过' if ok else '未通过'}")
     print()
     print("[!] 判定标准在跑之前就写死了。未通过 => 不碰 selector.py、不改线上权重。")
+
+    # ---- 候选池宽度（BASIC_TOPK）：判定标准事先写死 ----
+    TOPKS = [80, 200, 500, 0]          # 0 = 全部流动性（不限成交额）
+    n_t2 = len(TOPKS) - 1
+    t_bar2 = float(_norm.ppf(1 - 0.025 / n_t2))
+    print()
+    print("=" * 96)
+    print("候选池宽度（BASIC_TOPK）：把「按成交额取最活跃的 K 只」放宽")
+    print("  背景：实测这一步每期 -0.362%（t=-2.01，6/6 年负，见 docs §10）")
+    print(f"  判定标准（**事先声明**）：处理 vs 对照(80) 配对 t > {t_bar2:.2f}"
+          f"  [{n_t2} 个放宽档的 Bonferroni] 且 2023+ 同号")
+    print("  不通过 => **不改 selector.py**")
+    print("=" * 96)
+    _c0, _x0, a_b0 = run("B", close, amount, pe, roe, tech, regime_by_date, topn, dates,
+                         cost_mode="turnover", basic_topk=80)
+    s_b0 = pd.Series(dict(a_b0)).sort_index()
+    m_b0 = metrics(_c0)
+    out["basic_topk"] = {"criterion": {"t_bar": round(t_bar2, 3), "base": 80},
+                         "arms": {}}
+    print(f"{'候选池':<16}{'只数':>6}{'总收益':>9}{'年化':>8}{'Sharpe':>8}"
+          f"{'vs 对照':>10}{'t':>7}{'2023+t':>9}   判定")
+    print("-" * 92)
+    for k in TOPKS:
+        c, dd_, al = run("B", close, amount, pe, roe, tech, regime_by_date, topn, dates,
+                         cost_mode="turnover", basic_topk=k)
+        mm = metrics(c)
+        if not mm:
+            continue
+        mm.pop("_ser", None)
+        s = pd.Series(dict(al)).sort_index()
+        dc, tc, _n = _paired(s, s_b0)
+        _d23b, t23b, _n23b = _paired(s, s_b0, since="2023-01-01")
+        nfund = float(np.mean([x.get("funded", 0) for x in dd_])) if dd_ else 0.0
+        passed = (k != 80 and tc is not None and tc > t_bar2
+                  and t23b is not None and (t23b > 0) == (tc > 0))
+        out["basic_topk"]["arms"][str(k)] = {
+            "avg_funded": round(nfund, 1), "total": mm["total"], "annual": mm["annual"],
+            "sharpe": mm["sharpe"], "vs_ctrl_pct": dc, "vs_ctrl_t": tc,
+            "vs_ctrl_2023_t": t23b, "passed": bool(passed)}
+        tag = "对照" if k == 80 else ("通过" if passed else "未通过")
+        print(f"{('top ' + str(k)) if k else '全部流动性':<16}{nfund:>6.0f}"
+              f"{mm['total']:>9.1f}{mm['annual']:>8.2f}{mm['sharpe']:>8.2f}"
+              f"{(dc or 0):>10.3f}{(tc or 0):>7.2f}{(t23b or 0):>9.2f}   {tag}")
+    print()
+    print("[!] 现实约束（回测里看不到）：放宽 K 会让**线上每次要抓的 PE/ROE 数量**按比例增加。")
+    print("    线上 BASIC_TOPK 原本就是「省数据抓取」的截断，不是假设 —— 所以通过也不等于可以直接上。")
 
     # ---- 成本与换手：旧口径高估了多少？降换手值多少？----
     print()
