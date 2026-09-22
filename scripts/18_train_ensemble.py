@@ -105,15 +105,45 @@ def _load_pit500(cfg, n_names: int = 0) -> dict:
     return data
 
 
-def _load_training_data(cfg, universe: str, recent: int, pit_names: int = 0) -> dict:
+def _trim_window(data: dict, start: str | None, end: str | None) -> dict:
+    """按**日历窗口**裁剪每只票的行（闭区间，start/end 为 'YYYY-MM-DD'）。
+
+    [!] 为什么必须有它：`--recent` 是按**每只票自己的最后 N 天**切，而不同池子的数据新鲜度
+    不同（large_pool 到 2026-09-22、full_market 到 2026-09-11），于是两组切出来的
+    **验证段不是同一段日期** —— 那样「池子」这个变量的比较就不是干净的。
+    要升级成**配对级证据**，两组必须钉在同一段日历上。
+    """
+    if not start and not end:
+        return data
+    lo = pd.Timestamp(start) if start else None
+    hi = pd.Timestamp(end) if end else None
+    out: dict = {}
+    for c, df in data.items():
+        dts = pd.to_datetime(df["date"])          # 有的 loader 给字符串，有的给 Timestamp
+        m = pd.Series(True, index=df.index)
+        if lo is not None:
+            m &= (dts >= lo)
+        if hi is not None:
+            m &= (dts <= hi)
+        d = df[m]
+        if len(d):
+            out[c] = d
+    return out
+
+
+def _load_training_data(cfg, universe: str, recent: int, pit_names: int = 0,
+                        start: str | None = None, end: str | None = None) -> dict:
     """按 universe 载入训练截面：
         base   现池 40（market.db，原行为）
         large  现池40 ∪ data/large_pool.db 全量（约 600 池，阶段实验产物）
         pit500 PIT 中证500 层（无幸存者偏差，见 _load_pit500；pit_names>0 则固定种子抽样）
+
+    start/end：按**日历**裁剪（见 _trim_window），两组对齐时用。
     """
     import sqlite3
     if universe == "pit500":
-        return _trim_recent(_load_pit500(cfg, pit_names), recent)
+        d = _trim_window(_load_pit500(cfg, pit_names), start, end)
+        return _trim_recent(d, recent)
     data = load_all(cfg)
     if universe == "large":
         db_path = Path(cfg.resolve("data")) / "large_pool.db"
@@ -131,7 +161,7 @@ def _load_training_data(cfg, universe: str, recent: int, pit_names: int = 0) -> 
             data[code] = df
         con.close()
         logger.info("universe=large：现池 %d + 大池 → %d 只", 40, len(data))
-    return _trim_recent(data, recent)
+    return _trim_recent(_trim_window(data, start, end), recent)
 
 
 # ============================================================
@@ -224,6 +254,10 @@ def main():
                              "全量 1048@recent500 实测要 ~9.8GB，本机 15.6GB 装不下")
     parser.add_argument("--allow-tight", action="store_true",
                         help="内存预估不足时只警告、不中断（默认直接拒绝：宁可不跑，也别撞 OOM）")
+    parser.add_argument("--start", default=None,
+                        help="只保留该日期(含)之后的行 —— 按**日历**裁，用于把两组钉在同一段日期上")
+    parser.add_argument("--end", default=None,
+                        help="只保留该日期(含)之前的行。与 --start 合用可消掉两组验证段错位")
     args = parser.parse_args()
 
     # [!] 安全闸：pit500 必须显式给 --tag。
@@ -258,7 +292,8 @@ def main():
     logger.info("模型 v2 集成训练：%s", members)
     logger.info("=" * 64)
 
-    data = _load_training_data(cfg, args.universe, args.recent, args.pit_names)
+    data = _load_training_data(cfg, args.universe, args.recent, args.pit_names,
+                               args.start, args.end)
 
     # ---- 内存前置检查：宁可不跑，也别撞 OOM ----
     # make_samples 会把整个池子的窗口一次性物化，撞上去就是 MemoryError（或把系统拖垮）。
