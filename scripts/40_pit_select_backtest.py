@@ -170,11 +170,21 @@ def tech_factor_panels(close):
     return mom.fillna(0.0), trd.fillna(0.0), vol, rev.fillna(0.0)
 
 
-def score_stock(pe, roe):
-    """与 selector.score_stock 同式。"""
+def score_parts(pe, roe):
+    """基本面两半的计算值，分开返回 —— 归因要知道 PE / ROE 各自贡献了什么。
+
+    线上 `selector.score_stock` 把它们熔成一个数就再也拆不开，所以这里单独算一份。
+    公式与线上逐字一致。
+    """
     pe_score = max(0.0, min(50.0, 50.0 * (PE_BASE / max(pe, 1.0))))
     roe_score = max(0.0, min(50.0, 50.0 * (roe / ROE_BASE)))
-    return round(pe_score + roe_score, 1)
+    return pe_score, roe_score
+
+
+def score_stock(pe, roe):
+    """与 selector.score_stock 同式。"""
+    p, r = score_parts(pe, roe)
+    return round(p + r, 1)
 
 
 def score_tech(mom, trd, vol, rev, w):
@@ -192,7 +202,10 @@ def score_tech(mom, trd, vol, rev, w):
 def candidates_at(d, close, amount, pe, roe):
     """复刻第 1~2 层 + 基本面：流动性 >=1e8 -> top80 -> PE/ROE 打分。
 
-    返回 (funded, n_liq)；funded = [(code, fund_score)] 已按 fund_score 降序。
+    返回 (funded, n_liq)；funded = [(code, fund_score, pe_score, roe_score)] 已按 fund_score 降序。
+
+    [!] 为什么多返回 pe_score/roe_score：归因要回答「PE 和 ROE 谁在赚」，
+    而线上把两者熔成一个 fund_score，拆不开。多返回两个数不改变任何排序行为。
     """
     cl, amt = close.loc[d], amount.loc[d]
     liq = amt[amt >= MIN_AMOUNT].dropna()
@@ -209,7 +222,8 @@ def candidates_at(d, close, amount, pe, roe):
             continue
         if not np.isfinite(cl.get(c, np.nan)):
             continue
-        funded.append((c, score_stock(p, r)))
+        pes, roes = score_parts(p, r)
+        funded.append((c, round(pes + roes, 1), pes, roes))
     funded.sort(key=lambda x: -x[1])
     return funded, len(liq)
 
@@ -230,6 +244,7 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None):
     """按 `mode` 产出该日 top-N。
 
     mode: A 忠实复刻 / B 修正 tech 缺失 / F 只用基本面 / G 只用技术面
+          P 只用 PE 分 / R 只用 ROE 分（归因用，仿 G 走全 80 只候选）
     """
     topn = topn or TOPN
     funded, n_liq = candidates_at(d, close, amount, pe, roe)
@@ -237,7 +252,7 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None):
         return [], {}
 
     if mode == "G":                     # 技术面单因子：对全部 80 只候选算技术面
-        ts_map = tech_scores_at(d, tech, [c for c, _ in funded], weights)
+        ts_map = tech_scores_at(d, tech, [r[0] for r in funded], weights)
         if not ts_map:
             return [], {}
         rows = sorted(ts_map.items(), key=lambda x: -x[1])
@@ -245,13 +260,19 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None):
                                              "tech": len(ts_map), "liq": n_liq}
 
     if mode == "F":                     # 基本面单因子
-        return [c for c, _ in funded[:topn]], {"funded": len(funded),
+        return [r[0] for r in funded[:topn]], {"funded": len(funded),
                                                "tech": 0, "liq": n_liq}
 
+    if mode in ("P", "R"):              # 基本面**半**因子：只按 PE 分 / ROE 分排序
+        col = 2 if mode == "P" else 3
+        rows = sorted(funded, key=lambda x: -x[col])
+        return [r[0] for r in rows[:topn]], {"funded": len(funded),
+                                             "tech": 0, "liq": n_liq}
+
     # A/B：技术面只对基本面 top TECH_TOPK 计算（与线上一致）
-    ts_map = tech_scores_at(d, tech, [c for c, _ in funded[:TECH_TOPK]], weights)
+    ts_map = tech_scores_at(d, tech, [r[0] for r in funded[:TECH_TOPK]], weights)
     rows = []
-    for c, fs in funded:
+    for c, fs, _pes, _roes in funded:
         ts = ts_map.get(c)
         if ts is None:
             total = fs * 0.6 if mode == "B" else fs
@@ -267,6 +288,19 @@ def select_at(d, close, amount, pe, roe, tech, weights, mode="A", topn=None):
 # ============================================================
 # 回测
 # ============================================================
+# 单因子消融（--attrib 用）：只保留一个技术面子因子，权重 100、其余 0。
+# `select_at` 的 G 分支本来就吃任意权重 —— 所以这四个臂**不需要新的打分代码**。
+# 方向沿用 score_tech 的方向：mom/trd/rev 越大越好，vol 越小越好（score_tech 里是 1 - vol/0.03）。
+TECH_ONLY_WEIGHTS = {
+    "M_mom": {"mom": 100, "trd": 0, "vol": 0, "rev": 0},
+    "M_trd": {"mom": 0, "trd": 100, "vol": 0, "rev": 0},
+    "M_vol": {"mom": 0, "trd": 0, "vol": 100, "rev": 0},
+    "M_rev": {"mom": 0, "trd": 0, "vol": 0, "rev": 100},
+}
+# 基本面**半**因子：只按 PE 分 / 只按 ROE 分排序
+FUND_HALF_MODE = {"P_pe": "P", "R_roe": "R"}
+
+
 def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates):
     sel_dates = list(dates[::REBAL])
     nav, curve = 1.0, []
@@ -305,6 +339,16 @@ def run(variant, close, amount, pe, roe, tech, regime_by_date, topn, dates):
             continue
         if variant == "E":                                  # 全宇宙等权
             picks = list(close.loc[d].dropna().index)
+        elif variant in TECH_ONLY_WEIGHTS:                   # 单技术因子（G 分支 + 单位权重）
+            picks, diag = select_at(d, close, amount, pe, roe, tech,
+                                    TECH_ONLY_WEIGHTS[variant], "G", topn)
+            if diag:
+                diags.append({**diag, "date": d})
+        elif variant in FUND_HALF_MODE:                      # 只按 PE 分 / 只按 ROE 分
+            picks, diag = select_at(d, close, amount, pe, roe, tech,
+                                    DEFAULT_TECH_WEIGHTS, FUND_HALF_MODE[variant], topn)
+            if diag:
+                diags.append({**diag, "date": d})
         else:
             mode = variant if variant in ("A", "B", "F", "G") else "B"
             w = (DEFAULT_TECH_WEIGHTS if variant == "C"
@@ -355,10 +399,197 @@ def yearly(ser):
             for y, g in ser.groupby(ser.index.year) if len(g) > 1}
 
 
+# ============================================================
+# 因子归因（--attrib）
+# ============================================================
+# 六个子因子，方向统一成「越大越好」——这样价差的正负可直接读成「越大越赚」。
+# vol 取负：score_tech 里是 `1 - vol/0.03`，低波得高分，所以「低波」= 好。
+FACTOR_LABELS = {
+    "pe_score": "PE 分(低PE=高分)",
+    "roe_score": "ROE 分(高ROE=高分)",
+    "mom": "动量 mom20",
+    "trd": "趋势 close/MA20-1",
+    "vol": "低波 -vol20",
+    "rev": "反转 rev60",
+}
+
+
+def _factor_panels(pe, roe, tech):
+    """6 个子因子面板，方向统一为「越大越好」。"""
+    mom, trd, vol, rev = tech
+    pe_s = (50.0 * (PE_BASE / pe.clip(lower=1.0))).clip(0.0, 50.0)
+    roe_s = (50.0 * (roe / ROE_BASE)).clip(0.0, 50.0)
+    return {"pe_score": pe_s, "roe_score": roe_s,
+            "mom": mom, "trd": trd, "vol": -vol, "rev": rev}
+
+
+def _tstat(vals, since=None, pct=True):
+    """逐期值 -> {n, mean_pct, t}；since='2023-01-01' 时只取该日之后（子区间稳健性）。
+
+    pct=True 把均值乘 100（收益类）；**IC 必须传 pct=False** ——
+    Spearman IC 的取值在 [-1, 1]，乘 100 会打出「IC=7.15」这种不可能的数（踩过一次）。
+    t 值与是否乘 100 无关（分子分母同比例）。
+    """
+    a = np.asarray([v for d, v in vals if since is None or str(d)[:10] >= since], dtype=float)
+    a = a[np.isfinite(a)]
+    if len(a) < 3:
+        return {"n": int(len(a)), "mean_pct": None, "t": None}
+    se = float(a.std(ddof=1)) / np.sqrt(len(a))
+    scale = 100.0 if pct else 1.0
+    return {"n": int(len(a)), "mean_pct": round(float(a.mean()) * scale, 4),
+            "t": round(float(a.mean()) / se, 2) if se else None}
+
+
+def factor_quantile_table(close, pe, roe, tech, dates):
+    """第 1 层：因子分位归因 —— 不经组合构建、不经费用、不被那个缺陷污染。
+
+    每个调仓期，对每个子因子：
+      价差 = 当日截面 top1/3 减 bottom1/3 的前向 5 日收益
+      超额 = 当日截面 top1/3 减 全宇宙均值（「超配头部」实际能拿到多少）
+      IC   = 该因子与前瞻收益的截面 Spearman
+    再对逐期值做单样本 t（与 scripts/45 同一手法）。
+    """
+    from scipy.stats import spearmanr
+    panels = _factor_panels(pe, roe, tech)
+    spread = {k: [] for k in FACTOR_LABELS}
+    excess = {k: [] for k in FACTOR_LABELS}
+    ic = {k: [] for k in FACTOR_LABELS}
+    sel = list(dates[::REBAL])
+    for d in sel[:-1]:
+        i = dates.get_loc(d)
+        if i + REBAL >= len(dates):
+            break
+        d2 = dates[i + REBAL]
+        fwd = (close.loc[d2] / close.loc[d] - 1).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(fwd) < 30:
+            continue
+        uni = float(fwd.mean())
+        for k, p in panels.items():
+            if d not in p.index:
+                continue
+            f = p.loc[d].dropna()
+            b = f.index.intersection(fwd.index)
+            if len(b) < 30:
+                continue
+            ff = f[b].to_numpy(dtype=float)
+            rr = fwd[b].to_numpy(dtype=float)
+            ok = np.isfinite(ff) & np.isfinite(rr)
+            if ok.sum() < 30:
+                continue
+            ff, rr = ff[ok], rr[ok]
+            kk = max(1, len(ff) // 3)
+            o = np.argsort(ff)
+            top, bot = float(rr[o[-kk:]].mean()), float(rr[o[:kk]].mean())
+            spread[k].append((d2, top - bot))
+            excess[k].append((d2, top - uni))
+            rho, _ = spearmanr(ff, rr)
+            if np.isfinite(rho):
+                ic[k].append((d2, float(rho)))
+    return spread, excess, ic
+
+
+def run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, topn):
+    """跑两层归因，写 results/factor_attribution.json（**不碰** pit_select_backtest.json）。"""
+    from scipy.stats import norm
+
+    out = {}
+    spread, excess, ic = factor_quantile_table(close, pe, roe, tech, dates)
+
+    # ---- 第 1 层表 ----
+    n_tests = len(FACTOR_LABELS) * 3          # 6 因子 x (价差/超额/IC)
+    thr = float(norm.ppf(1 - 0.025 / n_tests))
+    print()
+    print("=" * 96)
+    print("第 1 层：因子分位归因（PIT 宇宙，逐调仓期；top1/3 - bottom1/3，或 top1/3 - 全宇宙）")
+    print(f"  多重比较：{n_tests} 个检验 -> Bonferroni 阈值 |t| > {thr:.2f} 才算显著")
+    print("=" * 96)
+    print(f"{'因子':<20}{'价差%/期':>10}{'t':>7}   {'超额%/期':>10}{'t':>7}   "
+          f"{'IC':>8}{'t':>7}   {'2023+价差t':>11}")
+    print("-" * 96)
+    out["quantile"] = {}
+    for k, lab in FACTOR_LABELS.items():
+        sp, ex, icv = _tstat(spread[k]), _tstat(excess[k]), _tstat(ic[k], pct=False)
+        sp23 = _tstat(spread[k], since="2023-01-01")
+        out["quantile"][k] = {"spread": sp, "excess": ex, "ic": icv, "spread_2023": sp23,
+                              "n_periods": sp["n"]}
+        mark = lambda t: ("*" if t is not None and abs(t) > thr else " ")  # noqa: E731
+        print(f"{lab:<20}{(sp['mean_pct'] or 0):>10.3f}{sp['t'] or 0:>6.2f}{mark(sp['t'])}  "
+              f"{(ex['mean_pct'] or 0):>10.3f}{ex['t'] or 0:>6.2f}{mark(ex['t'])}  "
+              f"{(icv['mean_pct'] or 0):>8.4f}{icv['t'] or 0:>6.2f}{mark(icv['t'])}  "
+              f"{(sp23['t'] or 0):>10.2f}")
+
+    # ---- 第 2 层：单因子消融回测（对照 = D，同流动性门槛的随机 12 只）----
+    print()
+    print("=" * 96)
+    print("第 2 层：单因子消融回测（能不能活着走过 top12 组合构建 + 逐期成本）")
+    print("  对照 D = 同流动性门槛随机 12 只 —— 本框架里唯一有合法零假设的基准")
+    print("=" * 96)
+    arms = [("A", "A 真分数（含缺陷）"), ("B", "B 真分数（修缺陷）"),
+            ("M_mom", "只 mom"), ("M_trd", "只 trd"), ("M_vol", "只低波"), ("M_rev", "只反转"),
+            ("F", "只基本面(PE+ROE)"), ("P_pe", "只 PE 分"), ("R_roe", "只 ROE 分"),
+            ("G", "只技术面(四合一)"), ("D", "D 随机 12(零假设)")]
+    alpha_series = {}
+    out["arms"] = {}
+    print(f"{'臂':<24}{'总收益':>9}{'年化':>8}{'最大回撤':>10}{'Sharpe':>8}{'逐期alpha':>11}{'t':>7}")
+    print("-" * 96)
+    for v, lab in arms:
+        curve, _diags, alphas = run(v, close, amount, pe, roe, tech,
+                                    regime_by_date, topn, dates)
+        m = metrics(curve)
+        if not m:
+            print(f"{lab:<24}{'无结果':>9}")
+            continue
+        ser = m.pop("_ser")
+        alpha_series[v] = pd.Series(dict(alphas)).sort_index()
+        a = np.asarray([x for _, x in alphas], dtype=float)
+        a_mean = float(a.mean()) * 100 if len(a) else 0.0
+        a_t = (float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+               if len(a) > 2 and a.std() else 0.0)
+        out["arms"][v] = {**m, "label": lab, "alpha_mean_pct": round(a_mean, 3),
+                          "alpha_t": round(a_t, 2), "n_periods": len(a),
+                          "yearly": yearly(ser)}
+        print(f"{lab:<24}{m['total']:>9.1f}{m['annual']:>8.2f}{m['maxdd']:>10.1f}"
+              f"{m['sharpe']:>8.2f}{a_mean:>11.3f}{a_t:>7.2f}")
+
+    # ---- 各臂 vs D 的配对检验 ----
+    print()
+    print("各臂 减 D（配对，同一天、只差一个打分规则）:")
+    print(f"{'对比':<30}{'alpha差/期':>12}{'t':>8}")
+    print("-" * 60)
+    out["pair_vs_D"] = {}
+    dser = alpha_series.get("D")
+    for v, lab in arms:
+        if v == "D" or v not in alpha_series or dser is None:
+            continue
+        s = pd.concat([alpha_series[v].rename("x"), dser.rename("y")],
+                      axis=1, sort=False).dropna()
+        if len(s) < 10:
+            continue
+        dd = s["x"] - s["y"]
+        t = float(dd.mean() / (dd.std(ddof=1) / np.sqrt(len(dd)))) if dd.std() else 0.0
+        out["pair_vs_D"][v] = {"diff_pct": round(float(dd.mean()) * 100, 3),
+                               "t": round(t, 2), "n": int(len(dd))}
+        print(f"{lab + ' 减 D':<30}{float(dd.mean()) * 100:>12.3f}{t:>8.2f}")
+
+    print()
+    print("[!] A 与 B 要一起看：A 保留「排名 41~80 的票 total=fund_score 未减半」这个缺陷，")
+    print("    它会**机械放大基本面分量的实际权重**（超出名义 0.6）=> 任何「基本面 vs 技术面」")
+    print("    的比较在 A 口径下都偏向基本面。只看 A 会被它骗。")
+
+    Path("results").mkdir(exist_ok=True)
+    p = Path("results/factor_attribution.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
+    print(f"\n[out] {p}（既有 results/pit_select_backtest.json 未被触碰）")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2021-07-01")
     ap.add_argument("--topn", type=int, default=TOPN)
+    ap.add_argument("--attrib", action="store_true",
+                    help="改跑**因子归因**（第1层分位 + 第2层单因子消融），"
+                         "写 results/factor_attribution.json，不跑 A-H、不碰既有 JSON")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -393,6 +624,10 @@ def main():
         regime_by_date[d] = pick_tech_weights(mr.detect(sub)["regime"])
     n_up = sum(1 for w in regime_by_date.values() if w["mom"] > 30)
     print(f"[in] regime 判定: {len(regime_by_date)} 天（其中 {n_up} 天为上涨权重）")
+
+    if args.attrib:                      # 归因模式：跑完就返回，不碰 A-H 与既有 JSON
+        run_attribution(close, amount, pe, roe, tech, dates, regime_by_date, args.topn)
+        return
 
     names = {"A": "A 忠实复刻（含 tech 缺失拿满分）",
              "B": "B 修正 tech 缺失 -> fund*0.6",
