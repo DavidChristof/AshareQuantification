@@ -243,7 +243,14 @@ auto_refresh:
     #   跑一次约 5219 次请求，按 min_gap 0.4s / 2 workers 约 17 分钟。
     #   要整体关掉：full_market.enabled: false
     full_market:
-      enabled: true
+      # [!] 2026-09-22 首次实跑后**关闭**：接线是对的，但 scripts/35 本身**会挂死**。
+      # 实测链条：workers=1 是 V8 逼出来的（>1 必崩）=> 单 worker 下**一只票的 HTTP 挂住
+      # 就拖死整个循环**（fetch_daily_full 走 akshare/Sina、**没有超时**）=> 而
+      # `_FLUSH_ROWS=20000` 意味着攒不够就不提交，**一挂就全丢**。
+      # 当晚实跑：到 1200/5218（20.5 分钟）后**卡住 105 分钟无任何进展**，杀掉时 0 行入库。
+      # 修好之前别打开：要么给 fetch 加超时，要么给 35 加「无进展看门狗 + 定期 flush」。
+      # 打开只需把下面这行改回 true（接线、闸门、星期、超时都已就位）。
+      enabled: false
       workers: 1          # [!] 2026-09-22 实测：workers=2 直接崩在 V8（py_mini_racer 栈），
                           # 与 scripts/26 同一种病、且同样与内存无关（当时可用 5.4GB）。
                           # workers=1 冒烟 20/20 通过。**不要调大。**
