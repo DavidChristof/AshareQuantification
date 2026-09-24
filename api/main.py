@@ -1168,26 +1168,42 @@ def _apply_manual_stops_locked(_live: dict | None = None) -> list:
 def _sync_manual_equity():
     """手动盘净值快照：盘中每小时记一个实时点，收盘后对齐最新交易日（日点）。
 
-    盘中用实时估值（_live_prices），让净值曲线时间轴细化到小时；
+    盘中用实时估值（`_build_prices`），让净值曲线时间轴细化到小时；
     同小时只快照一次，避免前端轮询重复写入。
+
+    [!] 2026-09-24 事故（孪生的 `_sync_real_equity` 在 2026-09-17 已修，这里漏打了补丁）：
+        **日点**的价格源原来是 `SIGNALS`，也就是**只有 40 池**。而手动盘会持有**池外**的
+        票（当日 688578，科创板，不在 40 池）—— 取不到价，`snapshot_equity` 就把那笔
+        持仓**静默按 0 计**：净值 86,288.84（应 96,710.84，少 10,422.00），
+        曲线凭空多出一根 -12.27% 的假暴跌（应 -1.68%）。
+        根因是**成交路径与估值路径不对称**：成交走 `_build_prices`，它有第三级兜底
+        「选股候选 price（覆盖池外）」=> 买得进；而估值这条没有 => 估不出。
+        修法与实盘对齐：日点用 `_close_on_date` 按**交易日**取收盘价（三个库依次查），
+        缺一个就**不写**，绝不拿别的价格凑（`_close_on_date` 的 docstring 就是这么要求的）；
+        盘中点的价格源换成同样覆盖池外的 `_build_prices`，仍缺价也不写。
     """
     try:
         hist = MANUAL_BROKER.equity_history()
+        held = [p.symbol for p in MANUAL_BROKER.query_positions()]
         # 交易时段内：每小时整点快照一次（实时估值）
         if _in_trading_hours():
             stamp = datetime.now().strftime("%Y-%m-%d %H:00")
             hour_key = datetime.now().strftime("%Y-%m-%d %H")
             if hist and str(hist[-1]["date"]).startswith(hour_key):
                 return
-            MANUAL_BROKER.snapshot_equity(stamp, _live_prices(),
-                                          price_date=trade_date())
+            # 用 _build_prices（实时 -> SIGNALS -> 选股候选，覆盖池外），而不是
+            # _live_prices（只有实时 + SIGNALS，池外持仓会缺价、被当 0 计）。
+            # 这也让盘中估值与**成交价**同源（portfolio_apply 同样走 _build_prices）。
+            prices = _build_prices(held)
+            missing = [s for s in held if s not in prices]
+            if missing:
+                logger.warning("[manual] 缺 %s 的现价，本次不写盘中点（不拿别的价格凑）",
+                               missing)
+                return
+            MANUAL_BROKER.snapshot_equity(stamp, prices, price_date=trade_date())
             return
         # 非交易时段：把日点对齐到**最新交易日**（「收盘点」属于交易日，不是日历上的「今天」）
         latest = _latest_data_date()
-        # 价格与日期**同源**：都取信号表的最后一行（`_latest_data_date()` 返回的正是该行日期）
-        prices = {s: float(sig.iloc[-1]["close"]) for s, sig in SIGNALS.items() if not sig.empty}
-        if not prices:
-            return
         # [!] 这里原来有两处坑（2026-09-17 事故，见 docs/2026-09-17-equity-date-mismatch.md）：
         #   ① 守卫 `hist[-1]["date"] >= latest` **恒为真**：equity_history() 把当日「日点」排在
         #      该日最后，没有日点时最后一个是 'D 15:00'，而字符串比较 'D 15:00' > 'D'
@@ -1199,7 +1215,16 @@ def _sync_manual_equity():
         point = daily_point_date(latest, MANUAL_BROKER.latest_trade_date())
         if point is None:
             return
-        MANUAL_BROKER.snapshot_equity(point, prices, price_date=latest)
+        # 价格与日期**同源**：都是 `latest` 这个交易日 —— 用 `_close_on_date` 从三个库
+        # 依次取**那天的收盘价**（`_latest_data_date()` 返回的正是数据覆盖的最后一天）。
+        # 不能再用 SIGNALS：它只有 40 池，池外持仓会被静默当 0（2026-09-24 事故）。
+        closes = _close_on_date(held, latest)
+        missing = [s for s in held if s not in closes]
+        if missing:
+            logger.warning("[manual] 缺 %s 在 %s 的收盘价，本次不写日点（不拿别的价格凑）",
+                           missing, latest)
+            return
+        MANUAL_BROKER.snapshot_equity(point, closes, price_date=latest)
     except Exception:  # noqa: BLE001
         logger.exception("手动盘净值同步失败")
 

@@ -461,10 +461,21 @@ class PaperBroker(Broker):
                 f"拒绝写入（会把 {price_date} 的行情算到 {date} 的点上）")
         cash = self.query_cash()
         market_value = 0.0
+        unpriced: list[str] = []
         for pos in self.query_positions():
             price = latest_prices.get(pos.symbol)
             if _valid_price(price):                     # 挡 NaN，避免 NaN 净值落库
                 market_value += pos.shares * price
+            else:
+                unpriced.append(pos.symbol)
+        if unpriced:
+            # **不能再静默按 0 计**。2026-09-24 手动盘就是这样少了 10,422.00：
+            # 688578 不在 40 池信号表里 => 取不到价 => 这一跳过 => 曲线凭空 -12.27%
+            # （真实是 -1.68%）。调用方应先保证价格齐全
+            # （见 api.main._sync_manual_equity / _sync_real_equity 的「缺价不写」）；
+            # 这里兜底吼一声，免得下一次又悄无声息地写进净值曲线。
+            logger.warning("[equity] %s 有持仓取不到有效价，按 0 计入市值（净值会偏低）: %s",
+                           self.db_path, unpriced)
         equity = cash + market_value
         with self._connect() as conn:
             conn.execute(

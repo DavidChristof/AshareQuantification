@@ -20,7 +20,29 @@
 
 1. `daily_point_date()`（纯函数）：判定日点该不该写、写哪天。
 2. `snapshot_equity(..., price_date=)`：日期与价格所属日不一致时**直接拒绝写入**。
+
+## 第 2 个事故（2026-09-24）：**池外持仓被静默按 0 计入市值**
+
+用户问「今天买了 688578 但未计入账户净值曲线」。
+
+688578 是科创板票，**不在 40 池信号表里**；而日点的价格源当时是 `SIGNALS`
+（**只有 40 池**）=> 取不到价 => `snapshot_equity` 的 `if _valid_price(price)`
+直接跳过它、照样写点。于是 09-24 净值写成 86,288.84（应 96,710.84，少 10,422.00），
+曲线凭空多出一根 -12.27% 的假暴跌（应 -1.68%）。
+
+根因是**成交路径与估值路径不对称**：成交走 `_build_prices`（有第三级兜底
+「选股候选 price，覆盖池外」）=> 买得进；估值这条没有 => 估不出。
+孪生的 `_sync_real_equity` 在 2026-09-17 已改用 `_close_on_date`，
+**手动盘漏打了这个补丁**。
+
+## 三处修复（本轮）
+
+1. `_sync_manual_equity` 的**日点**改用 `_close_on_date`（三个库按交易日取收盘价），
+   缺一个就**不写**（原来只有 40 池、缺价静默当 0）。
+2. 它的**盘中点**改用 `_build_prices`（覆盖池外），仍缺价就不写。
+3. `snapshot_equity` 遇到无有效价的持仓**必须 warning 点名**（原来是完全静默的）。
 """
+import logging
 import os
 import sys
 from pathlib import Path
@@ -69,6 +91,24 @@ def _rm(tmp):
         if not left:
             return
         time.sleep(0.05)
+
+
+def _capture_warnings(fn):
+    """跑 fn()，收集 `quant.trading.paper` 这个 logger 的告警文案（不依赖 pytest 的 caplog）。"""
+    import quant.trading.paper as paper_mod
+    got = []
+    handler = logging.Handler()
+    handler.emit = lambda rec: got.append(rec.getMessage())     # noqa: E731
+    log = paper_mod.logger
+    old_level = log.level
+    log.addHandler(handler)
+    log.setLevel(logging.WARNING)
+    try:
+        fn()
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(old_level)
+    return got
 
 
 # ============================================================
@@ -187,6 +227,81 @@ def test_incident_arithmetic_is_reproduced():
         _rm(tmp)
 
 
+# ============================================================
+# 4. 第 2 个事故（2026-09-24）：无价的持仓不得**静默**按 0 计
+# ============================================================
+def test_snapshot_equity_must_not_silently_zero_an_unpriced_position():
+    """**核心回归**：取不到价的持仓必须被**点名告警**，不能悄无声息地当 0 计。
+
+    那天手动盘买入 688578（科创板，不在 40 池信号表里），而日点的价格源当时只有 40 池
+    => 它取不到价 => `if _valid_price(price)` 直接跳过、照样写点 => 净值少了 10,422.00。
+
+    「算少」这件事由调用方负责避免（`api.main._sync_manual_equity` 现在是「缺价不写」）；
+    broker 层这一条守的是**可见性**：漏了必须有日志，否则下一次还是查不出来。
+    """
+    tmp, b = _fresh("unpriced")
+    try:
+        b.buy("601138", 100, 60.0, "2026-09-24")
+        b.buy("688578", 100, 113.0, "2026-09-24")
+        recs = _capture_warnings(
+            lambda: b.snapshot_equity("2026-09-24", {"601138": 61.0},
+                                      price_date="2026-09-24"))
+        row = [r for r in b.equity_history() if str(r["date"])[:10] == "2026-09-24"][0]
+        assert abs(row["market_value"] - 100 * 61.0) < 1e-6
+        text = " ".join(recs)
+        assert "688578" in text, f"取不到价的持仓必须被点名告警；实际日志: {text!r}"
+        assert "601138" not in text, "有价的持仓不该被误报"
+    finally:
+        _rm(tmp)
+
+
+def test_snapshot_equity_does_not_warn_when_every_position_is_priced():
+    """配上「不该吼的时候别吼」——否则告警会变成噪声、被忽略掉。"""
+    tmp, b = _fresh("allpriced")
+    try:
+        b.buy("601138", 100, 60.0, "2026-09-24")
+        b.buy("688578", 100, 113.0, "2026-09-24")
+        recs = _capture_warnings(
+            lambda: b.snapshot_equity("2026-09-24", {"601138": 61.0, "688578": 104.22},
+                                      price_date="2026-09-24"))
+        assert recs == [], f"价格齐全时不该有告警，实际: {recs!r}"
+    finally:
+        _rm(tmp)
+
+
+def test_incident_0924_arithmetic_is_reproduced():
+    """把 2026-09-24 那次的数字摆一遍，防止将来有人把「池外持仓」的取价又改窄。
+
+    持仓与当日收盘：601138 100x61.00、603993 500x17.08、002558 400x23.62、
+    688578 100x104.22、000792 400x23.70。
+      * 价格齐全    => 市值 43,990.00（净值 96,710.84，当日 -1.68%）
+      * 漏掉 688578 => 市值 33,568.00（净值 86,288.84，当日 -12.27%）
+    差额 10,422.00 = 100 x 104.22，正好是那一笔的市值。
+    """
+    tmp, b = _fresh("arith0924")
+    try:
+        closes = {"601138": 61.00, "603993": 17.08, "002558": 23.62,
+                  "688578": 104.22, "000792": 23.70}
+        shares = {"601138": 100, "603993": 500, "002558": 400,
+                  "688578": 100, "000792": 400}
+        for s, n in shares.items():
+            b.buy(s, n, 1.0, "2026-09-24")          # 成本价随便给，本测试只看市值
+
+        def mv(prices):
+            b.snapshot_equity("2026-09-24", prices, price_date="2026-09-24")
+            return [r for r in b.equity_history()
+                    if str(r["date"])[:10] == "2026-09-24"][0]["market_value"]
+
+        full = mv(dict(closes))
+        short = mv({k: v for k, v in closes.items() if k != "688578"})
+        assert abs(full - 43990.00) < 1e-6, f"齐全时应是 43,990.00，实际 {full}"
+        assert abs(short - 33568.00) < 1e-6, f"漏掉 688578 时应是 33,568.00，实际 {short}"
+        assert abs(full - short - 10422.00) < 1e-6, \
+            "差额必须正好是 688578 的市值 100 x 104.22"
+    finally:
+        _rm(tmp)
+
+
 if __name__ == "__main__":
     tests = [test_daily_point_date_normal,
              test_daily_point_date_premarket_idempotent,
@@ -197,7 +312,10 @@ if __name__ == "__main__":
              test_snapshot_equity_rejects_date_price_mismatch,
              test_snapshot_equity_accepts_matching_price_date,
              test_snapshot_equity_without_price_date_still_works,
-             test_incident_arithmetic_is_reproduced]
+             test_incident_arithmetic_is_reproduced,
+             test_snapshot_equity_must_not_silently_zero_an_unpriced_position,
+             test_snapshot_equity_does_not_warn_when_every_position_is_priced,
+             test_incident_0924_arithmetic_is_reproduced]
     for fn in tests:
         fn()
         print(f"PASS {fn.__name__}")
