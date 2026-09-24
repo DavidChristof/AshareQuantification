@@ -136,15 +136,26 @@ tests/test_gbk_output.py      4/4 PASS
 - `test_incident_0924_arithmetic_is_reproduced`
   —— 把本文第 1 节的数字钉死：齐全 `43990.00`、漏掉 `33568.00`、差 `10422.00`。
 
-## 9. [!] 生效前置：**必须重启 8001 服务**（未做，等确认）
+## 9. 生效：**已重启 8001 服务**（2026-09-24 21:0x）
 
-修复只写在源码里。**当前跑着的进程是旧代码**（模块级函数只在进程启动时载入，不热更新），所以：
+修复只写在源码里，模块级函数不热更新 —— 而这是**实测出来的**，不是推断：
+我改完数据后不到几分钟，09-24 日点就从 `96710.84` **被旧进程覆盖回 `86288.84`**
+（看板在轮询 `/api/manual/account`，旧逻辑按 40 池重写）。⇒ **必须重启**。
 
-- 它**仍会用旧逻辑**写日点 —— 也就是说**任何一次 `/api/manual/account` 或
-  `/api/manual/positions` 的轮询，都会把我刚修好的 09-24 日点重新覆盖成 86288.84**；
-- 重启后新代码会**自己把 09-24 日点写成 96710.84**（`_close_on_date` 取到的就是那天的收盘）。
+**前置条件已满足**：`logs/auto_open_execute_date` == `2026-09-24` ⇒ 当日 09:31 自动开盘调仓已跑完。
 
-**重启前置条件已满足**：`logs/auto_open_execute_date` == `2026-09-24` ⇒ 当日 09:31 自动开盘调仓已执行完。
+重启（`".venv\Scripts\python.exe" -u -m uvicorn api.main:app --host 127.0.0.1 --port 8001`），
+再轮询一次 `/api/manual/account` 触发日点写入：
+
+```
+09-24 日点  cash 52720.84  MV 43990.0  equity 96710.84145305683   <- 新代码自己写的
+行数 99（删掉的 5 个盘中点没有被重建）；全表恒等式违例 0
+logs 无 "[manual] 缺 ... 收盘价" 告警 => 取价完整、写入成功
+```
+
+**踩坑**：`start "标题" /min ...` 经 git-bash 传给 `cmd /c` 时，标题的引号被吃掉、
+被当成要执行的文件名（`系统找不到文件 "A-share-Quant-API (port 8001)"`）。
+改用 PowerShell `Start-Process` 启动（日志落在 `logs/api.log` + `logs/api.err.log`）。
 
 ## 10. 遗留（如实记下）
 
@@ -160,6 +171,22 @@ tests/test_gbk_output.py      4/4 PASS
 4. `data/full_market.db` 仍停在 **2026-09-22**（`scripts/35` 的下一次自动跑见
    `docs/2026-09-22-full-market-refresh-scheduled.md`；注意中秋/国庆休市日尚未填进
    `holiday_dates`，那一项**另案处理**）。
+5. **账户页与曲线仍不一致 —— 同类缺陷的另一半，本轮未修。**
+   `_live_prices()` 仍只覆盖 `QUOTE_MANAGER` + `SIGNALS`（40 池），所以**展示路径**上
+   池外持仓依旧缺价，`live_summary` 的 `or pos.avg_cost` 就回退到成本价：
+
+   ```
+   /api/manual/account    equity 97589.31   当日 -0.78%    <- 688578 按成本 113.005
+   净值曲线（已修）        equity 96710.84   当日 -1.68%    <- 688578 按收盘 104.22
+   差 878.47 = 100 x (113.005 - 104.22)
+   ```
+
+   **为什么不当场改掉**：`_live_prices()` **同时喂给止盈止损巡检**
+   （`_manual_stop_worker` -> `_apply_manual_stops`）。给它加池外兜底，等于
+   **让池外持仓第一次可以被止损触发**，而兜底价是**非实时**的近似价
+   （`_build_prices` 的「选股候选 price」）—— 可能误触发、真下单。
+   要修就应当**只改展示路径**（`manual_account` / `manual_positions`，
+   缺价时用 `_close_on_date` 取最近收盘），**巡检保持「缺价就不动手」**。
 
 ## 相关
 
