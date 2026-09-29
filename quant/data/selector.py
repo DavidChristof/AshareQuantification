@@ -468,3 +468,31 @@ def load_universe_codes() -> set[str]:
         return set(cfg.get("data", {}).get("universe", []))
     except Exception:  # noqa: BLE001
         return set()
+
+
+def tradable_candidates(rows: list[dict], universe, allow_out_of_pool: bool = False):
+    """从选股候选里筛出**可交易**的行：有价，且（默认）在 `universe` 内。
+
+    ## 为什么要有这道闸门（2026-09-29）
+
+    40 池外的票**买得进、估不出**：成交走 `_build_prices`（含「选股候选 price」的
+    池外兜底），估值却长期只认 40 池 => 688578（唯一的池外持仓）让净值曲线凭空
+    少算一整笔（见 docs/2026-09-24-manual-equity-missing-position.md）。修好取价路径
+    之后，池外持仓仍是持续的噪声源（展示层的名字回退、止盈止损拿不到实时价……），
+    所以直接**不再买池外**：池外标的从此不进交易目标集。
+
+    [!] 放进 selector 而不是写成 api.main 里的内联过滤，是为了**能被测试**：
+    tests/ 里没有任何文件 import `api/main.py`（引它就会加载模型、起后台线程），
+    内联过滤器等于没有回归。
+
+    Args:
+        rows: 选股候选（`results/daily_selection.json` 的 candidates，含 `code`/`price`）。
+        universe: 允许交易的代码集合（调用方传 40 池的 `DATA`）。
+        allow_out_of_pool: True 则放行池外（回退旧行为用）。
+
+    Returns:
+        过滤后的候选，**保持原顺序**（调用方依赖它已是综合分降序）。
+    """
+    pool = {str(c) for c in universe}
+    return [r for r in rows
+            if r.get("price") and (allow_out_of_pool or str(r.get("code")) in pool)]

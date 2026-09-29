@@ -298,6 +298,15 @@ trading:
   #   selection = 今日选股 topN（600 只大池，基本面+低波动+60日反转实证因子）——主推
   #   model40   = 旧逻辑：40 只训练池按模型综合分 topN（可随时回退）
   candidate_source: selection
+  # 池外闸门（2026-09-29）：是否允许买入 **40 池外**的票。false（默认）= 只买 40 池内。
+  # 起因：40 池外的票**买得进、估不出** —— 成交走 `_build_prices`（有池外兜底），估值
+  # 却只认 40 池，688578（唯一的池外持仓）因此让净值曲线凭空少算一整笔（09-24 事故，
+  # 见 docs/2026-09-24-manual-equity-missing-position.md）。取价路径修好后，池外持仓仍是
+  # 持续噪声源（名字回退成裸代码、止盈止损拿不到实时价……），故默认直接不买。
+  # 改动点只有一处咽喉：api/main.py::_portfolio_with_reasons（展示与 09:31 自动开盘
+  # 调仓共用）→ quant/data/selector.py::tradable_candidates。
+  # 注意：置 true 不只是"恢复旧行为"，还会让池外持仓重新进入目标集。
+  allow_out_of_pool: false
 portfolio_risk:
   market_weak_threshold: -1.0   # 大盘(沪深300)当日跌幅低于此值(%) → 弱势，降仓
   weak_position_pct: 0.5        # 弱势时总仓位上限（占资产比例）

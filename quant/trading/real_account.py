@@ -5,9 +5,12 @@
     - 新增 `real_order_log` 表：记录「下过的单 / 建议 / 是否成交」，**未成交也留痕**
       （这正是「着重考虑成交成功与否」需要的对照数据）；
     - `record_execution()`：按人工回报的成交价与**实际手续费**记账（fee_override）；
-    - `sellable_shares()`：T+1 可卖量（今日买入不可卖）；
-    - `delete_trade()` / `rebuild_from_trades()`：误录修正 —— 删掉错误流水后**全量重放**，
-      cash 与持仓从流水重新推导，永远自洽（也是坏数据的修复工具）。
+    - `sellable_shares()`：T+1 可卖量（今日买入不可卖）。
+
+[!] `delete_trade()` / `rebuild_from_trades()` / `trade_history_with_id()` 曾经长在本类上，
+2026-09-29 **已上移到基类 `PaperBroker`** —— 它们是纯流水代数，不含任何实盘专有状态，
+而手动盘同样需要它们（回退 688578 那笔池外买入时它没有这个能力）。这里靠继承拿到，
+**不要再复制一份回来**，否则两份必然漂移。
 
 [!] 本模块**不会**、也无法自动下单：没有任何券商接口，只对人工回报的成交做记账。
 """
@@ -91,16 +94,6 @@ class RealBroker(PaperBroker):
                 "advice_price", "advice_status", "reason", "remark")
         return [dict(zip(keys, r)) for r in rows]
 
-    def trade_history_with_id(self, limit: int = 100) -> list[dict]:
-        """成交流水（带 id，供误录删除）。基类 trade_history 不返回 id。"""
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT id,date,symbol,side,shares,price,fee,amount,remark "
-                "FROM paper_trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        keys = ("id", "date", "symbol", "side", "shares", "price", "fee",
-                "amount", "remark")
-        return [dict(zip(keys, r)) for r in rows]
-
     def sellable_shares(self, symbol: str, date: str) -> float:
         """T+1：可卖股数 = 持仓 - 当日买入。"""
         with self._connect() as conn:
@@ -121,56 +114,3 @@ class RealBroker(PaperBroker):
             conn.commit()
             return cur.rowcount > 0
 
-    def delete_trade(self, trade_id: int) -> bool:
-        """删除一条错误流水（随后应调用 rebuild_from_trades 重建）。"""
-        with self._connect() as conn:
-            cur = conn.execute("DELETE FROM paper_trades WHERE id=?", (trade_id,))
-            conn.commit()
-            return cur.rowcount > 0
-
-    def rebuild_from_trades(self) -> dict:
-        """按现存成交流水**全量重放**，重建 cash 与持仓（自洽、可作修复工具）。
-
-        口径：买入 `amount` 已含费用 → cash -= amount；卖出 `amount` 为成交额 →
-        cash += amount - fee。持仓成本按移动加权平均重算。
-        """
-        with self._connect() as conn:
-            init_row = conn.execute(
-                "SELECT value FROM paper_account WHERE key='initial_capital'").fetchone()
-            cash = float(init_row[0]) if init_row and init_row[0] is not None else 0.0
-            rows = conn.execute(
-                "SELECT id,date,symbol,side,shares,price,fee,amount FROM paper_trades "
-                "ORDER BY id").fetchall()
-            old_max = {r[0]: float(r[1] or 0) for r in conn.execute(
-                "SELECT symbol, max_price FROM paper_positions").fetchall()}
-
-        pos: dict[str, list] = {}
-        for _id, _d, sym, side, sh, px, fee, amt in rows:
-            sh, px, fee, amt = float(sh), float(px), float(fee or 0), float(amt)
-            if side == "buy":
-                cash -= amt
-                cur = pos.setdefault(sym, [0.0, 0.0])
-                new_sh = cur[0] + sh
-                cur[1] = (cur[0] * cur[1] + sh * px) / new_sh if new_sh else 0.0
-                cur[0] = new_sh
-            else:
-                cash += amt - fee
-                cur = pos.setdefault(sym, [0.0, 0.0])
-                cur[0] -= sh
-                if cur[0] <= 1e-9:
-                    pos.pop(sym, None)
-
-        with self._connect() as conn:
-            conn.execute("BEGIN")
-            conn.execute("DELETE FROM paper_positions")
-            conn.execute("UPDATE paper_account SET value=? WHERE key='cash'", (cash,))
-            for sym, (sh, cost) in pos.items():
-                if sh <= 0:
-                    continue
-                conn.execute(
-                    "INSERT INTO paper_positions (symbol,shares,avg_cost,max_price) "
-                    "VALUES (?,?,?,?)", (sym, sh, cost, old_max.get(sym, 0.0) or cost))
-            conn.commit()
-        logger.info("实盘账本已按流水重建：cash=%.2f，持仓 %d 只", cash, len(pos))
-        return {"cash": round(cash, 2),
-                "positions": {s: round(v[0], 4) for s, v in pos.items()}}

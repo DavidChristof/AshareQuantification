@@ -56,6 +56,7 @@ from quant.backtest.engine import BacktestEngine                       # noqa: E
 from quant.backtest.metrics import summarize                           # noqa: E402
 from quant.config import load_config                                   # noqa: E402
 from quant.data.loader import load_all                                 # noqa: E402
+from quant.data.selector import tradable_candidates                    # noqa: E402
 from quant.models.cross_model import CrossSectionalPredictor          # noqa: E402
 from quant.models.predict import ModelPredictor                        # noqa: E402
 from quant.realtime.indices import IndexQuoter                         # noqa: E402
@@ -1180,7 +1181,7 @@ def _sync_manual_equity():
         「选股候选 price（覆盖池外）」=> 买得进；而估值这条没有 => 估不出。
         修法与实盘对齐：日点用 `_close_on_date` 按**交易日**取收盘价（三个库依次查），
         缺一个就**不写**，绝不拿别的价格凑（`_close_on_date` 的 docstring 就是这么要求的）；
-        盘中点的价格源换成同样覆盖池外的 `_build_prices`，仍缺价也不写。
+        盘中点的价格源换成同样覆盖池外的 `_held_valuation_prices`，仍缺价也不写。
     """
     try:
         hist = MANUAL_BROKER.equity_history()
@@ -1191,10 +1192,11 @@ def _sync_manual_equity():
             hour_key = datetime.now().strftime("%Y-%m-%d %H")
             if hist and str(hist[-1]["date"]).startswith(hour_key):
                 return
-            # 用 _build_prices（实时 -> SIGNALS -> 选股候选，覆盖池外），而不是
-            # _live_prices（只有实时 + SIGNALS，池外持仓会缺价、被当 0 计）。
-            # 这也让盘中估值与**成交价**同源（portfolio_apply 同样走 _build_prices）。
-            prices = _build_prices(held)
+            # 用 `_held_valuation_prices`（实时 -> SIGNALS -> 三库收盘）而不是
+            # `_live_prices`（只有实时 + SIGNALS，池外持仓会缺价、被当 0 计）。
+            # 它与 `/api/manual/account`、`/api/manual/positions` 是**同一个函数**
+            # => 盘中点与账户页显示的数同源，不会互相打架。
+            prices = _held_valuation_prices(held)
             missing = [s for s in held if s not in prices]
             if missing:
                 logger.warning("[manual] 缺 %s 的现价，本次不写盘中点（不拿别的价格凑）",
@@ -1244,6 +1246,31 @@ def _live_prices() -> dict:
     return prices
 
 
+def _held_valuation_prices(held) -> dict:
+    """**持仓**的估值价：实时优先 -> SIGNALS 收盘 -> **三库按交易日取收盘**。
+
+    与 `_live_prices()` 的区别：那个只有 `QUOTE_MANAGER` + `SIGNALS`，也就是**只有 40 池**；
+    而手动盘会持有**池外**的票（2026-09-24：688578，科创板，不在 40 池）—— 取不到价时
+    `live_summary` 会回退成本价、`snapshot_equity` 会静默当 0。
+
+    - 第 1/2 级用 `_real_prices`：它对**池外**符号走 `fetch_quotes` 批量抓（10s TTL 缓存），
+      池内仍走 `QUOTE_MANAGER`，与 `_live_prices` 同源 => 盘中照旧随行情走。
+    - 第 3 级用 `_close_on_date` 兜底：它**读库、不依赖实时源**，所以**收盘后账户页与
+      曲线的日点必然是同一个数**（这正是 2026-09-24 那个 878.47 差额的修法）。
+
+    [!] **不要拿它去替换止盈止损巡检里的 `_live_prices()`**（`_manual_stop_worker`
+    -> `_apply_manual_stops`）：那等于让**池外持仓第一次可以被止损触发**，而这里的
+    兜底价是**收盘价、不是实时价** => 可能拿一个过时的价去**真下单**。
+    巡检保持「缺价就不动手」；要展示得对，在这里补。
+    """
+    held = [s for s in dict.fromkeys(held or []) if s]
+    prices = _real_prices(held)
+    missing = [s for s in held if s not in prices]
+    if missing:
+        prices.update(_close_on_date(missing, _latest_data_date()))
+    return prices
+
+
 def _manual_stop_worker():
     """盘中周期性检查手动盘止盈止损 —— 替代原来「挂在读接口上的副作用」。
 
@@ -1276,7 +1303,10 @@ def _manual_stop_worker():
 
 @app.get("/api/manual/account")
 def manual_account():
-    prices = _live_prices()          # 实时价优先（盘中总资产随行情同步）
+    # 实时价优先（盘中总资产随行情同步）；用**持仓**口径而不是 `_live_prices()`，
+    # 否则池外持仓取不到价 -> live_summary 回退成本价（2026-09-24：账户页 97589.31
+    # 而曲线 96710.84，差 878.47）。止盈止损巡检仍用 _live_prices（见该函数说明）。
+    prices = _held_valuation_prices([p.symbol for p in MANUAL_BROKER.query_positions()])
     # [!] 这里原来有一句 `_apply_manual_stops(prices)` —— **读接口里下单**。
     #     看板一轮询就触发、频率秒级，把 sell() 的竞态放大成了必然（2026-09-17 重复卖出）。
     #     止盈止损已挪到后台线程 `_manual_stop_worker`（2026-09-17）。
@@ -1289,7 +1319,8 @@ def manual_account():
 
 @app.get("/api/manual/positions")
 def manual_positions():
-    prices = _live_prices()          # 实时价优先（持仓现价/市值随行情同步）
+    # 同 manual_account：持仓口径取价，池外的票才不会回退成本价
+    prices = _held_valuation_prices([p.symbol for p in MANUAL_BROKER.query_positions()])
     # 止盈止损已挪到后台线程 `_manual_stop_worker`（理由见 manual_account）
     _sync_manual_equity()            # 净值对齐最新交易日
     risk = _risk_config()
@@ -1302,7 +1333,12 @@ def manual_positions():
         r = _position_risk(pos.symbol, pos.avg_cost, vol_map, vol_cfg)
         result.append({
             "symbol": pos.symbol,
-            "name": _name(pos.symbol),
+            # 用 `_display_name` 而不是 `_name`：后者只查 40 池的名字表，池外票会**回退成
+            # 裸代码**。2026-09-29 实测：688578 在「资产构成」饼图上是 `688578: 11.0%`、
+            # 在「持仓盈亏分布」y 轴上是 `688578 688578`（前端就是 `p.name + ' ' + p.symbol`，
+            # 名字回退成代码后写了两遍），看着像 bug。本文件其余 8 处早就用对了，只漏这一处。
+            # 加了池外闸门后池外持仓已为 0、此 bug 不可达 —— 但留着就是隐患，故仍修。
+            "name": _display_name(pos.symbol),
             "shares": round(pos.shares, 2),
             "avg_cost": round(pos.avg_cost, 3),
             "price": round(price, 3),
@@ -1736,10 +1772,18 @@ def _portfolio_with_reasons(n: int | None = None):
     n = n or cfg.get("trading", {}).get("max_positions", 5)
     # ---- 大池每日选股候选（有价可交易才用，否则回退 model40） ----
     if cfg.get("trading", {}).get("candidate_source", "selection") == "selection":
-        trade = [r for r in _selection_rows() if r.get("price")]
+        # 池外闸门（2026-09-29）：默认**不再买 40 池外的票**。这里是唯一咽喉 ——
+        # `/api/portfolio`（展示，:2044 一带）与 `portfolio_apply`（执行，含 09:31 自动开盘
+        # `_auto_open_execute_worker`）都经本函数，所以过滤一次，展示与成交天然一致。
+        # （另一条买入路径 `/api/manual/order` 在 :1437 早就用 `symbol in DATA` 拦住了。）
+        # 副作用：目标集不含池外 ⇒ `portfolio_apply` 第 1 步会把任何池外持仓按
+        # 「掉出topN」卖掉 —— 这条路径从此是自清洁的。开关见 config trading.allow_out_of_pool。
+        trade = tradable_candidates(
+            _selection_rows(), DATA,
+            allow_out_of_pool=bool(cfg.get("trading", {}).get("allow_out_of_pool", False)))
         if trade:
             return _portfolio_from_selection(trade, n)
-        logger.warning("每日选股候选为空或无可交易价，回退 model40 组合")
+        logger.warning("每日选股候选为空/无可交易价/池内无候选，回退 model40 组合")
     regime = None
     try:
         regime = REGIME_DETECTOR.detect(_market_proxy())

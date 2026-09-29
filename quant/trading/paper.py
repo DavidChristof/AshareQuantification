@@ -510,6 +510,182 @@ class PaperBroker(Broker):
         return [{"date": r[0], "symbol": r[1], "side": r[2], "shares": r[3],
                  "price": r[4], "fee": r[5], "amount": r[6], "remark": r[7]} for r in rows]
 
+    # ---------- 更正与修复（误录删除 / 按流水重建 / 净值点重建） ----------
+    # 这几招原本只长在 `RealBroker` 上，可它们是**纯流水代数**：只读写
+    # paper_trades / paper_account / paper_positions（全由上面的 `_SCHEMA` 建），
+    # 不含任何实盘专有状态。2026-09-29 上移到基类，手动盘与实盘共用一份 ——
+    # 当时的动机是手动盘要按「从没买过」回退 688578 那笔池外买入，而它**没有**
+    # 删除+重建的能力（前端「按流水全量重建资金/持仓」那句话此前只对实盘成立）。
+    def trade_history_with_id(self, limit: int = 100) -> list[dict]:
+        """成交流水（带 id，供误录删除）。上面的 `trade_history` 不返回 id。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,date,symbol,side,shares,price,fee,amount,remark "
+                "FROM paper_trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        keys = ("id", "date", "symbol", "side", "shares", "price", "fee",
+                "amount", "remark")
+        return [dict(zip(keys, r)) for r in rows]
+
+    def delete_trade(self, trade_id: int) -> bool:
+        """删除一条错误流水（随后应调用 `rebuild_from_trades` 重建）。"""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM paper_trades WHERE id=?", (trade_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def rebuild_from_trades(self) -> dict:
+        """按现存成交流水**全量重放**，重建 cash 与持仓（自洽、可作修复工具）。
+
+        口径：买入 `amount` 已含费用 → cash -= amount；卖出 `amount` 为成交额 →
+        cash += amount - fee。持仓成本按移动加权平均重算。
+
+        [!] **完全不碰 `paper_equity`** —— 历史净值点不会被重算、也不会被删。所以
+        删掉一笔成交之后，那些「含该持仓」的历史点会与流水脱节（它们自身仍然满足
+        `equity == cash + market_value`，恒等式检查**发现不了**这种脱节）。要让历史
+        重新与流水自洽，得另外调 `rebuild_daily_points` + `drop_equity_points`
+        （2026-09-29 回退 688578 就是这么组合的，见
+        docs/2026-09-29-rollback-out-of-pool-688578.md）。
+        """
+        with self._connect() as conn:
+            init_row = conn.execute(
+                "SELECT value FROM paper_account WHERE key='initial_capital'").fetchone()
+            cash = float(init_row[0]) if init_row and init_row[0] is not None else 0.0
+            rows = conn.execute(
+                "SELECT id,date,symbol,side,shares,price,fee,amount FROM paper_trades "
+                "ORDER BY id").fetchall()
+            old_max = {r[0]: float(r[1] or 0) for r in conn.execute(
+                "SELECT symbol, max_price FROM paper_positions").fetchall()}
+
+        pos: dict[str, list] = {}
+        for _id, _d, sym, side, sh, px, fee, amt in rows:
+            sh, px, fee, amt = float(sh), float(px), float(fee or 0), float(amt)
+            if side == "buy":
+                cash -= amt
+                cur = pos.setdefault(sym, [0.0, 0.0])
+                new_sh = cur[0] + sh
+                cur[1] = (cur[0] * cur[1] + sh * px) / new_sh if new_sh else 0.0
+                cur[0] = new_sh
+            else:
+                cash += amt - fee
+                cur = pos.setdefault(sym, [0.0, 0.0])
+                cur[0] -= sh
+                if cur[0] <= 1e-9:
+                    pos.pop(sym, None)
+
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM paper_positions")
+            conn.execute("UPDATE paper_account SET value=? WHERE key='cash'", (cash,))
+            for sym, (sh, cost) in pos.items():
+                if sh <= 0:
+                    continue
+                conn.execute(
+                    "INSERT INTO paper_positions (symbol,shares,avg_cost,max_price) "
+                    "VALUES (?,?,?,?)", (sym, sh, cost, old_max.get(sym, 0.0) or cost))
+            conn.commit()
+        logger.info("账本已按流水重建（%s）：cash=%.2f，持仓 %d 只",
+                    self.db_path, cash, len(pos))
+        return {"cash": round(cash, 2),
+                "positions": {s: round(v[0], 4) for s, v in pos.items()}}
+
+    def rebuild_daily_points(self, close_of, dates: list[str] | None = None) -> dict:
+        """按现存成交流水重建**日点**净值：cash 取该日为止的 PIT 现金，mv 取当日收盘。
+
+        用途：回退/更正成交流水之后，让历史日点重新与流水自洽（`rebuild_from_trades`
+        明确不碰净值表）。
+
+        ## 为什么重算日点是正当的，删盘中点却是必须的
+
+        日期为 D 的日点**本来就只依赖 D 当天收盘时可知的信息**（D 为止的现金 + D 的
+        收盘价），所以按同一口径重算**不引入未来信息**。盘中点相反：它们写的是
+        **实时价**，而实时快照不留存（`data/minute.db` 里池外票 0 行）=> 不可重建，
+        只能删（见 `drop_equity_points`；先例
+        docs/2026-09-24-manual-equity-missing-position.md §7）。
+
+        Args:
+            close_of: `(symbol, 日期) -> float | None`。由调用方注入，本模块不依赖行情库
+                （脚本里传三库依次查收盘的那个阶梯）。
+                **任一持仓当日无价 → 该点整点不写**（记入返回值的 missing），绝不拿
+                别的价格凑 —— 与 `snapshot_equity` 的「缺价不写」同一口径。
+            dates: 要重写的日期（`'YYYY-MM-DD'`）；None = 库里现有的**所有**日点。
+
+        Returns: `{"written": [...], "missing": {日期: [无价持仓]}}`
+        """
+        if dates is None:
+            with self._connect() as conn:
+                dates = [r[0] for r in conn.execute(
+                    "SELECT date FROM paper_equity WHERE instr(date,' ')=0 ORDER BY date")]
+        # 去重 + 排序：下面按流水 id 升序**单向前进**，日期乱序会把流水回退掉
+        dates = sorted({str(d)[:10] for d in dates})
+        with self._connect() as conn:
+            init_row = conn.execute(
+                "SELECT value FROM paper_account WHERE key='initial_capital'").fetchone()
+            rows = conn.execute(
+                "SELECT id,date,symbol,side,shares,price,fee,amount FROM paper_trades "
+                "ORDER BY id").fetchall()
+        cash = float(init_row[0]) if init_row and init_row[0] is not None else 0.0
+
+        written: list[str] = []
+        missing: dict[str, list[str]] = {}
+        pos: dict[str, list] = {}
+        i = 0
+        for d in dates:
+            # 推进到「D 为止」的 PIT 状态（含 D 当天的成交 —— 日点记的是 D 收盘后的账户）
+            while i < len(rows) and str(rows[i][1])[:10] <= d:
+                _id, _dd, sym, side, sh, px, fee, amt = rows[i]
+                sh, px, fee, amt = float(sh), float(px), float(fee or 0), float(amt)
+                if side == "buy":
+                    cash -= amt
+                    cur = pos.setdefault(sym, [0.0, 0.0])
+                    new_sh = cur[0] + sh
+                    cur[1] = (cur[0] * cur[1] + sh * px) / new_sh if new_sh else 0.0
+                    cur[0] = new_sh
+                else:
+                    cash += amt - fee
+                    cur = pos.setdefault(sym, [0.0, 0.0])
+                    cur[0] -= sh
+                    if cur[0] <= 1e-9:
+                        pos.pop(sym, None)
+                i += 1
+            prices, unpriced = {}, []
+            for sym in pos:
+                p = close_of(sym, d)
+                if _valid_price(p):
+                    prices[sym] = float(p)
+                else:
+                    unpriced.append(sym)
+            if unpriced:
+                missing[d] = unpriced
+                continue
+            mv = sum(pos[s][0] * prices[s] for s in pos)
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO paper_equity "
+                    "(date, cash, market_value, equity) VALUES (?,?,?,?)",
+                    (d, cash, mv, cash + mv))
+            written.append(d)
+        if missing:
+            logger.warning("[equity] %s 这些日点的持仓缺价，未重建（不拿别的价格凑）: %s",
+                           self.db_path, missing)
+        logger.info("[equity] %s 已按流水重建日点 %d 个", self.db_path, len(written))
+        return {"written": written, "missing": missing}
+
+    def drop_equity_points(self, keys: list[str]) -> int:
+        """按 key 精确删除净值点，返回删除行数。
+
+        专门用来清掉**不可重建**的盘中点（它们按实时价写入、实时快照不留存），
+        日点不受影响。只删点名的那几行，不做任何猜测性的批量删除。
+        """
+        keys = [str(k) for k in keys]
+        if not keys:
+            return 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM paper_equity WHERE date IN " f"({','.join('?' * len(keys))})",
+                keys)
+            conn.commit()
+            return int(cur.rowcount)
+
     def account_summary(self) -> dict:
         cash = self.query_cash()
         with self._connect() as conn:

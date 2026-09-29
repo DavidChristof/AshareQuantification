@@ -13,7 +13,7 @@ import pandas as pd                                  # noqa: E402
 
 from quant.data.selector import (                               # noqa: E402
     DEFAULT_TECH_WEIGHTS, TECH_REGIME_WEIGHTS, _daily_tech, _score_tech,
-    pick_tech_weights,
+    pick_tech_weights, tradable_candidates,
 )
 
 
@@ -102,13 +102,51 @@ def test_score_tech_regime_weights_change_ranking():
     assert _score_tech(None) is None
 
 
+_POOL = {"603993", "002709", "600519", "000792", "002558"}
+_ROWS = [{"code": "603993", "price": 16.75},      # 池内、有价
+         {"code": "688578", "price": 106.25},     # 池外、有价（真实事故里那只）
+         {"code": "600519", "price": 1400.0},     # 池内、有价
+         {"code": "999999", "price": None}]       # 有码无价
+
+
+def test_tradable_candidates_blocks_out_of_pool_by_default():
+    """默认把池外剔掉 —— 顺序保持（调用方依赖它已是综合分降序）。"""
+    got = [r["code"] for r in tradable_candidates(_ROWS, _POOL)]
+    assert got == ["603993", "600519"]
+    assert "688578" not in got
+
+
+def test_tradable_candidates_can_allow_out_of_pool():
+    """开关放行池外时回到旧行为（池外仍在，顺序不变）。"""
+    got = [r["code"] for r in tradable_candidates(_ROWS, _POOL, allow_out_of_pool=True)]
+    assert got == ["603993", "688578", "600519"]
+
+
+def test_tradable_candidates_always_drops_unpriced():
+    """无价的候选无论开不开闸门都不能交易。"""
+    assert "999999" not in [r["code"] for r in tradable_candidates(_ROWS, _POOL)]
+    assert "999999" not in [
+        r["code"] for r in tradable_candidates(_ROWS, _POOL, allow_out_of_pool=True)]
+
+
+def test_tradable_candidates_empty_when_no_in_pool_name():
+    """池内一只都没有 -> 返回空（调用方据此回退 model40，那本身就是 40 池）。"""
+    only_out = [{"code": "688578", "price": 106.25}]
+    assert tradable_candidates(only_out, _POOL) == []
+    assert len(tradable_candidates(only_out, _POOL, allow_out_of_pool=True)) == 1
+
+
 if __name__ == "__main__":
     tests = [test_score_tech_strong_weak, test_score_tech_bounds,
              test_score_tech_none, test_daily_tech_uptrend,
              test_daily_tech_failure,
              test_pick_tech_weights_regime_direction,
              test_pick_tech_weights_default_and_sum,
-             test_score_tech_regime_weights_change_ranking]
+             test_score_tech_regime_weights_change_ranking,
+             test_tradable_candidates_blocks_out_of_pool_by_default,
+             test_tradable_candidates_can_allow_out_of_pool,
+             test_tradable_candidates_always_drops_unpriced,
+             test_tradable_candidates_empty_when_no_in_pool_name]
     for fn in tests:
         fn()
         print(f"PASS {fn.__name__}")

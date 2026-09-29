@@ -41,6 +41,15 @@
    缺一个就**不写**（原来只有 40 池、缺价静默当 0）。
 2. 它的**盘中点**改用 `_build_prices`（覆盖池外），仍缺价就不写。
 3. `snapshot_equity` 遇到无有效价的持仓**必须 warning 点名**（原来是完全静默的）。
+
+## 第 3 件事（2026-09-29）：回退成交后，历史日点要能重新对齐流水
+
+用户决定把 688578 那笔池外买入**当没发生过**（删流水 + 重算日点），并且此后不再买
+池外（`config.trading.allow_out_of_pool: false`）。`rebuild_from_trades` 明确不碰净值表，
+所以补了两个工具：`rebuild_daily_points`（日点可精确重算 —— 它只依赖该日收盘可知的
+信息）与 `drop_equity_points`（盘中点不可重建，只能删）。本文件下面三条测试钉住它们的
+关键性质：**逐日 PIT**（更晚才买的票不能出现在更早的点里）、**缺价整点不写**、
+**只删点名的行**。见 docs/2026-09-29-rollback-out-of-pool-688578.md。
 """
 import logging
 import os
@@ -302,6 +311,64 @@ def test_incident_0924_arithmetic_is_reproduced():
         _rm(tmp)
 
 
+def test_rebuild_daily_points_uses_point_in_time_state():
+    """日点按「该日为止的现金 + 该日收盘市值」重算（回退成交后对齐历史用）。
+
+    关键在**逐日**：更晚才买的票不能出现在更早的点里。这里用「把后一笔的 amount
+    加回来」来钉死这一点 —— 加不回来就说明用了未来的持仓。
+    """
+    tmp, b = _fresh("rebuild")
+    b.buy("603993", 100, 10.0, "2026-09-10")
+    r2 = b.buy("688578", 100, 20.0, "2026-09-11")
+    assert r2.success
+    closes = {("603993", "2026-09-10"): 10.5,
+              ("603993", "2026-09-11"): 11.0,
+              ("688578", "2026-09-11"): 21.0}
+    rep = b.rebuild_daily_points(lambda s, d: closes.get((s, d)),
+                                 dates=["2026-09-10", "2026-09-11"])
+    assert rep["missing"] == {}
+    h = {r["date"]: r for r in b.equity_history()}
+    cash_all = b.query_cash()
+    # 09-10：第二笔还没发生 -> 现金要把它加回来，且只有 603993 计市值
+    assert abs(h["2026-09-10"]["cash"] - (cash_all + r2.amount)) < 1e-6
+    assert abs(h["2026-09-10"]["market_value"] - 100 * 10.5) < 1e-6
+    # 09-11：两笔都已发生
+    assert abs(h["2026-09-11"]["cash"] - cash_all) < 1e-6
+    assert abs(h["2026-09-11"]["market_value"] - (100 * 11.0 + 100 * 21.0)) < 1e-6
+    for d in ("2026-09-10", "2026-09-11"):
+        assert abs(h[d]["equity"] - (h[d]["cash"] + h[d]["market_value"])) < 1e-6
+    _rm(tmp)
+
+
+def test_rebuild_daily_points_skips_a_day_with_a_missing_price():
+    """某持仓当日无价 -> 该点**整点不写**，绝不拿别的价格凑（与快照同一口径）。"""
+    tmp, b = _fresh("rebuildmiss")
+    b.buy("603993", 100, 10.0, "2026-09-10")
+    b.buy("688578", 100, 20.0, "2026-09-11")
+
+    def close_of(s, d):                       # 只有 603993 有价，688578 取不到
+        return 11.0 if (s, d) == ("603993", "2026-09-11") else None
+
+    rep = b.rebuild_daily_points(close_of, dates=["2026-09-11"])
+    assert rep["written"] == []
+    assert "688578" in rep["missing"]["2026-09-11"]
+    assert "2026-09-11" not in {r["date"] for r in b.equity_history()}
+    _rm(tmp)
+
+
+def test_drop_equity_points_removes_only_the_named_keys():
+    """只删点名的行 —— 盘中点删掉，同日日点原样保留。"""
+    tmp, b = _fresh("drop")
+    b.buy("603993", 100, 10.0, "2026-09-10")
+    b.snapshot_equity("2026-09-10", {"603993": 11.0})
+    b.snapshot_equity("2026-09-10 09:00", {"603993": 10.2})
+    b.snapshot_equity("2026-09-10 10:00", {"603993": 10.5})
+    assert b.drop_equity_points(["2026-09-10 09:00", "2026-09-10 10:00"]) == 2
+    assert {r["date"] for r in b.equity_history()} == {"2026-09-10"}
+    assert b.drop_equity_points([]) == 0
+    _rm(tmp)
+
+
 if __name__ == "__main__":
     tests = [test_daily_point_date_normal,
              test_daily_point_date_premarket_idempotent,
@@ -315,7 +382,10 @@ if __name__ == "__main__":
              test_incident_arithmetic_is_reproduced,
              test_snapshot_equity_must_not_silently_zero_an_unpriced_position,
              test_snapshot_equity_does_not_warn_when_every_position_is_priced,
-             test_incident_0924_arithmetic_is_reproduced]
+             test_incident_0924_arithmetic_is_reproduced,
+             test_rebuild_daily_points_uses_point_in_time_state,
+             test_rebuild_daily_points_skips_a_day_with_a_missing_price,
+             test_drop_equity_points_removes_only_the_named_keys]
     for fn in tests:
         fn()
         print(f"PASS {fn.__name__}")

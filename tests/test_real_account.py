@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from quant.trading.paper import PaperBroker
 from quant.trading.real_account import RealBroker
 
 _TMP_UID = [0]
@@ -110,6 +111,31 @@ def test_insufficient_cash_rejected():
     r = b.record_execution("603993", "buy", 300, 18.0, "2026-09-10")
     assert r.success is False and "资金不足" in r.message
     assert b.query_cash() == 3000.0
+    _rm(tmp)
+
+
+def test_paper_broker_also_owns_delete_and_rebuild():
+    """`delete_trade`/`rebuild_from_trades` 已上移到**基类**，手动盘同样能用。
+
+    2026-09-29：这两个方法原本只长在 `RealBroker` 上，而手动盘要按「从没买过」回退
+    688578 那笔池外买入时**没有**这个能力（前端「按流水全量重建资金/持仓」只对实盘成立）。
+    形状照抄真实事故：买一只池内的 + 一只池外的，删掉池外那笔 —— 持仓消失、现金按
+    该笔买入金额（已含费用）退回、另一只不动。
+    """
+    tmp = f"paper/_test_paper_{os.getpid()}_{_RUN_TAG}_base.db"
+    b = PaperBroker(tmp, initial_capital=100000.0, commission=0.0003,
+                    slippage=0.0, stamp_tax=0.0005, lot_size=100)
+    assert b.buy("603993", 500, 17.60106951, "2026-09-21", remark="池内").success
+    rb = b.buy("688578", 100, 113.00469641999999, "2026-09-24", remark="池外")
+    assert rb.success
+    cash_with_out = b.query_cash()
+    ids = [t["id"] for t in b.trade_history_with_id() if t["symbol"] == "688578"]
+    assert len(ids) == 1
+    assert b.delete_trade(ids[0]) is True
+    out = b.rebuild_from_trades()
+    assert out["positions"] == {"603993": 500.0}
+    assert [p.symbol for p in b.query_positions()] == ["603993"]
+    assert abs(b.query_cash() - (cash_with_out + rb.amount)) < 1e-9
     _rm(tmp)
 
 
