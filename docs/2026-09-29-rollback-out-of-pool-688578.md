@@ -155,7 +155,7 @@ tradable_candidates(rows, universe, allow_out_of_pool=False)   # quant/data/sele
     => 与修复脚本写的值**完全相同**（任何漂移都说明重建错了）
 净值表行数 101（112-11）；被删的 11 个盘中点**没有被重建**；2026-09-24 09:00 仍在
 全表 equity == cash + market_value 违例 0 行
-scripts/42_audit_accounts.py --only manual  ->  cash 差 +0.00
+scripts/42_audit_accounts.py --only manual  ->  cash 差 +0.00，日点 0 处差异（见 §9）
 /api/manual/positions  ->  5 只、无 688578、名字为中文
 /api/portfolio         ->  targets 5 只全部 in_universe=True，池外目标数 0
 tests/  31/31 个测试文件全绿（新增 8 条）
@@ -166,20 +166,32 @@ logs 无 "[manual] 缺 ... 收盘价" 告警（=> 取价完整）
 必须在停服状态做，且必须重启 —— 09-24 §9 的教训就是旧进程把修好的数据又覆盖了回去。
 备份：`paper/manual_account.db.bak-20260929-rollback-out-of-pool`（回滚 = 覆盖回去）。
 
-## 9. 遗留：日点审计**本来就有 5 处**差异（本轮不动）
+## 9. 日点审计差异：手动盘的 5 处**已抹平**；自动纸面盘另有 14 处（未动）
 
-审计显示 5 处历史差异，**全部早于 09-24、与 688578 无关**（均已实测复现，库中值偏大）：
+审计（`scripts/42` 恒等式 ②）在手动盘报出 5 处差异，**全部早于 09-24、与 688578 无关**
+（库中值偏大）。成因多半是**那些日期的 40 池收盘价事后被修订过** —— 点写下去时是对的，
+行情源后来改了数，点就与现在的收盘价对不上了。这类差异不会自己消失。
 
-| 日期 | 库中 mv | 重算 mv | 差 |
+经用户确认后，用 `scripts/47_rebuild_daily_points.py` 按「该日为止的现金 + 该日收盘价」
+重算抹平（备份 `paper/manual_account.db.bak-20260929-daily-point-rebuild`）：
+
+| 日期 | equity 改前 | equity 改后 | 差 |
 |---|---|---|---|
-| 2026-09-03 | 42051.00 | 41742.00 | +309.00 |
-| 2026-09-04 | 42358.00 | 42046.00 | +312.00 |
-| 2026-09-21 | 34369.00 | 34324.00 | +45.00 |
-| 2026-09-22 | 38155.00 | 38111.00 | +44.00 |
-| 2026-09-23 | 44162.00 | 44074.00 | +88.00 |
+| 2026-09-03 | 99453.71 | 99144.71 | −309.00 |
+| 2026-09-04 | 99760.71 | 99448.71 | −312.00 |
+| 2026-09-21 | 98976.03 | 98931.03 | −45.00 |
+| 2026-09-22 | 98968.08 | 98924.08 | −44.00 |
+| 2026-09-23 | 98360.30 | 98272.30 | −88.00 |
 
-本轮**不动**它们（多半是这些日期的 40 池收盘价事后被修订所致）。要不要用新的
-`rebuild_daily_points` 一并抹平，是**另一个可见的历史改写决定**，留给用户拍板。
+重算**不引入未来信息**（日点只依赖当日收盘可知的信息），且**盘中点一个没动**（84 → 84）。
+这是**一次刻意的历史改写**，故脚本同样先备份、默认只在副本上预演。
+
+抹平后：`[manual] 日点 0 处差异，结论 OK`、`[real] 0 处差异，结论 OK`。
+
+> [!] **顺带发现：自动纸面盘（`paper/paper_account.db`）有 14 处同类差异**（09-14 ~ 09-23）。
+> 与本次改动**无关**（那个库本会话从未被碰过），**未动** —— 它是另一个账户的历史，
+> 要不要一并抹平是**单独的决定**。所以 `scripts/42` 的总结论目前仍显示「14 处差异」，
+> 那 14 处全部来自自动纸面盘，手动盘与实盘都是干净的。
 
 其它：
 - `quant/trading/real_advice.py` 的实盘建议仍允许池外票（范围外）。
@@ -192,5 +204,7 @@ logs 无 "[manual] 缺 ... 收盘价" 告警（=> 取价完整）
 - `docs/2026-09-17-equity-date-mismatch.md` —— 日点日期口径
 - `docs/2026-09-14-trade-date-fix.md` —— 成交日期用日历日
 - `quant/trading/paper.py`（`rebuild_from_trades` / `rebuild_daily_points` / `drop_equity_points`）、
-  `quant/data/selector.py::tradable_candidates`、`api/main.py::_portfolio_with_reasons`、
-  `scripts/46_rollback_poolout_holding.py`
+  `quant/data/selector.py::tradable_candidates`、`api/main.py::_portfolio_with_reasons`
+- `scripts/46_rollback_poolout_holding.py` —— 本次回退的执行器
+- `scripts/47_rebuild_daily_points.py` —— 抹平日点审计差异的工具（§9）
+- `quant/trading/audit.py::check_daily_points` —— 上面两个脚本的**验收口径**（复用它，别自造）
