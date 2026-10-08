@@ -372,6 +372,17 @@
              style="background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.45);color:#f85149;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
           🛑 <b>账户回撤熔断</b>：{{ portfolio.drawdown_brake.reason }} → 总仓位上限降至 {{ ((portfolio.drawdown_brake.position_pct||0.5)*100).toFixed(0) }}% 且<b>暂停开新仓</b>（回撤收窄后自动解除）
         </div>
+        <!-- 每日一次的自动任务「今天跑没跑」—— 来自 /api/portfolio 的 daily_runs。
+             [!] 这两条必须插在下面那个多余的 </div> 之前：它提前关掉了 .panel，
+                 插在它后面会被甩到面板外（布局会变）。那个 </div> 是既有的小瑕疵，别顺手去"修"。 -->
+        <div v-if="portfolio.daily_runs && portfolio.daily_runs.auto_open && portfolio.daily_runs.auto_open.missed"
+             style="background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.45);color:#f85149;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
+          🛑 <b>今日开盘自动调仓未执行</b>：已过 {{ portfolio.daily_runs.auto_open.window_end }} 仍无执行标记（auto_open_execute_date = {{ portfolio.daily_runs.auto_open.date || '空' }}）→ 请手动点下方「一键执行组合调仓」
+        </div>
+        <div v-if="portfolio.daily_runs && portfolio.daily_runs.shadow_ab && portfolio.daily_runs.shadow_ab.missed"
+             style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4);color:#d29922;border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px">
+          ⚠️ <b>600 池维护今日未执行</b>：已过 {{ portfolio.daily_runs.shadow_ab.window_end }} 仍无标记（shadow_ab_date = {{ portfolio.daily_runs.shadow_ab.date || '空' }}）→ 服务可能没在窗口内运行
+        </div>
         </div>
         <div v-if="portfolio.targets && portfolio.targets.length" class="grid2" style="margin-bottom:8px">
           <div>

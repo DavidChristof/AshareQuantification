@@ -73,7 +73,7 @@ from quant.trading.real_account import RealBroker                      # noqa: E
 from quant.trading import fill as fill_mod                             # noqa: E402
 from quant.trading.real_advice import AdviceInput, plan_real_portfolio  # noqa: E402
 from quant.risk.calendar import (                                      # noqa: E402
-    is_ashare_trading_day, parse_dates, upcoming_closure_run,
+    is_ashare_trading_day, parse_dates, upcoming_closure_run, daily_worker_step,
 )
 from quant.risk import drawdown as drawdown_mod                        # noqa: E402
 from quant.risk import market_trend as trend_mod                      # noqa: E402
@@ -82,6 +82,60 @@ logger = logging.getLogger(__name__)
 
 cfg = load_config()
 app = FastAPI(title="A股量化预测服务", version="0.2.0")
+
+
+def _setup_app_logging() -> None:
+    """把应用日志落到 `logs/app.log`（utf-8，带时间戳+级别）。幂等；不影响 uvicorn 的输出。
+
+    ## [!] 为什么必须补这一步（2026-10-08）
+
+    本模块**只 getLogger()、从来不配 handler**。而 uvicorn 的 `LOGGING_CONFIG` 里
+    **没有 root entry**（只有 uvicorn / uvicorn.error / uvicorn.access 三个 logger）=> 应用
+    logger 冒泡到一个**没有 handler 的 root**，只剩 Python 的 `lastResort` 兜底：
+    **仅 WARNING 及以上、且无时间戳无级别**。
+
+    后果不是「日志难看」，是**事故无痕**：`_auto_open_execute_worker` 那句
+    「错过开盘触发点」是 `logger.info` => 一个字都没落盘 => 2026-09-30 开盘自动调仓静默
+    失效，直到用户发现要手动操作才暴露（见 docs/2026-10-08-daily-workers-single-shot.md）。
+
+    ## 为什么不会和 uvicorn 重复
+
+    已核对 uvicorn 默认配置：`uvicorn` 与 `uvicorn.access` 都是 `propagate: False`，
+    `uvicorn.error` 无该键但父级 `uvicorn` 是 False —— 在 root 之前就截断了。
+    再加一道 `_NoUvicorn` filter 兜底，propagate 无论真假都不会漏进 app.log。
+
+    ## 为什么不用 `logging.basicConfig`
+
+    它会给 root 加一个 **StreamHandler**，和 uvicorn 抢控制台（应用日志会打印两遍，
+    一遍裸格式一遍 uvicorn 格式）。这里只挂文件，控制台维持原样。
+    """
+    root = logging.getLogger()
+    if any(getattr(h, "_ashare_app_log", False) for h in root.handlers):
+        return                                          # 幂等：重复 import 不重复挂
+    try:
+        logdir = cfg.resolve("logs")
+        logdir.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(logdir / "app.log", encoding="utf-8")
+    except OSError:                                     # 日志目录不可写不该拖垮服务
+        return
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s"))
+
+    class _NoUvicorn(logging.Filter):
+        def filter(self, record):
+            return not record.name.startswith("uvicorn")
+
+    fh.addFilter(_NoUvicorn())
+    fh._ashare_app_log = True
+    root.addHandler(fh)
+    # 只给应用自己的 logger 开 INFO，免得把第三方库（urllib3 / akshare…）的 INFO 也灌进来。
+    # 冒泡到 root 时只查 handler 的 level、不再查 root logger 的 level，故 root 保持默认即可。
+    for _n in ("__main__", "api", "quant"):
+        logging.getLogger(_n).setLevel(logging.INFO)
+
+
+_setup_app_logging()
 
 # 允许前端（file:// 直接打开 / 本地静态页）跨域访问
 app.add_middleware(
@@ -321,65 +375,123 @@ def _scheduler():
 # 函数尚未绑定 → 实测踩到 `portfolio_apply` NameError（2026-09-14，见 docs）。
 
 
-def _auto_open_execute_worker():
-    """开盘自动组合调仓：服务在开盘时刻(9:30+delay)正运行时，自动执行一次买入/卖出。
+# ---------- 每日一次 worker 的共用件（开盘自动调仓 / 600 池维护） ----------
 
-    用日志标记防同一天重复（中途重启也不重跑）；服务当时没开 → 本进程错过则当日不再跑
-    （符合“本地项目无法 24h 挂服务”约束）。执行走 portfolio_apply 同一套决策（含追高拦截/风控）。
-    """
+# 睡眠上限。**不要一觉睡到 wake_at**：Windows 的 `time.sleep` 不保证计入系统挂起的时间，
+# 一觉睡到触发点在「挂起穿过窗口」时行为不可预测；60 秒上限保证唤醒后 60 秒内必定用墙钟
+# 重新判定 —— 于是「挂起到 11:00」稳定得到 skip_grace（正确：窗口已过，不迟到成交），
+# 「挂起到 09:40」稳定得到 run（正确：还在窗口内）。代价约 2880 次/天/线程的纯函数调用。
+_WORKER_MAX_SLEEP = 60.0
+
+# 「今天漏跑了」告警的去重集合（键 = kind:日期）。
+# [!] 刻意只用**进程内集合**、不写文件：写标记会与「运行标记」混为一谈，
+#    让一次漏跑看起来像跑过了（那正是我们要消灭的错觉）。重启后最多重复告警一次，可接受。
+_warned_missed: set[str] = set()
+
+
+def _read_marker(path) -> str | None:
+    """读运行标记文件的内容（不存在/不可读 -> None）。每轮都重读，兼容外部写入。"""
     try:
-        aoe = (cfg.get("portfolio_risk", {}) or {}).get("auto_open_execute") or {}
-        if not aoe.get("enabled", False):
-            return
-        today = datetime.now().date()
-        holidays = parse_dates(
-            (cfg.get("risk", {}) or {}).get("pre_holiday", {}).get("holiday_dates") or [])
-        if not is_ashare_trading_day(today, holidays):
-            return
-        delay = int(aoe.get("delay_sec", 60))
-        grace = int(aoe.get("grace_min", 25)) * 60
-        trigger = datetime(today.year, today.month, today.day, 9, 30, 0) \
-            + timedelta(seconds=delay)
-        marker = cfg.resolve("logs") / "auto_open_execute_date"
-        while True:
-            now = datetime.now()
-            if now < trigger:
-                time.sleep(max(1.0, min(20.0, (trigger - now).total_seconds())))
-                continue
-            if (now - trigger).total_seconds() > grace:
-                logger.info("[auto-open] 错过开盘触发点（已过 %s 分钟），本日不自动调仓",
-                            grace // 60)
-                return
-            if marker.exists() \
-                    and marker.read_text(encoding="utf-8").strip() == today.isoformat():
-                return                                    # 本日已自动执行过
-            # [!] marker 只在**确认处理过**时才写。原来无条件写在 try 之外，
-            #    导致调仓抛异常（什么都没执行）也会被标记为「本日已跑」→ 当日永久跳过。
-            #    2026-09-14 实际事故即如此（NameError 被吞 + marker 照写）。
-            handled = False
-            try:
-                logger.info("[auto-open] 触发自动组合调仓（开盘参考价成交）...")
-                summary = portfolio_apply(force_open_ref=True)
-                logger.info("[auto-open] 完成: %s", summary)
-                handled = True
-            except HTTPException as exc:
-                # 业务性跳过（非交易日/非交易时段/已调仓等）：算已处理，不重试
-                logger.info("[auto-open] 跳过（%s）", exc.detail)
-                handled = True
-            except Exception as exc:  # noqa: BLE001
-                logger.error("[auto-open] 执行异常（**不写 marker**，"
-                             "grace 窗口内重启可重试）: %s", exc, exc_info=True)
-            if handled:
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                marker.write_text(today.isoformat(), encoding="utf-8")
-            return
-    except Exception as exc:  # noqa: BLE001
-        logger.error("[auto-open] worker 异常退出: %s", exc)
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+    return None
 
 
-# 「开盘自动组合调仓」线程同样在**文件末尾**启动（配置关闭时立即空转退出）。
-# [!] 这个 worker 尤其不能提前启动：它的触发条件是「现在已过 09:31 且在 grace 窗口内」，
-#    若服务恰在 09:31~09:56 之间启动，它会在 import 途中立刻调用 portfolio_apply → NameError。
+def _warn_missed_once(kind: str, day) -> None:
+    """今日窗口已过却没有运行标记 -> 吼一声（每个 kind×日期 只吼一次）。
+
+    这是本次修复的**另一半**：worker 常驻只保证「该跑的时候有人跑」，而「万一没跑」
+    必须自己喊出来 —— 2026-09-30 就是没人喊，用户只能靠手动操作才发现。
+    """
+    key = f"{kind}:{day.isoformat()}"
+    if key in _warned_missed:
+        return
+    _warned_missed.add(key)
+    logger.warning("[%s] 今日(%s)窗口已过但仍无运行标记 -> 本日未执行，需人工处理",
+                   kind, day)
+
+
+def _auto_open_execute_worker():
+    """开盘自动组合调仓：**常驻循环**，每个交易日在开盘触发点自动执行一次。
+
+    ## 与旧版的关键差别（2026-10-08 修）
+
+    旧版是**一天一次性**的：处理完一天就 `return`，线程永久结束 —— 于是只有「服务恰好
+    在当天窗口前被重启过」的日子才会跑。2026-09-30 因此整天空过（用户只能手动调仓）；
+    假期 10-02/05/06/07 四天没有任何 shadow 日志，也是因为线程早在 10-01 就死了。
+    现在每一轮都用 `datetime.now()` 重新推导「今天」，**重启时刻不再重要**。
+
+    ## 安全边界（**不要放宽**）
+
+    `run` 只发生在 `[trigger, trigger+grace]` 且今天确为交易日时；窗口外一律
+    `skip_grace`，**绝不迟到成交**（服务 11:00 才起，就不能拿 11:00 的现价补开盘单）。
+    判定在 `quant/risk/calendar.py::daily_worker_step`，**条件顺序本身就是安全边界**，
+    那里有详细推导 + 单测覆盖。
+
+    执行走 `portfolio_apply` 同一套决策（含追高拦截/风控）。
+    """
+    attempted = None        # 本进程内今天是否已尝试过（防「异常未写 marker」后重复下单）
+    while True:
+        wake = datetime.now() + timedelta(seconds=_WORKER_MAX_SLEEP)
+        try:
+            aoe = (cfg.get("portfolio_risk", {}) or {}).get("auto_open_execute") or {}
+            if not aoe.get("enabled", False):
+                wake = datetime.now() + timedelta(seconds=300)
+            else:
+                delay = int(aoe.get("delay_sec", 60))
+                grace_min = int(aoe.get("grace_min", 25))
+                # 触发点 = 09:30:00 + delay_sec（**不是**配置里的 HH:MM）
+                hhmm = (datetime(2000, 1, 1, 9, 30)
+                        + timedelta(seconds=delay)).strftime("%H:%M")
+                marker = cfg.resolve("logs") / "auto_open_execute_date"
+                now = datetime.now()
+                action, wake_at = daily_worker_step(
+                    now, hhmm, grace_min, _read_marker(marker), _today_is_trading())
+                if action == "run" and attempted == now.date():
+                    # [!] 本进程今天已经试过了（多半是执行中途抛异常、没写 marker）。
+                    #     不能不记：`portfolio_apply` 先卖后买，中途异常会留下**部分成交**，
+                    #     60 秒后窗口若还没关就会再跑一遍 -> **重复下单**。
+                    #     这也保持了旧版既定语义：「不重试，但 grace 窗口内重启可补」。
+                    action = "skip_done"
+                if action == "run":
+                    handled = False
+                    try:
+                        logger.info("[auto-open] 触发自动组合调仓（开盘参考价成交）...")
+                        summary = portfolio_apply(force_open_ref=True)
+                        logger.info("[auto-open] 完成: %s", summary)
+                        handled = True
+                    except HTTPException as exc:
+                        # 业务性跳过（非交易日/非交易时段/已调仓等）：算已处理，不重试
+                        logger.info("[auto-open] 跳过（%s）", exc.detail)
+                        handled = True
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("[auto-open] 执行异常（**不写 marker**，今日不再重试；"
+                                     "窗口内重启可补）: %s", exc, exc_info=True)
+                    if handled:
+                        # marker 只在**确认处理过**时才写。2026-09-14 事故：无条件写会让
+                        # 「什么都没执行的异常」也被标记成「本日已跑」-> 当日永久跳过。
+                        marker.parent.mkdir(parents=True, exist_ok=True)
+                        marker.write_text(now.date().isoformat(), encoding="utf-8")
+                    attempted = now.date()
+                    wake = now + timedelta(seconds=_WORKER_MAX_SLEEP)
+                else:
+                    wake = min(wake_at, now + timedelta(seconds=_WORKER_MAX_SLEEP))
+                    if action == "skip_grace" and _today_is_trading() \
+                            and _read_marker(marker) != now.date().isoformat():
+                        _warn_missed_once("auto-open", now.date())
+        except Exception as exc:  # noqa: BLE001
+            # try/except 在**循环内**：坏配置或单次故障只废掉一轮，不能杀死线程。
+            # 旧版把 try 包在整个函数外面 —— 一处异常就永久退出线程，与「错过就死」同源。
+            logger.error("[auto-open] worker 循环异常（不退出）: %s", exc, exc_info=True)
+        time.sleep(max(1.0, min(_WORKER_MAX_SLEEP,
+                                (wake - datetime.now()).total_seconds())))
+
+
+# 「开盘自动组合调仓」线程同样在**文件末尾**启动（`enabled=false` 时只是空转，不退出）。
+# [!] 这个 worker 尤其不能提前启动：服务若恰在 09:31~09:56（窗口内）启动，它会**立刻**
+#     调用 `portfolio_apply`，而此时该函数尚未绑定 → NameError（2026-09-14 实际事故）。
 
 
 # ============ 收盘后：自动维护 600 池 + 影子 A/B（scripts 26→27→28） ============
@@ -581,110 +693,130 @@ def _shadow_data_current(day) -> bool:
         return False
 
 
-def _shadow_ab_worker():
-    """服务挂着时，在 run_time（默认 15:45）自动跑 600 池维护流水线，每日一次。
+def _shadow_ab_run_once(today, sab) -> None:
+    """跑一轮 600 池维护（含 40 池补刷 / 日线发布探测 / 内存闸门 / retry_until）。
 
-    与 _auto_open_execute_worker 同理：没到点就睡；错过 grace 窗口 → 本日跳过；
-    logs/shadow_ab_date 防同日重复（中途重启也不重跑）。跑 27 前确保 40 池
-    (market.db) 今日已刷新 —— 15:30 自动刷新若还没跑到（服务刚起），这里补一次幂等更新。
+    [!] 本函数里的每一个 `return` 都只表示「**本日放弃**」。在旧版里它们是 `return`
+    出整个 worker 线程（于是线程就此死亡）；2026-10-08 改成常驻循环后，它们必须
+    只结束这一轮 —— 外层 worker 下一轮会重新判定该不该跑。成功时由本函数写 marker。
     """
-    try:
-        sab = (cfg.get("auto_refresh", {}) or {}).get("shadow_ab") or {}
-        if not sab.get("enabled", False):
-            return
-        today = datetime.now().date()
-        holidays = parse_dates(
-            (cfg.get("risk", {}) or {}).get("pre_holiday", {}).get("holiday_dates") or [])
-        if not is_ashare_trading_day(today, holidays):
-            return
-        run_time = str(sab.get("run_time", "15:45"))
-        grace_min = int(sab.get("grace_min", 120))
-        rh, rm = map(int, run_time.split(":"))
-        trigger = datetime(today.year, today.month, today.day, rh, rm, 0)
-        while True:
-            now = datetime.now()
-            if now < trigger:
-                time.sleep(max(1.0, min(20.0, (trigger - now).total_seconds())))
-                continue
-            if (now - trigger).total_seconds() > grace_min * 60:
-                logger.info("[shadow] 错过今日触发点（%s 后 %d 分钟仍不在），本日不自动跑",
-                            run_time, grace_min)
+    marker = cfg.resolve("logs") / "shadow_ab_date"
+    retry_min = max(int(sab.get("retry_interval_min", 10) or 10), 1)
+    uh, um = map(int, str(sab.get("retry_until", "18:30")).split(":"))
+    rh, rm = map(int, str(sab.get("run_time", "15:45")).split(":"))
+    trigger = datetime(today.year, today.month, today.day, rh, rm, 0)
+    retry_until = max(datetime(today.year, today.month, today.day, uh, um, 0), trigger)
+    while True:
+        # 先补一次 40 池收盘刷新（幂等，含自动调仓/选股）
+        if not _pool_data_current(today):
+            _run_auto_update()
+        # **先判源发布没发布，再跑昂贵流水线**。旧写法是「先跑完整 26→27→28、
+        # 再校验大池库、不合格就 10 分钟后重跑」——从 run_time 到当日日线发布之间
+        # 会每 10 分钟全量重跑一次（559 次请求 + 约 7 分钟），纯属白跑，而且本项目
+        # 曾因高频请求被新浪软封（见 fetcher / scripts/38 的限速记录）。
+        # 40 池与大池同源，所以 40 池没推进 => 大池必然也拿不到今天的日线。
+        if not _pool_data_current(today):
+            if datetime.now() >= retry_until:
+                logger.error("[shadow] 今日日线仍未发布（40 池未推进到 %s）且已过重试截止 "
+                             "%s —— 本次**不写 marker**，留给兜底定时补跑", today,
+                             retry_until.strftime("%H:%M"))
+                _shadow_log(today, f"等待当日日线发布：已过重试截止 "
+                                   f"{retry_until:%H:%M}，本次不写 marker")
                 return
-            marker = cfg.resolve("logs") / "shadow_ab_date"
-            if marker.exists() and marker.read_text(encoding="utf-8").strip() == today.isoformat():
-                logger.info("[shadow] 今日已自动跑过，跳过")
+            msg = (f"行情源当日日线尚未发布（40 池仍停在昨日），{retry_min} 分钟后重试"
+                   f"（本轮跳过 26→27→28，避免白跑）")
+            logger.info("[shadow] %s", msg)
+            _shadow_log(today, msg)
+            time.sleep(retry_min * 60)
+            continue
+        # 内存闸门：26 的 py_mini_racer(V8) 在内存紧张时会**进程级 FATAL 崩溃**，
+        # 崩了就是 0 行、白跑一轮。与其撞上去，不如等内存够了再跑（见 _free_mem_mb）。
+        free_mb = _free_mem_mb()
+        min_mb = float(sab.get("min_free_mb", 1200) or 0)
+        if free_mb < min_mb:
+            if datetime.now() >= retry_until:
+                logger.error("[shadow] 可用内存仅 %.0fMB（< %.0fMB）且已过重试截止 %s —— "
+                             "本次**不写 marker**，留给兜底定时补跑",
+                             free_mb, min_mb, retry_until.strftime("%H:%M"))
+                _shadow_log(today, f"可用内存仅 {free_mb:.0f}MB（< {min_mb:.0f}MB）："
+                                   f"已过重试截止，本次不写 marker")
                 return
-            retry_min = max(int(sab.get("retry_interval_min", 10) or 10), 1)
-            uh, um = map(int, str(sab.get("retry_until", "18:30")).split(":"))
-            retry_until = max(datetime(today.year, today.month, today.day, uh, um, 0), trigger)
-            while True:
-                # 先补一次 40 池收盘刷新（幂等，含自动调仓/选股）
-                if not _pool_data_current(today):
-                    _run_auto_update()
-                # **先判源发布没发布，再跑昂贵流水线**。旧写法是「先跑完整 26→27→28、
-                # 再校验大池库、不合格就 10 分钟后重跑」——从 run_time 到当日日线发布之间
-                # 会每 10 分钟全量重跑一次（559 次请求 + 约 7 分钟），纯属白跑，而且本项目
-                # 曾因高频请求被新浪软封（见 fetcher / scripts/38 的限速记录）。
-                # 40 池与大池同源，所以 40 池没推进 => 大池必然也拿不到今天的日线。
-                if not _pool_data_current(today):
-                    if datetime.now() >= retry_until:
-                        logger.error("[shadow] 今日日线仍未发布（40 池未推进到 %s）且已过重试截止 "
-                                     "%s —— 本次**不写 marker**，留给兜底定时补跑", today,
-                                     retry_until.strftime("%H:%M"))
-                        _shadow_log(today, f"等待当日日线发布：已过重试截止 "
-                                           f"{retry_until:%H:%M}，本次不写 marker")
-                        return
-                    msg = (f"行情源当日日线尚未发布（40 池仍停在昨日），{retry_min} 分钟后重试"
-                           f"（本轮跳过 26→27→28，避免白跑）")
-                    logger.info("[shadow] %s", msg)
-                    _shadow_log(today, msg)
-                    time.sleep(retry_min * 60)
-                    continue
-                # 内存闸门：26 的 py_mini_racer(V8) 在内存紧张时会**进程级 FATAL 崩溃**，
-                # 崩了就是 0 行、白跑一轮。与其撞上去，不如等内存够了再跑（见 _free_mem_mb）。
-                free_mb = _free_mem_mb()
-                min_mb = float(sab.get("min_free_mb", 1200) or 0)
-                if free_mb < min_mb:
-                    if datetime.now() >= retry_until:
-                        logger.error("[shadow] 可用内存仅 %.0fMB（< %.0fMB）且已过重试截止 %s —— "
-                                     "本次**不写 marker**，留给兜底定时补跑",
-                                     free_mb, min_mb, retry_until.strftime("%H:%M"))
-                        _shadow_log(today, f"可用内存仅 {free_mb:.0f}MB（< {min_mb:.0f}MB）："
-                                           f"已过重试截止，本次不写 marker")
-                        return
-                    msg = (f"可用内存仅 {free_mb:.0f}MB（< {min_mb:.0f}MB）—— "
-                           f"26 的 py_mini_racer(V8) 会在 partition_address_space 处 FATAL 崩溃，"
-                           f"本轮不跑，{retry_min} 分钟后重试（请关掉占内存的程序，如游戏）")
-                    logger.warning("[shadow] %s", msg)
-                    _shadow_log(today, msg)
-                    time.sleep(retry_min * 60)
-                    continue
-                logger.info("[shadow] 触发：维护 600 池 + 影子 A/B（26→27→28，约几分钟）...")
-                _shadow_ab_pipeline(sab)
-                if _shadow_data_current(today):
-                    break
-                if datetime.now() >= retry_until:
-                    logger.error("[shadow] 大池库未推进到 %s 且已过重试截止 %s —— "
-                                 "本次**不写 marker**，留给兜底定时补跑", today,
-                                 retry_until.strftime("%H:%M"))
-                    return
-                logger.warning("[shadow] 大池库仍停在昨日，%d 分钟后重试", retry_min)
-                time.sleep(retry_min * 60)
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(today.isoformat(), encoding="utf-8")
-            logger.info("[shadow] 本日自动维护完成（数据已推进到 %s）→ logs/shadow_ab_%s.log",
-                        today, today)
+            msg = (f"可用内存仅 {free_mb:.0f}MB（< {min_mb:.0f}MB）—— "
+                   f"26 的 py_mini_racer(V8) 会在 partition_address_space 处 FATAL 崩溃，"
+                   f"本轮不跑，{retry_min} 分钟后重试（请关掉占内存的程序，如游戏）")
+            logger.warning("[shadow] %s", msg)
+            _shadow_log(today, msg)
+            time.sleep(retry_min * 60)
+            continue
+        logger.info("[shadow] 触发：维护 600 池 + 影子 A/B（26→27→28，约几分钟）...")
+        _shadow_ab_pipeline(sab)
+        if _shadow_data_current(today):
+            break
+        if datetime.now() >= retry_until:
+            logger.error("[shadow] 大池库未推进到 %s 且已过重试截止 %s —— "
+                         "本次**不写 marker**，留给兜底定时补跑", today,
+                         retry_until.strftime("%H:%M"))
             return
-    except Exception as exc:  # noqa: BLE001
-        logger.error("[shadow] worker 异常退出: %s", exc, exc_info=True)
-        # 落盘留痕：服务 stdout 未必包含 api 模块的 logger，故障要能在 shadow 日志里看到
+        logger.warning("[shadow] 大池库仍停在昨日，%d 分钟后重试", retry_min)
+        time.sleep(retry_min * 60)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(today.isoformat(), encoding="utf-8")
+    logger.info("[shadow] 本日自动维护完成（数据已推进到 %s）→ logs/shadow_ab_%s.log",
+                today, today)
+
+
+def _shadow_ab_worker():
+    """服务挂着时，每个交易日在 run_time（默认 16:55）自动跑 600 池维护流水线。
+
+    **常驻循环**，理由与 `_auto_open_execute_worker` 完全相同（旧版「一天一次性」，
+    处理完就 `return` -> 线程永久死亡 -> 只有恰好在窗口前重启过的日子才跑）。
+    假期 10-02/05/06/07 四天没有任何 shadow 日志，就是线程早在 10-01 就死了的实证。
+
+    跑 27 前确保 40 池 (market.db) 今日已刷新 —— 15:30 自动刷新若还没跑到（服务刚起），
+    `_shadow_ab_run_once` 里会补一次幂等更新。
+
+    ## 为什么这里**没有** auto-open 那个 `attempted` 同日防重
+
+    `portfolio_apply` 动真钱（部分成交后重跑 = 重复下单），所以那边必须记住「本日已试过」。
+    而 600 池流水线是**幂等的数据重算**（26 增量 INSERT OR REPLACE、27/28 重算后重写）
+    -> 窗口内因一次偶发异常重跑一遍是**无害且有益的**（多一次拿到当日日线的机会）。
+    差异是刻意的，不是漏写。
+    """
+    while True:
+        wake = datetime.now() + timedelta(seconds=_WORKER_MAX_SLEEP)
         try:
-            import traceback
-            with (cfg.resolve("logs") / f"shadow_ab_{datetime.now():%Y-%m-%d}.log").open(
-                    "a", encoding="utf-8") as fh:
-                fh.write(f"\n[worker 异常] {exc!r}\n{traceback.format_exc()}\n")
-        except Exception:  # noqa: BLE001
-            pass
+            sab = (cfg.get("auto_refresh", {}) or {}).get("shadow_ab") or {}
+            if not sab.get("enabled", False):
+                wake = datetime.now() + timedelta(seconds=300)
+            else:
+                run_time = str(sab.get("run_time", "15:45"))
+                grace_min = int(sab.get("grace_min", 120))
+                marker = cfg.resolve("logs") / "shadow_ab_date"
+                now = datetime.now()
+                action, wake_at = daily_worker_step(
+                    now, run_time, grace_min, _read_marker(marker), _today_is_trading())
+                if action == "run":
+                    logger.info("[shadow] 触发 600 池维护（%s）", now.date())
+                    _shadow_ab_run_once(now.date(), sab)
+                    wake = now + timedelta(seconds=_WORKER_MAX_SLEEP)
+                else:
+                    wake = min(wake_at, now + timedelta(seconds=_WORKER_MAX_SLEEP))
+                    if action == "skip_grace" and _today_is_trading() \
+                            and _read_marker(marker) != now.date().isoformat():
+                        _warn_missed_once("shadow_ab", now.date())
+        except Exception as exc:  # noqa: BLE001
+            # try/except 在**循环内**：单轮故障不能杀死线程（旧版把 try 包在函数外面）
+            logger.error("[shadow] worker 循环异常（不退出）: %s", exc, exc_info=True)
+            # 落盘留痕：故障要能在 shadow 日志里看到（app.log 之外再加一道）
+            try:
+                import traceback
+                with (cfg.resolve("logs") / f"shadow_ab_{datetime.now():%Y-%m-%d}.log").open(
+                        "a", encoding="utf-8") as fh:
+                    fh.write(f"\n[worker 异常] {exc!r}\n{traceback.format_exc()}\n")
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(max(1.0, min(_WORKER_MAX_SLEEP,
+                                (wake - datetime.now()).total_seconds())))
 
 
 # 「收盘后自动维护 600 池」线程同样在**文件末尾**启动（配置关 / 非交易日 / 错过窗口则当日不跑）。
@@ -2114,6 +2246,8 @@ def portfolio():
         "trading_hours": _in_trading_hours(),
         "drawdown_brake": brake,
         "market_gate": _market_trend_gate(),
+        # 两个「每日一次」worker 今天跑没跑（自动调仓 / 600 池维护）-> 看板红/黄横幅
+        "daily_runs": _daily_runs_status(),
     }
 
 
@@ -2482,6 +2616,65 @@ def _market_trend_gate(force: bool = False) -> dict:
         out = {"enabled": True, "below": False, "reason": f"指数取数失败，不干预（{exc}）"}
     _MARKET_TREND_CACHE.update({"ts": now, "data": out})
     return out
+
+
+def _daily_run_status(marker_name: str, run_hhmm: str, grace_min: int,
+                      enabled: bool) -> dict:
+    """「今天这个每日一次的 worker 到底跑没跑」—— 供看板告警。纯读，不写任何文件。
+
+    这是 2026-10-08 修复的**另一半**：worker 常驻只保证「该跑的时候有线程在」，
+    而「万一没跑」必须自己喊出来。2026-09-30 就是没人喊 —— 自动调仓静默失效，
+    用户只能靠手动操作才发现（见 docs/2026-10-08-daily-workers-single-shot.md）。
+
+    照搬 `logs/drawdown_brake.json` 那条既有链路（状态文件 -> HTTP 字段 -> 看板横幅）：
+    `_drawdown_state` ➜ `/api/portfolio` 的 `drawdown_brake` ➜ 前端红条。
+
+    `missed` 的三个条件缺一不可：**本该跑**（enabled 且今天确为交易日）、**没跑**
+    （标记不是今天）、**窗口已过**（再等下去也不会跑了，才值得报警）。
+    交易日判定用 `_today_is_trading()`（看快照证据），所以法定节假日不会误报 ——
+    尽管 `risk.pre_holiday.holiday_dates` 目前是空的。
+    """
+    now = datetime.now()
+    today = now.date()
+    val = _read_marker(cfg.resolve("logs") / marker_name)
+    try:
+        hh, mm = (int(x) for x in str(run_hhmm).split(":"))
+        window_end = datetime(today.year, today.month, today.day, hh, mm) \
+            + timedelta(minutes=int(grace_min))
+        end_txt = window_end.strftime("%H:%M")
+    except (ValueError, TypeError):
+        window_end, end_txt = None, "--:--"
+    trading = _today_is_trading()
+    ran = (val == today.isoformat())
+    return {
+        "enabled": bool(enabled),
+        "expect": bool(enabled and trading),
+        "ran": ran,
+        "date": val,
+        "missed": bool(enabled and trading and not ran
+                       and window_end is not None and now > window_end),
+        "window_end": end_txt,
+    }
+
+
+def _daily_runs_status() -> dict:
+    """两个「每日一次」worker 的运行状态汇总（供 `/api/portfolio` 透出给看板）。
+
+    触发时刻的算法必须与 worker **保持一致** —— 开盘自动调仓的触发点是
+    `09:30:00 + delay_sec`（不是配置里写死的 HH:MM），这里照同样的算式推一遍。
+    """
+    aoe = (cfg.get("portfolio_risk", {}) or {}).get("auto_open_execute") or {}
+    auto_hhmm = (datetime(2000, 1, 1, 9, 30)
+                 + timedelta(seconds=int(aoe.get("delay_sec", 60)))).strftime("%H:%M")
+    sab = (cfg.get("auto_refresh", {}) or {}).get("shadow_ab") or {}
+    return {
+        "auto_open": _daily_run_status(
+            "auto_open_execute_date", auto_hhmm,
+            int(aoe.get("grace_min", 25)), bool(aoe.get("enabled", False))),
+        "shadow_ab": _daily_run_status(
+            "shadow_ab_date", str(sab.get("run_time", "15:45")),
+            int(sab.get("grace_min", 120)), bool(sab.get("enabled", False))),
+    }
 
 
 def _drawdown_state(broker=None, tag: str = "") -> dict:
