@@ -849,6 +849,27 @@ def dashboard_page():
     return FileResponse(page, headers={"Cache-Control": "no-store, must-revalidate"})
 
 
+@app.get("/vendor/{name}")
+def vendor_asset(name: str):
+    """看板依赖的第三方 JS（本地化在 frontend/vendor/，见 index.html 顶部说明）。
+
+    为什么需要这个路由：`frontend/index.html` 用**相对路径**引用
+    `vendor/vue.global.prod.js` / `vendor/echarts.min.js`。
+    用 `file://` 直接打开时，相对路径指向本地文件（本来就可用）；而通过
+    `/dashboard` 打开时，**同一行**会解析成 `/vendor/...` —— 没有这个路由就是 404，
+    看板照样白屏（2026-10-16 实测 `GET /vendor/echarts.min.js -> 404`）。
+
+    `Path(name).name` 只取最后一段，挡掉 `../` 之类的目录穿越。
+    """
+    base = Path(__file__).resolve().parent.parent / "frontend" / "vendor"
+    path = base / Path(name).name
+    if path.suffix not in (".js", ".css") or not path.is_file():
+        raise HTTPException(404, f"asset not found: {name}")
+    # 与 /dashboard 同口径 no-store：本地回环，1MB 的传输代价可忽略，
+    # 换来的是「永远拿到当前文件」，不会再出现"浏览器拿着旧库"那类问题。
+    return FileResponse(path, headers={"Cache-Control": "no-store, must-revalidate"})
+
+
 @app.get("/api/stocks")
 def stocks():
     return {"stocks": [{"symbol": s, "name": _name(s)} for s in DATA]}

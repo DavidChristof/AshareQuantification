@@ -5,8 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>A股量化监控台</title>
 <!-- Vue3 + ECharts CDN，无需构建工具 -->
-<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<!-- 依赖已**本地化**到 frontend/vendor/（2026-10-16）。
+     原写法是走 CDN：vue 走 unpkg、echarts 走 cdn.jsdelivr.net。
+     而本机**连不上 cdn.jsdelivr.net**（curl HTTP 000）=> `echarts` 未定义 =>
+     loadAll() 里那句 `this.drawManualCharts()` 抛 ReferenceError =>
+     被同一个 catch 抓住 => 弹出「加载失败：…请确认 API 服务已启动」。
+     明明 11 个接口全部 200，却把服务端误诊成故障 —— 排查了很久。
+     **别再改回 CDN**（本机网络到 jsdelivr 不可达；本地文件还能离线用）。 -->
+<script src="vendor/vue.global.prod.js"></script>
+<script src="vendor/echarts.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #0d1117; color: #e6edf3; font-family: "Microsoft YaHei", -apple-system, sans-serif; }
@@ -1188,7 +1195,17 @@ createApp({
       } catch (err) {
         console.error('加载失败:', err);
         if (showError) {
-          alert('加载失败：' + err.message + '\n请确认 API 服务已启动（python api/main.py）');
+          // [!] 2026-10-16：这里原来**无条件**写「请确认 API 服务已启动」，
+          // 把任何失败都栽给服务端。而真实的故障是前端自己的 echarts 从
+          // cdn.jsdelivr.net 加载失败（本机连不上该域）=> echarts 未定义 =>
+          // 上面那句 drawManualCharts() 抛错 => 被这里抓住 => 报「服务没起」。
+          // 结果 11 个接口全部 200 却排查了很久。现在**按错误类型分开说**。
+          const netFail = (err instanceof TypeError) ||
+                          /Failed to fetch|NetworkError|Load failed/i.test(err.message || '');
+          alert('加载失败：' + err.message +
+                (netFail
+                  ? '\n连不上 API（' + API_BASE + '）→ 请确认服务在运行'
+                  : '\n这是**页面内部**的错误，不是 API 服务的问题（F12 Console 看详情）'));
         }
       }
     },
@@ -1412,6 +1429,14 @@ createApp({
       finally { this.checkBusy = false; }
     },
     drawManualCharts() {
+      // [!] 库没加载成功时**不要让它把整页带崩**（2026-10-16 事故）：echarts 从
+      // CDN 加载失败 => echarts 未定义 => 这里抛 ReferenceError => 被 loadAll 的
+      // catch 抓走 => 整页弹「加载失败」，可数据其实**全部拿到了**。
+      // 缺库只该少几张图，不该让整个看板看起来像挂了。
+      if (typeof echarts === 'undefined') {
+        console.warn('echarts 未加载，跳过画图（检查 frontend/vendor/echarts.min.js）');
+        return;
+      }
       this.drawMEquity();
       this.drawMAssets();
       this.drawMPnl();
