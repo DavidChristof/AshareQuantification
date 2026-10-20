@@ -1213,22 +1213,33 @@ def _build_vol_cfg(risk: dict) -> dict:
 
 
 def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict,
-                   risk: dict | None = None) -> dict:
+                   risk: dict | None = None, max_price: float = 0.0) -> dict:
     """计算某持仓的止损/止盈位：动态波动率优先，回退固定百分比。
 
     risk: 自定义风控参数（如 config 的 real.advice）；None = 全局 risk 段（原行为）。
-    Returns: {stop_price, take_price, sl_pct, tp_pct, mode(动态/固定), atr_pct}
+    max_price: 持仓期间最高价（移动止损的参考价）。不传 => 只算成本止损线。
+
+    Returns: {stop_price, take_price, sl_pct, tp_pct, mode(动态/固定), atr_pct,
+              trail_price, eff_stop_price, eff_sl_pct, stop_basis}
+
+    [!] `stop_price` 只是**成本止损线**。撮合层 `apply_stop_rules` 还会判**移动止损**
+    （高点回撤 `high*(1-trail)`），而价格下跌时**先碰到的是更高**的那条 =>
+    `eff_stop_price = max(stop_price, trail_price)`，`stop_basis` 说明生效的是哪条。
+    2026-10-20 洛阳钼业：卡片显示 14.228（成本线），实际绑定 14.74（高点回撤线），
+    差 3.6% —— 只显示成本线会让人以为"离止损还远"，而真正的线更近。
     """
     risk = risk or _risk_config()
     sl = risk.get("stop_loss_pct", 0.08)
     tp = risk.get("take_profit_pct", 0.15)
     mode, atr_pct = "fixed", None
+    dyn = None
     if vol_map and vol_cfg and cost > 0:
         v = vol_map.get(symbol)
         if v and v.get("atr", 0) > 0:
             from quant.risk.volatility import dynamic_pcts
             dyn = dynamic_pcts(
                 v, cost,
+                high=(max_price or None),     # 让 trail_pct 与撮合层用同一参考价
                 stop_mult=vol_cfg["atr_stop_mult"], take_mult=vol_cfg["atr_take_mult"],
                 trail_mult=vol_cfg["atr_trailing_mult"],
                 min_pct=vol_cfg["vol_min_pct"], max_pct=vol_cfg["vol_max_pct"],
@@ -1243,11 +1254,31 @@ def _position_risk(symbol: str, cost: float, vol_map: dict, vol_cfg: dict,
     band = limit_pct(symbol)
     sl = min(float(sl), band)
     tp = min(float(tp), band)          # 止损/止盈各自独立（允许 take ≤ stop，保守锁盈）
+
+    # --- 移动止损线：启用前提与撮合层一致（高点必须高于成本）---
+    trail_pct = None
+    if max_price and max_price > cost:
+        if dyn and dyn.get("trail_pct"):
+            # 动态档的开关在 vol_cfg.trailing_enabled（apply_stop_rules 同一判断）
+            if (vol_cfg or {}).get("trailing_enabled", True):
+                trail_pct = dyn["trail_pct"]
+        elif risk.get("trailing_stop", False) and risk.get("trailing_pct"):
+            trail_pct = float(risk["trailing_pct"])
+    trail_price = (max_price * (1 - min(float(trail_pct), band))
+                   if trail_pct is not None else None)
+
+    stop_price = cost * (1 - sl)
+    take_price = cost * (1 + tp)
+    eff_stop = max(stop_price, trail_price) if trail_price else stop_price
     return {
-        "stop_price": cost * (1 - sl),
-        "take_price": cost * (1 + tp),
+        "stop_price": stop_price,
+        "take_price": take_price,
         "sl_pct": sl, "tp_pct": tp,
         "mode": mode, "atr_pct": atr_pct,
+        "trail_price": trail_price,
+        "eff_stop_price": eff_stop,
+        "eff_sl_pct": (1 - eff_stop / cost) if cost else None,
+        "stop_basis": "trailing" if (trail_price and trail_price > stop_price) else "fixed",
     }
 
 
@@ -1275,9 +1306,16 @@ def _apply_manual_stops_locked(_live: dict | None = None) -> list:
     """手动盘止盈止损（2026-09-08 拆分口径）：
 
     - 止盈（+ 盘中锁盈，保守）：用**实时价**，强势日冲到止盈线即落袋，不等收盘回落；
-    - 止损 / 移动止损：用**当日收盘价**判（盘中插针不算打损），与日频策略一致、避免被震出。
+    - 止损 / 移动止损：用**收盘价**判（盘中插针不算打损），与日频策略一致、避免被震出。
 
-    一天内止盈可盘中触发、止损仅在收盘数据刷新后触发一次。`_live` 为实时价快照（旧调用兼容）。
+    [!] 这里的「收盘价」是 `SIGNALS` 里的**最后一根日线收盘**，而 `SIGNALS` 在
+    **收盘后 16:45** 才刷新，本函数又**只在交易时段跑**（`_in_trading_hours` =
+    09:30-11:30 / 13:00-15:00）=> 两者永远错开。**真实行为**是：
+    用**上一交易日的收盘价**，在**下一交易日盘中**（每 30 秒一轮）触发并卖出。
+    原文写「止损仅在收盘数据刷新后触发一次」会让人以为收盘后立刻反应 —— **不会**。
+    （行为本身是合理的：收盘后不能交易，close 触发的止损必然落到下一个可交易时点。）
+
+    `_live` 为实时价快照（旧调用兼容）。
     """
     risk = _risk_config()
     if not risk.get("enabled", True):
@@ -1483,7 +1521,8 @@ def manual_positions():
     for pos in MANUAL_BROKER.query_positions():
         price = prices.get(pos.symbol, pos.avg_cost)
         mv = pos.shares * price
-        r = _position_risk(pos.symbol, pos.avg_cost, vol_map, vol_cfg)
+        r = _position_risk(pos.symbol, pos.avg_cost, vol_map, vol_cfg,
+                           max_price=pos.max_price)
         result.append({
             "symbol": pos.symbol,
             # 用 `_display_name` 而不是 `_name`：后者只查 40 池的名字表，池外票会**回退成
@@ -1499,11 +1538,18 @@ def manual_positions():
             "unrealized_pnl": round(mv - pos.shares * pos.avg_cost, 2),
             "pnl_pct": round(mv / (pos.shares * pos.avg_cost) - 1, 4)
             if pos.shares * pos.avg_cost else 0.0,
+            # stop_price 只是**成本线**；eff_stop_price 才是撮合层会先触发的那条
+            # （= max(成本线, 高点回撤线)，见 _position_risk）。stop_dist 一律按 eff 算，
+            # 否则「警戒」标签会按错误的线判定（2026-10-20 洛阳钼业：14.228 vs 14.74）。
             "stop_price": round(r["stop_price"], 3),
+            "trail_price": (round(r["trail_price"], 3)
+                            if r.get("trail_price") else None),
+            "eff_stop_price": round(r["eff_stop_price"], 3),
             "take_price": round(r["take_price"], 3),
-            "stop_dist": round((price / r["stop_price"] - 1) * 100, 1),
+            "stop_dist": round((price / r["eff_stop_price"] - 1) * 100, 1),
             "take_dist": round((price / r["take_price"] - 1) * 100, 1),
             "sl_pct": r["sl_pct"], "tp_pct": r["tp_pct"],
+            "eff_sl_pct": r["eff_sl_pct"], "stop_basis": r["stop_basis"],
             "mode": r["mode"], "atr_pct": r["atr_pct"],
         })
     return {"positions": result}

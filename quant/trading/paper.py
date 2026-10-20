@@ -214,9 +214,11 @@ class PaperBroker(Broker):
     def query_positions(self) -> list[Position]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT symbol, shares, avg_cost FROM paper_positions WHERE shares > 0"
+                "SELECT symbol, shares, avg_cost, COALESCE(max_price, 0) "
+                "FROM paper_positions WHERE shares > 0"
             ).fetchall()
-        return [Position(symbol=r[0], shares=float(r[1]), avg_cost=float(r[2])) for r in rows]
+        return [Position(symbol=r[0], shares=float(r[1]), avg_cost=float(r[2]),
+                         max_price=float(r[3] or 0.0)) for r in rows]
 
     def buy(self, symbol: str, shares: float, price: float, date: str,
             remark: str = "", fee_override: float | None = None) -> TradeResult:
@@ -356,7 +358,11 @@ class PaperBroker(Broker):
 
         Args:
             apply_stop / apply_take: 是否启用止损 / 止盈。用于「止盈盘中触发、止损收盘触发」
-            的分开调用（2026-09-08 起手动盘：止盈用实时价盘中落袋，止损用当日收盘价判，避免插针震出）。
+            的分开调用（2026-09-08 起手动盘：止盈用实时价盘中落袋，止损用**传入的收盘价**判，
+            避免插针震出）。注意「收盘价」指的是**调用方传进来的那根日线收盘**：
+            手动盘实际传的是 SIGNALS 的最后一根 = **上一交易日的收盘**（SIGNALS 收盘后
+            16:45 才刷新，而巡检只在交易时段跑）=> 止损在**下一交易日盘中**触发，
+            成交价就该收盘价（若次日跳空，账面会比真实可成交价乐观）。
             默认两者都开（自动盘/回测保持原行为）。
 
         Returns: 触发的卖出列表 [{symbol, reason, price}]。

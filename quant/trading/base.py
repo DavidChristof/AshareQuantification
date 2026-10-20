@@ -34,6 +34,11 @@ class Position:
     avg_cost: float           # 平均成本价（不含费）
     market_value: float = 0.0 # 按最新价计算的市场价值
     unrealized_pnl: float = 0.0
+    # 持仓期间最高价（移动止损的参考价；0 = 未知/还没记过）。
+    # 2026-10-20 补：原来 Position 不带这个字段，导致展示层（api._position_risk）
+    # 想算移动止损线也拿不到高点，只能显示"成本止损"那一条 —— 展示的线与实际
+    # 撮合层会先触发的那条不是同一条。
+    max_price: float = 0.0
 
     def __post_init__(self):
         self.unrealized_pnl = self.market_value - self.shares * self.avg_cost

@@ -515,7 +515,7 @@
                 <td>{{ p.shares }}</td><td>{{ p.avg_cost }}</td><td>{{ p.price }}</td>
                 <td class="muted">{{ p.atr_pct ? (p.atr_pct*100).toFixed(1)+'%' : '-' }}</td>
                 <td :class="p.unrealized_pnl >= 0 ? 'up' : 'down'">{{ p.unrealized_pnl.toFixed(2) }} ({{ (p.pnl_pct*100).toFixed(1) }}%)</td>
-                <td class="muted">{{ p.stop_price }}<span v-if="p.mode==='dynamic'" class="tag" style="margin-left:4px;font-size:10px">{{ (p.sl_pct*100).toFixed(1) }}%</span><span v-if="p.stop_dist<=3" class="tag tag-sell" style="margin-left:4px;font-size:10px">警戒</span></td>
+                <td class="muted" :title="'成本线 ' + p.stop_price + (p.trail_price != null ? ' / 高点回撤线 ' + p.trail_price : '')">{{ p.eff_stop_price != null ? p.eff_stop_price : p.stop_price }}<span v-if="p.mode==='dynamic'" class="tag" style="margin-left:4px;font-size:10px">{{ ((p.eff_sl_pct != null ? p.eff_sl_pct : p.sl_pct)*100).toFixed(1) }}%</span><span v-if="p.stop_basis==='trailing'" class="tag" style="margin-left:4px;font-size:10px">高点回撤</span><span v-if="p.stop_dist<=3" class="tag tag-sell" style="margin-left:4px;font-size:10px">警戒</span></td>
                 <td class="muted">{{ p.take_price }}<span v-if="p.mode==='dynamic'" class="tag" style="margin-left:4px;font-size:10px">{{ (p.tp_pct*100).toFixed(1) }}%</span></td>
               </tr>
             </tbody>
