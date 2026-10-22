@@ -7,9 +7,20 @@
     - shadow600 的 OOS 平均 RankIC > 0.015
     - shadow600 平均 RankIC > live40 平均 RankIC（稳定更会排序）
     - shadow600 OOS ICIR > live40 OOS ICIR
+    - **配对 t（HAC 修正）≥ min_paired_t（默认 2.0）**  <- 2026-10-22 新增
 全部满足 → STABLE（提醒上线）；否则输出还需多少天/差距。
 
+[!] 为什么要加最后一条（2026-10-22）：前四条都是**点估计比较**，不含任何显著性检验。
+10-19~10-21 连续三天报了 STABLE，而同一批数据的配对检验是 t=+0.82 (p=0.42) ——
+所谓"交叉"只是**一次 regime 反转**（09-14~09-24 是 40 完胜，09-28~10-14 是 600 全胜）。
+点估计规则在行情反转时必然误报一次，光靠"再多等几天"治不了。
+
+[!] 为什么用 HAC（Newey-West）而不是普通 t：每天的 RankIC 用的是**未来 5 日收益**，
+相邻两天共享 4/5 的收益窗口 => 序列自相关，普通 t 把 n 天的重叠样本当成 n 个独立
+观测，**系统性高估**显著性。lag 取 horizon-1 = 4，Bartlett 权重。
+
 用法：python scripts/28_shadow_check.py [--cutoff 2026-09-07] [--min-days 10]
+                                    [--min-paired-t 2.0] [--hac-lag 4]
 """
 from __future__ import annotations
 
@@ -32,6 +43,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--cutoff", default="2026-09-07")
 parser.add_argument("--min-days", type=int, default=10)
 parser.add_argument("--min-rankic", type=float, default=0.015)
+parser.add_argument("--min-paired-t", type=float, default=2.0,
+                    help="配对 t 的门槛（单侧，600 领先）；默认 2.0")
+parser.add_argument("--hac-lag", type=int, default=4,
+                    help="Newey-West 滞后阶数；默认 4 = 5 日前向收益的重叠补偿")
 args = parser.parse_args()
 
 
@@ -48,6 +63,36 @@ def daily_ic(df: pd.DataFrame) -> pd.Series:
         if np.isfinite(rho):
             ics[d] = rho
     return pd.Series(ics, dtype=float)
+
+
+def hac_t(diff: np.ndarray, lag: int) -> tuple[float, float]:
+    """差分序列的均值 + Newey-West(Bartlett 权重) HAC t 值。
+
+    Args:
+        diff: 逐日差值（600 的 RankIC - 40 的 RankIC）。
+        lag: 自相关补偿阶数。5 日前向收益 => 相邻两天共享 4/5 的收益窗口 => lag=4。
+
+    **为什么不能用普通 t**：重叠窗口让序列正自相关，普通 t 把重叠样本当成独立观测，
+    系统性**高估**显著性。例（2026-10-22，n=21）：普通 t=+0.82；HAC 修正后更小。
+    非独立样本上谈"n 天"，本来就没有那么多信息量。
+    """
+    d = np.asarray(diff, dtype=float)
+    n = len(d)
+    if n < 2:
+        return (float(d.mean()) if n else 0.0, float("nan"))
+    m = float(d.mean())
+    x = d - m
+    var_plain = float(x @ x) / n
+    if var_plain <= 0:
+        return m, float("nan")
+    var = var_plain
+    for k in range(1, min(lag, n - 1) + 1):
+        w = 1.0 - k / (lag + 1.0)
+        var += 2.0 * w * float(x[k:] @ x[:-k]) / n
+    if var <= 0:                 # 短样本下 HAC 可能给出非正方差 -> 回退普通方差
+        var = var_plain
+    se = float(np.sqrt(var / n))
+    return m, (m / se if se > 0 else float("nan"))
 
 
 def main():
@@ -81,11 +126,28 @@ def main():
     print(f"      live40     平均RankIC={m40:.4f}  ICIR={i40:.3f}", flush=True)
     print(f"      shadow600  平均RankIC={m60:.4f}  ICIR={i60:.3f}", flush=True)
 
+    # ---- 配对显著性：点估计领先 ≠ 显著领先 ----
+    paired = None
+    if nd >= 3:
+        diffs = (ic60 - ic40).to_numpy(dtype=float)
+        mdiff, t_paired = hac_t(diffs, args.hac_lag)
+        wins = int((diffs > 0).sum())
+        paired = {"mean": mdiff, "t": t_paired, "wins": wins, "n": nd}
+        print(f"[28] 配对（逐日 RankIC 差 600-40，n={nd}，HAC lag={args.hac_lag}）：", flush=True)
+        print(f"      均值差={mdiff:+.4f}  t(HAC)={t_paired:+.2f}  600赢 {wins}/{nd} 天",
+              flush=True)
+        print("      注：日窗 5 日重叠 => 有效独立观测远少于 n，HAC 已按 lag 修正自相关。",
+              flush=True)
+
     checks = {
         "OOS天数够": nd >= args.min_days,
         "600有正IC": m60 > args.min_rankic,
         "600>40(平均IC)": m60 > m40,
         "600>40(ICIR)": i60 > i40,
+        # 点估计领先**还不够**：必须显著领先。算不出来（样本太少/NaN）也按不通过处理
+        # （fail closed）—— 宁可多等，也不要因为"没算"而放行上线。
+        f"600>40(配对t>={args.min_paired_t:g})": bool(
+            paired and np.isfinite(paired["t"]) and paired["t"] >= args.min_paired_t),
     }
     for k, v in checks.items():
         # 只能用 ASCII：本机控制台是 GBK，checkmark(码位 U+2713) 和 ballot-X(U+2717)
@@ -99,8 +161,12 @@ def main():
         print("\nSTABLE：600 池模型已在真正前向 OOS 稳压（>线上40）。→ 提醒用户：可以上线新版600池了。", flush=True)
     else:
         need = max(args.min_days - nd, 0)
-        print(f"\nNOT_YET：尚未稳压。预计还需 ≥{need} 个 OOS 可评日子；"
-              "继续每天跑 26→27。", flush=True)
+        msg = (f"NOT_YET：尚未稳压。预计还需 ≥{need} 个 OOS 可评日子；"
+               "继续每天跑 26→27。")
+        if paired and np.isfinite(paired["t"]) and paired["t"] < args.min_paired_t:
+            msg += (f"\n  卡在显著性：配对 t={paired['t']:+.2f} < {args.min_paired_t:g}"
+                    " —— 点估计领先不等于显著领先（日窗 5 日重叠，别按天数算信息量）。")
+        print("\n" + msg, flush=True)
     return 0 if stable else 1
 
 
